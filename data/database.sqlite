@@ -1,0 +1,128 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS products (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  SKU TEXT NOT NULL UNIQUE,
+  barcode TEXT UNIQUE,
+  price REAL NOT NULL CHECK (price >= 0),
+  quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
+  cost_price REAL CHECK (cost_price >= 0),
+  tax_rate REAL NOT NULL DEFAULT 0 CHECK (tax_rate >= 0),
+  updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS products_history (
+  history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER,
+  name TEXT,
+  SKU TEXT,
+  barcode TEXT,
+  price REAL,
+  quantity INTEGER,
+  cost_price REAL,
+  tax_rate REAL,
+  changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  action TEXT CHECK (action IN ('UPDATE', 'DELETE'))
+);
+
+CREATE TABLE IF NOT EXISTS quantity_history (
+  history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  product_id INTEGER NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  old_quantity INTEGER NOT NULL,
+  new_quantity INTEGER NOT NULL,
+  changed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  subtotal REAL NOT NULL,
+  tax_total REAL NOT NULL,
+  discount_total REAL NOT NULL DEFAULT 0 CHECK (discount_total >= 0),
+  total REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED', 'REFUNDED', 'VOID')),
+  parent_sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS sale_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  product_id INTEGER NOT NULL REFERENCES products(id),
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price REAL NOT NULL CHECK (unit_price >= 0),
+  tax_rate_at_sale REAL NOT NULL DEFAULT 0 CHECK (tax_rate_at_sale >= 0)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+  method TEXT NOT NULL CHECK (method IN ('CASH', 'CARD', 'UPI')),
+  amount REAL NOT NULL CHECK (amount >= 0),
+  is_partial BOOLEAN NOT NULL DEFAULT 0 CHECK (is_partial IN (0, 1)),
+  parent_payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
+CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
+CREATE INDEX IF NOT EXISTS idx_payments_sale ON payments(sale_id);
+CREATE INDEX IF NOT EXISTS idx_quantity_history_product ON quantity_history(product_id);
+
+CREATE TRIGGER IF NOT EXISTS log_product_update
+BEFORE UPDATE ON products
+FOR EACH ROW
+WHEN NEW.name IS NOT OLD.name
+  OR NEW.SKU IS NOT OLD.SKU
+  OR NEW.barcode IS NOT OLD.barcode
+  OR NEW.price IS NOT OLD.price
+  OR NEW.cost_price IS NOT OLD.cost_price
+  OR NEW.tax_rate IS NOT OLD.tax_rate
+BEGIN
+  INSERT INTO products_history (product_id, name, SKU, barcode, price, quantity, cost_price, tax_rate, action)
+  VALUES (OLD.id, OLD.name, OLD.SKU, OLD.barcode, OLD.price, OLD.quantity, OLD.cost_price, OLD.tax_rate, 'UPDATE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS log_product_delete
+BEFORE DELETE ON products
+FOR EACH ROW
+BEGIN
+  INSERT INTO products_history (product_id, name, SKU, barcode, price, quantity, cost_price, tax_rate, action)
+  VALUES (OLD.id, OLD.name, OLD.SKU, OLD.barcode, OLD.price, OLD.quantity, OLD.cost_price, OLD.tax_rate, 'DELETE');
+END;
+
+CREATE TRIGGER IF NOT EXISTS log_quantity_change
+AFTER UPDATE ON products
+FOR EACH ROW
+WHEN NEW.quantity IS NOT OLD.quantity
+BEGIN
+  INSERT INTO quantity_history (product_id, old_quantity, new_quantity)
+  VALUES (NEW.id, OLD.quantity, NEW.quantity);
+END;
+
+CREATE TRIGGER IF NOT EXISTS adjust_inventory_on_item_insert
+AFTER INSERT ON sale_items
+BEGIN
+  UPDATE products
+  SET quantity = CASE
+    WHEN (SELECT status FROM sales WHERE id = NEW.sale_id) = 'COMPLETED'
+      THEN quantity - NEW.quantity
+    WHEN (SELECT status FROM sales WHERE id = NEW.sale_id) = 'REFUNDED'
+      THEN quantity + NEW.quantity
+    ELSE quantity
+  END
+  WHERE id = NEW.product_id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS restore_inventory_on_item_delete
+AFTER DELETE ON sale_items
+BEGIN
+  UPDATE products
+  SET quantity = CASE
+    WHEN (SELECT status FROM sales WHERE id = OLD.sale_id) = 'COMPLETED'
+      THEN quantity + OLD.quantity
+    WHEN (SELECT status FROM sales WHERE id = OLD.sale_id) = 'REFUNDED'
+      THEN quantity - OLD.quantity
+    ELSE quantity
+  END
+  WHERE id = OLD.product_id;
+END;
