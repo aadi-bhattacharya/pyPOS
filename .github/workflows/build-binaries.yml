@@ -33,7 +33,19 @@ jobs:
           python-version: "3.12"
 
       - name: Install build deps
-        run: pip install "Flask>=3.0" pyinstaller
+        run: pip install "Flask>=3.0" "waitress>=3.0" pyinstaller
+
+      # UPX compresses the frozen binary; PyInstaller no-ops safely if it's
+      # absent, but installing it shrinks Linux/Windows builds noticeably.
+      # Skipped on macOS: UPX-compressed Mach-O binaries can trip codesign
+      # and Gatekeeper on Apple Silicon.
+      - name: Install UPX (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y upx-ucl
+
+      - name: Install UPX (Windows)
+        if: matrix.os == 'windows-latest'
+        run: choco install upx -y
 
       - name: Build single-file binary
         run: pyinstaller --noconfirm --clean pypos.spec

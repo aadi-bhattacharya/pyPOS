@@ -105,7 +105,8 @@ def main(argv=None):
         print("  Isolated to this computer (127.0.0.1) — no outside access.")
     print("  Press Ctrl+C to stop.\n")
 
-    app.run(host=args.host, port=args.port, debug=False)
+    from waitress import serve
+    serve(app, host=args.host, port=args.port, threads=8)
 
 
 def _port_free(host, port):
