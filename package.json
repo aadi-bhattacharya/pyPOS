@@ -1,0 +1,8 @@
+{
+  "name": "pypos",
+  "private": true,
+  "description": "Dev-only dependencies for the headless frontend test (jsdom). The app itself needs nothing but Python + Flask.",
+  "devDependencies": {
+    "jsdom": "^30.0.1"
+  }
+}

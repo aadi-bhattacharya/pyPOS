@@ -5,6 +5,45 @@ CREATE TABLE IF NOT EXISTS product_groups (
   name TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS customers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  phone TEXT UNIQUE,
+  email TEXT,
+  notes TEXT,
+  store_credit_cents INTEGER NOT NULL DEFAULT 0 CHECK (store_credit_cents >= 0),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS credit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  delta_cents INTEGER NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+  timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS parked_sales (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  label TEXT NOT NULL,
+  items_json TEXT NOT NULL,
+  discount_mode TEXT CHECK (discount_mode IN ('percent', 'amount')),
+  discount_value REAL NOT NULL DEFAULT 0 CHECK (discount_value >= 0),
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS cash_sessions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  opened_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  closed_at TIMESTAMP,
+  opening_float REAL NOT NULL DEFAULT 0 CHECK (opening_float >= 0),
+  counted_cash REAL,
+  drawer_difference REAL,
+  note TEXT
+);
+
 CREATE TABLE IF NOT EXISTS products (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   group_id INTEGER REFERENCES product_groups(id),
@@ -54,7 +93,8 @@ CREATE TABLE IF NOT EXISTS sales (
   discount_total REAL NOT NULL DEFAULT 0 CHECK (discount_total >= 0),
   total REAL NOT NULL,
   status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED', 'REFUNDED', 'VOID')),
-  parent_sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL
+  parent_sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -63,7 +103,9 @@ CREATE TABLE IF NOT EXISTS sale_items (
   product_id INTEGER NOT NULL REFERENCES products(id),
   quantity INTEGER NOT NULL CHECK (quantity > 0),
   unit_price REAL NOT NULL CHECK (unit_price >= 0),
-  tax_rate_at_sale REAL NOT NULL DEFAULT 0 CHECK (tax_rate_at_sale >= 0)
+  tax_rate_at_sale REAL NOT NULL DEFAULT 0 CHECK (tax_rate_at_sale >= 0),
+  discount_cents REAL NOT NULL DEFAULT 0 CHECK (discount_cents >= 0),
+  tax_cents REAL NOT NULL DEFAULT 0 CHECK (tax_cents >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS payments (
@@ -75,6 +117,11 @@ CREATE TABLE IF NOT EXISTS payments (
   parent_payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_products_group ON products(group_id);
 CREATE INDEX IF NOT EXISTS idx_product_attributes_product ON product_attributes(product_id);
 CREATE INDEX IF NOT EXISTS idx_product_attributes_name_value ON product_attributes(attribute_name, attribute_value);
@@ -82,6 +129,10 @@ CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_payments_sale ON payments(sale_id);
 CREATE INDEX IF NOT EXISTS idx_quantity_history_product ON quantity_history(product_id);
+CREATE INDEX IF NOT EXISTS idx_sales_timestamp ON sales(timestamp);
+CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
+CREATE INDEX IF NOT EXISTS idx_credit_events_customer ON credit_events(customer_id);
+CREATE INDEX IF NOT EXISTS idx_parked_created ON parked_sales(created_at);
 
 CREATE VIEW IF NOT EXISTS product_variants AS
 SELECT
@@ -129,6 +180,9 @@ BEGIN
   VALUES (NEW.id, OLD.quantity, NEW.quantity);
 END;
 
+-- Inventory is driven by sale status at the moment items are inserted/deleted.
+-- COMPLETED sale  -> inserting items takes stock out
+-- REFUNDED sale   -> inserting items puts stock back
 CREATE TRIGGER IF NOT EXISTS adjust_inventory_on_item_insert
 AFTER INSERT ON sale_items
 BEGIN

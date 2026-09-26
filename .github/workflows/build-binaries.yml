@@ -1,0 +1,54 @@
+# Builds native single-file pyPOS binaries for Windows, macOS and Linux.
+#
+# PyInstaller cannot cross-compile: each OS builds its own binary, so this
+# workflow runs the same steps on three runners. Trigger it from the Actions
+# tab (Run workflow) or by pushing a tag like v1.0.1. Binaries appear under
+# the run's Artifacts.
+
+name: build-binaries
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: pypos-linux
+          - os: windows-latest
+            artifact: pypos-windows
+          - os: macos-latest
+            artifact: pypos-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build deps
+        run: pip install "Flask>=3.0" pyinstaller
+
+      - name: Build single-file binary
+        run: pyinstaller --noconfirm --clean pypos.spec
+
+      - name: Rename artifact (windows adds .exe automatically)
+        shell: bash
+        run: |
+          cd dist
+          for f in pypos pypos.exe; do
+            [ -f "$f" ] && mv "$f" "${{ matrix.artifact }}${f##pypos}"
+          done
+          ls -lh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/pypos-*
+          if-no-files-found: error
