@@ -85,6 +85,14 @@ export function buildReceipt(receipt, { store = null } = {}) {
       ? h("div", { class: "r-row" }, h("span", {}, "Returned to store credit"),
           h("span", {}, money(receipt.store_credit_refunded)))
       : null,
+    receipt.loyalty_points_earned > 0
+      ? h("div", { class: "r-row" }, h("span", {}, "Loyalty points earned"),
+          h("span", {}, `+${receipt.loyalty_points_earned} pts`))
+      : null,
+    receipt.loyalty_points_reversed > 0
+      ? h("div", { class: "r-row" }, h("span", {}, "Loyalty points reversed"),
+          h("span", {}, `-${receipt.loyalty_points_reversed} pts`))
+      : null,
     receipt.change && receipt.change > 0
       ? h("div", { class: "r-row r-bold" }, h("span", {}, "Change"),
           h("span", {}, money(receipt.change)))

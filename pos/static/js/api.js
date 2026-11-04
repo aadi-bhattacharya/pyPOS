@@ -98,6 +98,11 @@ export const api = {
     request(`/customers/${id}/credit`,
       { method: "POST", body: { delta_cents: deltaCents, reason } }),
 
+  adjustLoyalty: (id, payload) => request(`/customers/${id}/loyalty/adjust`,
+    { method: "POST", body: payload }),
+  redeemLoyalty: (id, points) => request(`/customers/${id}/loyalty/redeem`,
+    { method: "POST", body: { points } }),
+
   // parked orders
   listParked: () => request("/parked"),
   parkCart: (payload) => request("/parked", { method: "POST", body: payload }),

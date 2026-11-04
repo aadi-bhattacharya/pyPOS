@@ -95,6 +95,7 @@ def get_customer(conn, customer_id):
         "notes": row["notes"],
         "gstin": row["gstin"],
         "billing_address": row["billing_address"],
+        "loyalty_points": row["loyalty_points"],
         "store_credit_cents": row["store_credit_cents"],
         "store_credit": round(row["store_credit_cents"] / 100, 2),
         "created_at": row["created_at"],
@@ -163,6 +164,15 @@ def delete_customer(conn, customer_id):
         raise CustomerHasCreditError(
             "This customer still holds store credit — spend it or adjust "
             "the balance to zero before deleting.")
+    points = conn.execute("SELECT loyalty_points FROM customers WHERE id=?",
+                          (customer_id,)).fetchone()["loyalty_points"]
+    if points != 0:
+        raise CustomersError("Customer has a non-zero loyalty balance. "
+                             "An admin must clear the balance before deletion.")
+    if conn.execute("SELECT 1 FROM loyalty_events WHERE customer_id=? LIMIT 1",
+                    (customer_id,)).fetchone():
+        raise CustomersError("This customer has a loyalty transaction history. "
+                             "Deletion is blocked to preserve the points audit trail.")
     conn.execute("DELETE FROM customers WHERE id = ?", (customer_id,))
     conn.commit()
 

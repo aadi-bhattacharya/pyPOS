@@ -20,6 +20,12 @@ SETTING_KEYS = {
     "tax_label": "GST",
     "price_tax_mode": "exclusive",
     "receipt_footer": "Thank you for shopping with us!",
+    # Earning: floor(eligible spend / threshold) * points. Redemption credits
+    # the customer wallet and does not modify any issued GST invoice.
+    "loyalty_enabled": "true",
+    "loyalty_earn_spend_rupees": "100",
+    "loyalty_earn_points": "1",
+    "loyalty_redeem_paise": "100",
     "low_stock_threshold": "5",
     # Receipt tax breakup (e.g. GST printed as CGST + SGST)
     "tax_breakup": "false",
@@ -101,6 +107,13 @@ def save_settings(conn, values):
         elif key == "receipt_logo_width":
             if not value.isdigit() or not 12 <= int(value) <= 65:
                 raise ValueError("Logo width must be 12–65 mm")
+        elif key == "loyalty_enabled":
+            if value not in ("true", "false"):
+                raise ValueError("Loyalty enabled must be true or false")
+        elif key in ("loyalty_earn_spend_rupees", "loyalty_earn_points", "loyalty_redeem_paise"):
+            # Integer-only policy values make payout calculations exact.
+            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 100000:
+                raise ValueError(f"{key} must be an integer between 1 and 100000")
         elif key == "store_fssai":
             value = value.strip()
             if value and (not value.isdigit() or len(value) != 14):

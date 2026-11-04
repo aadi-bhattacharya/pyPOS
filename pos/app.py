@@ -15,6 +15,7 @@ from pos import parked as parked_mod
 from pos import cash_sessions
 from pos import settings as settings_mod
 from pos import auth
+from pos import loyalty
 from pos.demo import seed_demo_data
 from pos.security import install_security
 
@@ -594,6 +595,7 @@ def create_app(db_path=None, extra_hosts=()):
         conn = get_db()
         cust = customers_mod.get_customer(conn, cid)
         cust["credit_events"] = customers_mod.credit_events(conn, cid)
+        cust["loyalty_events"] = loyalty.events(conn, cid)
         cust["recent_sales"] = customers_mod.recent_sales(conn, cid)
         return jsonify(cust)
 
@@ -624,6 +626,34 @@ def create_app(db_path=None, extra_hosts=()):
             reason=data.get("reason") or "")
         return jsonify({"id": cid, "store_credit_cents": balance,
                         "store_credit": round(balance / 100, 2)})
+
+    # All loyalty balance edits and conversions require a configured admin
+    # password AND an authenticated session; first-run bootstrap cannot bypass.
+    def _loyalty_admin():
+        if not auth.is_configured(_admin_password()):
+            return jsonify({"error": "Set an admin password in Settings before managing loyalty points"}), 403
+        if not auth.is_authenticated():
+            return jsonify({"error": "Admin login required", "code": "auth_required"}), 401
+        return None
+
+    @app.post("/api/customers/<int:cid>/loyalty/adjust")
+    def api_loyalty_adjust(cid):
+        denial = _loyalty_admin()
+        if denial is not None:
+            return denial
+        data = body()
+        result = loyalty.adjust(get_db(), cid,
+                                delta=data.get("delta_points"),
+                                set_to=data.get("set_points"),
+                                reason=data.get("reason", ""))
+        return jsonify({"id": cid, "loyalty_points": result})
+
+    @app.post("/api/customers/<int:cid>/loyalty/redeem")
+    def api_loyalty_redeem(cid):
+        denial = _loyalty_admin()
+        if denial is not None:
+            return denial
+        return jsonify(loyalty.redeem(get_db(), cid, body().get("points")))
 
     # ---------------- parked orders ----------------
     @app.get("/api/parked")
@@ -701,6 +731,23 @@ def create_app(db_path=None, extra_hosts=()):
         return Response(
             data, mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+    @app.get("/api/export/loyalty.csv")
+    def api_export_loyalty():
+        denial = _loyalty_admin()
+        if denial is not None:
+            return denial
+        rows = get_db().execute('''SELECT le.id, le.timestamp, le.customer_id,
+            COALESCE(c.name, ''), COALESCE(c.phone, ''), le.event_type,
+            le.delta_points, le.balance_after, le.reason,
+            COALESCE(le.sale_id, '')
+            FROM loyalty_events le
+            LEFT JOIN customers c ON c.id = le.customer_id
+            ORDER BY le.id DESC''').fetchall()
+        return _csv_response([tuple(row) for row in rows],
+            ["event_id", "timestamp_utc", "customer_id", "customer_name",
+             "phone", "event_type", "delta_points", "balance_after",
+             "reason", "linked_sale_id"], "pypos-loyalty-ledger.csv")
 
     @app.get("/api/export/sales.csv")
     def api_export_sales():

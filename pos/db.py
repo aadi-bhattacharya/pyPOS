@@ -159,7 +159,8 @@ def migrate(conn):
     for table, new_columns in {
         "products": {"hsn_code": "TEXT NOT NULL DEFAULT ''",
                      "unit_code": "TEXT NOT NULL DEFAULT 'NOS'"},
-        "customers": {"gstin": "TEXT NOT NULL DEFAULT ''",
+        "customers": {"loyalty_points": "INTEGER NOT NULL DEFAULT 0",
+                      "gstin": "TEXT NOT NULL DEFAULT ''",
                       "billing_address": "TEXT NOT NULL DEFAULT ''"},
         "sale_items": {"hsn_at_sale": "TEXT NOT NULL DEFAULT ''",
                        "unit_at_sale": "TEXT NOT NULL DEFAULT 'NOS'",

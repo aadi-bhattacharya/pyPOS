@@ -11,6 +11,7 @@ from .catalog import (
 )
 from .customers import CustomerNotFoundError, _apply_credit
 from . import settings as settings_mod
+from . import loyalty
 
 MONEY_Q = Decimal("0.01")
 PAYMENT_METHODS = ("CASH", "CARD", "UPI")
@@ -426,6 +427,9 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
             _apply_credit(conn, customer["id"], -credit_cents,
                           f"Spent on sale #{sale_id}", sale_id=sale_id)
 
+        loyalty.award_on_sale(
+            conn, customer["id"] if customer else None, sale_id,
+            max(0, _cents(totals["total"]) - credit_cents))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -589,6 +593,10 @@ def get_sale_detail(conn, sale_id):
         crow = cur.fetchone()
         customer_name = crow["name"] if crow else None
 
+    loyalty_rows = cur.execute('''SELECT event_type, delta_points FROM loyalty_events
+        WHERE sale_id=? AND event_type IN ('EARN','REFUND','VOID')''', (sale_id,)).fetchall()
+    points_earned = sum(r["delta_points"] for r in loyalty_rows if r["event_type"] == "EARN")
+    points_reversed = -sum(r["delta_points"] for r in loyalty_rows if r["event_type"] in ("REFUND", "VOID"))
     paid = sum(p["amount"] for p in payments)
     return {
         "id": sale["id"],
@@ -604,6 +612,8 @@ def get_sale_detail(conn, sale_id):
         "paid": round(paid, 2),
         "customer_id": sale["customer_id"],
         "customer_name": customer_name,
+        "loyalty_points_earned": points_earned,
+        "loyalty_points_reversed": points_reversed,
         "store_credit_used": round(credit_used / 100, 2),
         "store_credit_refunded": round(credit_returned / 100, 2),
         "refunded_to_credit": credit_returned > 0,
@@ -885,6 +895,8 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                     raise SalesError("Store credit refund needs an original customer")
                 _apply_credit(conn, sale["customer_id"], credit_now_cents,
                               f"Return credit from sale #{sale_id}", sale_id=refund_id)
+        loyalty.reverse_for_return(conn, sale_id, refund_id, refund_total_cents,
+                                   _cents(sale["total"]), "REFUND")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -922,6 +934,8 @@ def void_sale(conn, sale_id):
             cur.execute("UPDATE products SET quantity=quantity+? WHERE id=?",
                         (row["quantity"], row["product_id"]))
         cur.execute("UPDATE sales SET status='VOID' WHERE id=?", (sale_id,))
+        loyalty.reverse_for_return(conn, sale_id, sale_id, _cents(sale["total"]),
+                                   _cents(sale["total"]), "VOID")
         conn.commit()
     except Exception:
         conn.rollback()

@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS customers (
   email TEXT,
   notes TEXT,
   store_credit_cents INTEGER NOT NULL DEFAULT 0 CHECK (store_credit_cents >= 0),
+  loyalty_points INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   gstin TEXT NOT NULL DEFAULT '',
   billing_address TEXT NOT NULL DEFAULT ''
@@ -24,6 +25,19 @@ CREATE TABLE IF NOT EXISTS credit_events (
   reason TEXT NOT NULL DEFAULT '',
   sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
   timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Append-only loyalty ledger; negative points are permitted only for reversal
+-- of earned points after refunds/voids (a customer may already have spent them).
+CREATE TABLE IF NOT EXISTS loyalty_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+  delta_points INTEGER NOT NULL CHECK (delta_points != 0),
+  balance_after INTEGER NOT NULL,
+  event_type TEXT NOT NULL CHECK (event_type IN ('EARN', 'REFUND', 'VOID', 'ADMIN', 'REDEEM')),
+  reason TEXT NOT NULL DEFAULT '',
+  sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
+  timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS parked_sales (
@@ -147,6 +161,8 @@ CREATE INDEX IF NOT EXISTS idx_quantity_history_product ON quantity_history(prod
 CREATE INDEX IF NOT EXISTS idx_sales_timestamp ON sales(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 CREATE INDEX IF NOT EXISTS idx_credit_events_customer ON credit_events(customer_id);
+CREATE INDEX IF NOT EXISTS idx_loyalty_events_customer ON loyalty_events(customer_id, id);
+CREATE INDEX IF NOT EXISTS idx_loyalty_events_sale ON loyalty_events(sale_id);
 CREATE INDEX IF NOT EXISTS idx_parked_created ON parked_sales(created_at);
 
 CREATE VIEW IF NOT EXISTS product_variants AS

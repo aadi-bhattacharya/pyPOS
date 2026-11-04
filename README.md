@@ -187,6 +187,26 @@ Click a cart line to select it for `+`/`-`.
   store-credit component proportionally (or into store credit on request),
   and restock only what came back.
 
+## Loyalty points (India Edition)
+
+Attach a customer to a sale to earn configurable loyalty points. The default is
+**1 point for each complete ₹100 of eligible spending**. Settings → **Customer
+loyalty programme** controls the earning rate and how much store credit each
+point can be converted into. New policies apply prospectively; old invoices
+and point records are not modified.
+
+In **Customers**, the **Points** button lets a logged-in administrator add,
+deduct, set, or convert points to store credit with a logged reason. A configured
+admin password is mandatory; normal cashiers cannot edit point balances.
+Customer details show the event history and **Loyalty CSV** gives administrators
+an audit export. Refunds and voids reverse points awarded on the original
+sale; redeemed points can create a negative balance after a refund, which
+future accruals offset. Receipts show newly earned or reversed points.
+
+Loyalty conversion adds **store credit rather than changing the GST invoice
+amount**. See [LOYALTY_GUIDE.md](LOYALTY_GUIDE.md) for exact business rules,
+upgrade precautions, examples and GST/accounting limitations.
+
 ## End of day
 
 Reports → **End of day**: open the day with your drawer float, check the live

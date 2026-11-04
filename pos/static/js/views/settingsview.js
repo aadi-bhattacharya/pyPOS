@@ -304,6 +304,41 @@ export async function renderSettingsView(main) {
         onclick: async () => { location.href = "/logout"; },
       }, "Log out") : null));
 
+  const loyaltyEnabled = h("input", { type: "checkbox", checked: s.loyalty_enabled === "true" });
+  const loyaltySpend = h("input", { class: "input", type: "number", min: "1", step: "1",
+    value: s.loyalty_earn_spend_rupees || "100" });
+  const loyaltyEarn = h("input", { class: "input", type: "number", min: "1", step: "1",
+    value: s.loyalty_earn_points || "1" });
+  const loyaltyValue = h("input", { class: "input", type: "number", min: "1", step: "1",
+    value: s.loyalty_redeem_paise || "100" });
+  const loyaltyCard = h("div", { class: "card card-pad", style: "margin-top:16px" },
+    h("h3", { style: "margin-bottom:6px" }, "Customer loyalty programme"),
+    h("p", { style: "font-size:12.5px;color:var(--text-2);margin-bottom:12px" },
+      "Points are earned on customer-linked sales, excluding store-credit payments. " +
+      "Refunds and voids reverse earned points. Admins can correct balances or convert points " +
+      "to store credit under Customers. Changes apply to future transactions only."),
+    h("label", { class: "credit-toggle" }, loyaltyEnabled, h("span", {}, "Enable loyalty points")),
+    h("div", { class: "form-grid" },
+      h("div", { class: "field" }, h("label", {}, "Eligible spend per reward (₹)"), loyaltySpend),
+      h("div", { class: "field" }, h("label", {}, "Points earned per spend block"), loyaltyEarn),
+      h("div", { class: "field" }, h("label", {}, "Store credit value per point (paise)"), loyaltyValue)),
+    h("p", { class: "form-hint" },
+      "Example: ₹100 per block and 1 point awards 1 point per complete ₹100 spent. " +
+      "100 paise per point makes 10 points worth ₹10 of store credit. " +
+      "Redemptions settle bills after GST calculation; consult your accountant about scheme treatment."),
+    h("button", { class: "btn primary", onclick: async () => {
+      const values = {
+        loyalty_enabled: loyaltyEnabled.checked ? "true" : "false",
+        loyalty_earn_spend_rupees: loyaltySpend.value.trim(),
+        loyalty_earn_points: loyaltyEarn.value.trim(),
+        loyalty_redeem_paise: loyaltyValue.value.trim(),
+      };
+      try {
+        state.settings = await api.saveSettings(values);
+        toast("Loyalty settings saved.", "success");
+      } catch (e) { toastError(e); }
+    } }, icon("i-check"), "Save loyalty settings"));
+
   main.append(
     h("div", { class: "view-head" },
       h("div", { class: "view-title" },
@@ -339,6 +374,7 @@ export async function renderSettingsView(main) {
 
       brandingCard,
       taxCard,
+      loyaltyCard,
 
       h("div", { class: "card card-pad", style: "margin-top:16px" },
         h("h3", { style: "margin-bottom:8px" }, "Sample data"),

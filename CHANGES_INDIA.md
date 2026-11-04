@@ -32,3 +32,12 @@
 - Full Flask HTTP and headless browser end-to-end tests **could not be run in the packaging environment** because Flask and jsdom were not installed. Run them on the shop PC/staging setup before production rollout.
 
 For full limitations and a step-by-step printer setup, see `INDIA_SETUP.md`.
+
+## Loyalty points addition (November 2026)
+
+- Added `loyalty_events` audit journal and customer `loyalty_points` balance with idempotent SQLite migration.
+- Automatic earning on eligible customer-linked paid purchases with configurable ₹ threshold and integer point rate; no rewards on spend settled with store credit.
+- Proportional point clawback for partial refunds and full reversals for voids; settled refund is never blocked by an insufficient point balance.
+- Admin-authenticated add / deduct / set / convert-to-store-credit actions; mandatory audit reasons for edits and atomic redemption transactions.
+- Customer point column, register customer point badges, detail history, receipt point lines and admin-only CSV export.
+- Configuration in Settings and a worked examples / compliance note in `LOYALTY_GUIDE.md`.

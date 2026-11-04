@@ -26,6 +26,9 @@ export async function renderCustomers(main) {
         h("h2", {}, "Customers"),
         h("div", { class: "sub", id: "cust-sub" })),
       h("div", { class: "view-actions" },
+        h("a", { class: "btn", href: "/api/export/loyalty.csv",
+          title: "Download the loyalty adjustment, earning and redemption audit ledger (admin login required)" },
+          "Loyalty CSV"),
         h("button", { class: "btn primary", onclick: () => customerModal() },
           icon("i-plus"), "New customer"))),
     h("div", { class: "search-wrap", style: "margin-bottom:12px;max-width:340px" },
@@ -59,8 +62,10 @@ function renderSub() {
   const el = document.getElementById("cust-sub");
   if (el) {
     const owing = customers.filter((c) => c.store_credit > 0).length;
+    const pointHolders = customers.filter((c) => c.loyalty_points > 0).length;
     el.textContent = `${customers.length} customer${customers.length === 1 ? "" : "s"}` +
-      (owing ? ` · ${owing} with store credit` : "");
+      (owing ? ` · ${owing} with store credit` : "") +
+      (pointHolders ? ` · ${pointHolders} with loyalty points` : "");
   }
 }
 
@@ -87,6 +92,7 @@ function renderTable() {
       h("thead", {}, h("tr", {},
         h("th", {}, "Customer"),
         h("th", { class: "num" }, "Store credit"),
+        h("th", { class: "num" }, "Loyalty points"),
         h("th", { class: "num" }, "Orders"),
         h("th", { class: "num" }, "Total spent"),
         h("th", {}))),
@@ -106,9 +112,16 @@ function rowHtml(c) {
       c.store_credit > 0
         ? h("span", { class: "pill ok" }, fmt(c.store_credit))
         : h("span", { style: "color:var(--muted)" }, fmt(0))),
+    h("td", { class: "num cell-main mono" },
+      h("span", { class: c.loyalty_points > 0 ? "pill ok" : "" },
+        `${Number(c.loyalty_points || 0).toLocaleString("en-IN")} pts`)),
     h("td", { class: "num" }, String(c.orders)),
     h("td", { class: "num" }, fmt(c.total_spent)),
     h("td", { class: "actions-cell" },
+      h("button", {
+        class: "btn ghost sm", title: "Manage loyalty points (admin)",
+        onclick: () => loyaltyModal(c),
+      }, "Points"),
       h("button", {
         class: "btn ghost icon-only sm", title: "Adjust credit",
         onclick: () => creditModal(c),
@@ -124,6 +137,85 @@ function rowHtml(c) {
 }
 
 // ================= modals =================
+
+async function loyaltyModal(c) {
+  let auth;
+  try { auth = await api.settingsAuth(); } catch (e) { return toastError(e); }
+  if (!auth.configured) {
+    return toast("Set an admin password in Settings before managing loyalty points.", "warn");
+  }
+  if (!auth.authenticated) {
+    toast("Admin login required to manage points.", "warn");
+    location.href = "/login?next=" + encodeURIComponent("/#/customers");
+    return;
+  }
+  const latest = await api.getCustomer(c.id).catch(() => c);
+  const amount = h("input", { class: "input num", type: "number", step: "1", min: "0",
+    max: "1000000", placeholder: "Whole points" });
+  const action = h("select", { class: "input" },
+    ...[["add", "Add points"], ["deduct", "Deduct points"],
+         ["set", "Set exact balance"], ["redeem", "Convert points to store credit"]].map(([v, name]) =>
+      h("option", { value: v }, name)));
+  const reason = h("input", { class: "input", maxlength: "240",
+    placeholder: "Required reason, e.g. goodwill adjustment" });
+  const rate = Number(state.settings.loyalty_redeem_paise || 100) / 100;
+  const helper = h("p", { style: "font-size:12.5px;color:var(--text-2);margin:8px 0" });
+  const submit = h("button", { class: "btn primary" }, "Apply change");
+  function sync() {
+    const redeem = action.value === "redeem";
+    reason.parentElement.style.display = redeem ? "none" : "";
+    if (redeem) {
+      helper.textContent = `Each point converts to ${fmt(rate)} of store credit. This is not a GST discount. ` +
+        `Maximum available: ${Math.max(0, latest.loyalty_points || 0)} points.`;
+      submit.textContent = "Convert to store credit";
+    } else {
+      helper.textContent = action.value === "set" ? "Set the customer's exact whole-point balance." :
+        "Adjustments are recorded with the reason and cannot spend more than the available points.";
+      submit.textContent = "Apply change";
+    }
+  }
+  action.onchange = sync;
+  const modal = openModal({
+    title: `Loyalty points — ${latest.name}`,
+    narrow: true,
+    body: h("div", {},
+      h("div", { class: "pay-total-banner" },
+        h("span", { class: "lbl" }, "Current balance"),
+        h("span", { class: "amt" }, `${Number(latest.loyalty_points || 0).toLocaleString("en-IN")} pts`)),
+      h("div", { class: "field" }, h("label", {}, "Action"), action),
+      h("div", { class: "field" }, h("label", {}, "Points (whole number)"), amount),
+      h("div", { class: "field" }, h("label", {}, "Reason *"), reason),
+      helper),
+    footer: [h("button", { class: "btn", onclick: () => modal.close() }, "Cancel"), submit],
+  });
+  sync();
+  submit.onclick = async () => {
+    const val = Number(amount.value);
+    if (!amount.value.trim() || !Number.isSafeInteger(val) || val < 0 || val > 1000000)
+      return toast("Enter a valid whole-point amount.", "warn");
+    if (action.value !== "set" && val === 0)
+      return toast("Points must be greater than zero.", "warn");
+    if (action.value !== "redeem" && !reason.value.trim())
+      return toast("A reason is required for an admin adjustment.", "warn");
+    try {
+      submit.disabled = true;
+      if (action.value === "redeem") {
+        const converted = await api.redeemLoyalty(latest.id, val);
+        toast(`${val} points converted to ${fmt(converted.credited_paise / 100)} store credit.`, "success");
+      } else {
+        const payload = { reason: reason.value.trim() };
+        if (action.value === "set") payload.set_points = val;
+        else payload.delta_points = action.value === "deduct" ? -val : val;
+        const result = await api.adjustLoyalty(latest.id, payload);
+        toast(`Loyalty balance: ${result.loyalty_points} points.`, "success");
+      }
+      modal.close();
+      await load(); renderSub(); renderTable();
+      await detailModal(latest.id);
+    } catch (e) { toastError(e); submit.disabled = false; }
+  };
+}
+
 
 function customerModal(existing = null) {
   const name = h("input", { class: "input", value: existing?.name || "", placeholder: "Full name" });
@@ -241,7 +333,7 @@ async function deleteFlow(c) {
   const ok = await confirmDialog({
     title: `Delete ${c.name}?`,
     message: "Their purchase history stays in sales reports, but the customer " +
-      "record and credit log are removed. Customers holding store credit cannot be deleted.",
+      "record and credit log are removed. Customers with store credit, loyalty points, or any loyalty transaction history cannot be deleted.",
     confirmLabel: "Delete customer",
     danger: true,
   });
@@ -273,6 +365,15 @@ async function detailModal(id) {
       h("td", { class: "num mono", style: "color:" + (ev.delta >= 0 ? "var(--ok)" : "var(--danger)") },
         (ev.delta >= 0 ? "+" : "") + fmt(ev.delta))));
 
+  const loyaltyRows = (c.loyalty_events || []).map((ev) =>
+    h("tr", {},
+      h("td", {}, fmtDate(ev.timestamp)),
+      h("td", {}, `${ev.event_type}: ${ev.reason || "Adjustment"}`),
+      h("td", { class: "num mono", style: "color:" +
+        (ev.delta_points >= 0 ? "var(--ok)" : "var(--danger)") },
+        `${ev.delta_points > 0 ? "+" : ""}${ev.delta_points}`),
+      h("td", { class: "num mono" }, String(ev.balance_after))));
+
   const saleRows = c.recent_sales.map((s) =>
     h("tr", {},
       h("td", {}, h("a", {
@@ -293,6 +394,9 @@ async function detailModal(id) {
       h("div", { class: "pay-total-banner" },
         h("span", { class: "lbl" }, "Store credit"),
         h("span", { class: "amt" }, fmt(c.store_credit))),
+      h("div", { class: "pay-total-banner", style: "margin-top:8px" },
+        h("span", { class: "lbl" }, "Loyalty points"),
+        h("span", { class: "amt" }, `${Number(c.loyalty_points || 0).toLocaleString("en-IN")} pts`)),
       h("div", { style: "display:flex;gap:18px;margin-bottom:12px;font-size:13px;color:var(--text-2)" },
         h("span", {}, h("strong", {}, String(c.orders)), " orders"),
         h("span", {}, h("strong", {}, fmt(c.total_spent)), " lifetime")),
@@ -304,6 +408,12 @@ async function detailModal(id) {
             c.email ? h("div", {}, c.email) : null,
             c.notes ? h("div", { style: "color:var(--text-2)" }, c.notes) : null)
         : null,
+      h("h3", { style: "margin-bottom:6px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)" },
+        "Loyalty history"),
+      loyaltyRows.length
+        ? h("div", { class: "table-wrap", style: "max-height:180px;margin-bottom:14px" },
+            h("table", { class: "table" }, loyaltyRows))
+        : h("p", { style: "color:var(--muted);font-size:13px;margin-bottom:14px" }, "No loyalty activity yet."),
       h("h3", { style: "margin-bottom:6px;font-size:13px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted)" },
         "Credit history"),
       creditRows.length
@@ -317,6 +427,8 @@ async function detailModal(id) {
             h("table", { class: "table" }, saleRows))
         : h("p", { style: "color:var(--muted);font-size:13px" }, "No purchases yet.")),
     footer: [
+      h("button", { class: "btn",
+        onclick: () => { closeModalAll(); loyaltyModal(c); } }, "Manage points"),
       h("button", {
         class: "btn",
         onclick: () => { closeModalAll(); creditModal({ ...c }); },

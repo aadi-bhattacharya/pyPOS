@@ -381,7 +381,8 @@ function renderCart() {
             customer.store_credit > 0
               ? h("span", { class: "pill ok" }, `${fmt(customer.store_credit)} credit`)
               : null),
-          h("div", { class: "cb-sub" }, "Tap to change customer")),
+          h("div", { class: "cb-sub" },
+            `${Number(customer.loyalty_points || 0).toLocaleString("en-IN")} loyalty points · Tap to change`)),
         h("button", {
           class: "btn ghost icon-only sm", title: "Detach — sell as walk-in",
           onclick: (e) => {
@@ -515,7 +516,8 @@ function openCustomerPicker() {
       },
         h("span", {}, c.name),
         h("span", { class: "mono", style: "color:var(--muted)" },
-          [c.phone, c.store_credit > 0 ? `${fmt(c.store_credit)} credit` : null]
+          [c.phone, c.store_credit > 0 ? `${fmt(c.store_credit)} credit` : null,
+           `${Number(c.loyalty_points || 0).toLocaleString("en-IN")} pts`]
             .filter(Boolean).join(" · ") || "")));
     }
   }
