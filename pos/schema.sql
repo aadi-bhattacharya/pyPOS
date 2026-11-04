@@ -12,7 +12,9 @@ CREATE TABLE IF NOT EXISTS customers (
   email TEXT,
   notes TEXT,
   store_credit_cents INTEGER NOT NULL DEFAULT 0 CHECK (store_credit_cents >= 0),
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  gstin TEXT NOT NULL DEFAULT '',
+  billing_address TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS credit_events (
@@ -53,7 +55,9 @@ CREATE TABLE IF NOT EXISTS products (
   quantity INTEGER NOT NULL DEFAULT 0 CHECK (quantity >= 0),
   cost_price REAL CHECK (cost_price >= 0) NOT NULL DEFAULT 0,
   tax_rate REAL NOT NULL DEFAULT 0 CHECK (tax_rate >= 0),
-  updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  hsn_code TEXT NOT NULL DEFAULT '',
+  unit_code TEXT NOT NULL DEFAULT 'NOS'
 );
 
 CREATE TABLE IF NOT EXISTS product_attributes (
@@ -94,7 +98,9 @@ CREATE TABLE IF NOT EXISTS sales (
   total REAL NOT NULL,
   status TEXT NOT NULL DEFAULT 'COMPLETED' CHECK (status IN ('COMPLETED', 'REFUNDED', 'VOID')),
   parent_sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
-  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL
+  customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
+  invoice_number TEXT UNIQUE,
+  invoice_snapshot TEXT
 );
 
 CREATE TABLE IF NOT EXISTS sale_items (
@@ -105,7 +111,11 @@ CREATE TABLE IF NOT EXISTS sale_items (
   unit_price REAL NOT NULL CHECK (unit_price >= 0),
   tax_rate_at_sale REAL NOT NULL DEFAULT 0 CHECK (tax_rate_at_sale >= 0),
   discount_cents REAL NOT NULL DEFAULT 0 CHECK (discount_cents >= 0),
-  tax_cents REAL NOT NULL DEFAULT 0 CHECK (tax_cents >= 0)
+  tax_cents REAL NOT NULL DEFAULT 0 CHECK (tax_cents >= 0),
+  hsn_at_sale TEXT NOT NULL DEFAULT '',
+  unit_at_sale TEXT NOT NULL DEFAULT 'NOS',
+  description_at_sale TEXT NOT NULL DEFAULT '',
+  sku_at_sale TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS payments (
@@ -115,6 +125,11 @@ CREATE TABLE IF NOT EXISTS payments (
   amount REAL NOT NULL CHECK (amount >= 0),
   is_partial BOOLEAN NOT NULL DEFAULT 0 CHECK (is_partial IN (0, 1)),
   parent_payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS invoice_sequences (
+  financial_year TEXT PRIMARY KEY,
+  last_number INTEGER NOT NULL CHECK (last_number >= 0)
 );
 
 CREATE TABLE IF NOT EXISTS settings (

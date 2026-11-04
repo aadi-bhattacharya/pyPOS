@@ -2,10 +2,11 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from .sales import get_sale, _d, _money
+from .india import IST
 
 
 def _local_tz():
-    return datetime.now().astimezone().tzinfo
+    return IST
 
 
 def _period_bounds(days):

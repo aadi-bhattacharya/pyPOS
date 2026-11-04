@@ -8,6 +8,11 @@ export function buildZReceipt(rep) {
     h("div", { class: `r-row ${cls}` }, h("span", {}, label), h("span", {}, value));
 
   const el = h("div", { class: "receipt" },
+    s.store_logo && s.show_receipt_logo === "true"
+      ? h("div", { class: "r-center" }, h("img", {
+          class: "receipt-logo", alt: "Store logo", src: s.store_logo,
+          style: `width:${Math.min(65, Math.max(12, Number(s.receipt_logo_width) || 32))}mm`,
+        })) : null,
     h("div", { class: "r-center r-store" }, s.store_name || "My Store"),
     h("div", { class: "r-center r-status" },
       rep.is_open ? "** X REPORT **" : "** Z REPORT **"),

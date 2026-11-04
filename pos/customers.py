@@ -1,4 +1,5 @@
 from .catalog import InvalidInputError
+from .india import gstin
 
 
 class CustomersError(Exception):
@@ -56,15 +57,17 @@ def _phone(conn, phone, exclude_id=None):
     return phone
 
 
-def create_customer(conn, name, phone=None, email=None, notes=None):
+def create_customer(conn, name, phone=None, email=None, notes=None, gstin_number="", billing_address=""):
     name = _clean(name, NAME_MAX, "Name", required=True)
     phone = _phone(conn, phone)
     email = _clean(email, 200, "Email")
     notes = _clean(notes, NOTES_MAX, "Notes")
     cur = conn.cursor()
     cur.execute(
-        ''' INSERT INTO customers(name, phone, email, notes) VALUES(?, ?, ?, ?) ''',
-        (name, phone, email, notes),
+        ''' INSERT INTO customers(name, phone, email, notes, gstin, billing_address)
+            VALUES(?, ?, ?, ?, ?, ?) ''',
+        (name, phone, email, notes, gstin(gstin_number),
+         _clean(billing_address, 500, "Billing address") or ""),
     )
     conn.commit()
     return get_customer(conn, cur.lastrowid)
@@ -90,6 +93,8 @@ def get_customer(conn, customer_id):
         "phone": row["phone"],
         "email": row["email"],
         "notes": row["notes"],
+        "gstin": row["gstin"],
+        "billing_address": row["billing_address"],
         "store_credit_cents": row["store_credit_cents"],
         "store_credit": round(row["store_credit_cents"] / 100, 2),
         "created_at": row["created_at"],
@@ -126,7 +131,7 @@ def list_customers(conn, query=None, limit=500):
     return [get_customer(conn, cid) for cid in ids]
 
 
-def update_customer(conn, customer_id, name=None, phone=None, email=None, notes=None):
+def update_customer(conn, customer_id, name=None, phone=None, email=None, notes=None, gstin_number=None, billing_address=None):
     get_customer(conn, customer_id)
     fields = {}
     if name is not None:
@@ -137,6 +142,10 @@ def update_customer(conn, customer_id, name=None, phone=None, email=None, notes=
         fields["email"] = _clean(email, 200, "Email")
     if notes is not None:
         fields["notes"] = _clean(notes, NOTES_MAX, "Notes")
+    if gstin_number is not None:
+        fields["gstin"] = gstin(gstin_number)
+    if billing_address is not None:
+        fields["billing_address"] = _clean(billing_address, 500, "Billing address") or ""
     if fields:
         marks = ", ".join(f"{k} = ?" for k in fields)
         conn.execute(f"UPDATE customers SET {marks} WHERE id = ?",

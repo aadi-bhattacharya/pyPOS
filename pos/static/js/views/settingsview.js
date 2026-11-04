@@ -1,11 +1,11 @@
 import { api, state, refreshSettings, fmt } from "../api.js";
-import { h, icon, toast, toastError, confirmDialog } from "../ui.js";
+import { h, icon, toast, toastError, confirmDialog, printReceipt } from "../ui.js";
 import { fmtDate } from "../api.js";
 
 const FIELDS = [
   ["store_name", "Store name", "text", "My Store"],
   ["store_phone", "Phone", "text", ""],
-  ["currency", "Currency symbol", "text", "$"],
+  ["currency", "Currency symbol", "text", "₹"],
   ["tax_label", "Tax label on receipts", "text", "Tax"],
   ["low_stock_threshold", "Low-stock alert threshold (units)", "number", "5"],
 ];
@@ -39,10 +39,136 @@ export async function renderSettingsView(main) {
   form.append(h("div", { class: "field" },
     h("label", {}, "Address (printed on receipts)"), addressIn));
 
+  const businessFields = [
+    ["store_gstin", "Business GSTIN (if registered)", "15-character GSTIN"],
+    ["store_state", "Supplier State / UT", "e.g. West Bengal"],
+    ["store_state_code", "GST state code", "e.g. 19"],
+    ["store_fssai", "FSSAI licence (food businesses, optional)", "14-digit licence"],
+    ["store_upi_id", "UPI ID to print on receipts (optional)", "shopname@bank"],
+  ];
+  const businessInputs = {};
+  for (const [key, label, placeholder] of businessFields) {
+    const el = h("input", { class: "input", value: s[key] || "", placeholder });
+    businessInputs[key] = el;
+    form.append(h("div", { class: "field" }, h("label", {}, label), el));
+  }
+
   const footerIn = h("textarea", { class: "input", rows: "2" });
   footerIn.value = s.receipt_footer ?? "";
   form.append(h("div", { class: "field" },
     h("label", {}, "Receipt footer message"), footerIn));
+
+  // Printer branding is stored in the SQLite database and included in backups.
+  const priceTaxSelect = h("select", { class: "input" },
+    h("option", { value: "exclusive", selected: s.price_tax_mode !== "inclusive" },
+      "Prices before GST (add tax at checkout)"),
+    h("option", { value: "inclusive", selected: s.price_tax_mode === "inclusive" },
+      "Prices include GST (e.g. GST-inclusive MRP)"));
+  const paperSelect = h("select", { class: "input" },
+    ...[["58mm", "58mm thermal receipt"], ["80mm", "80mm thermal receipt"],
+         ["A4", "A4 paper / PDF printing"]].map(([val, label]) =>
+      h("option", { value: val, selected: s.receipt_paper === val }, label)));
+  const titleSelect = h("select", { class: "input" },
+    ...["Retail receipt", "Tax invoice", "Bill of supply"].map((x) =>
+      h("option", { value: x, selected: s.receipt_heading === x }, x)));
+  const localTaxSelect = h("select", { class: "input" },
+    ...["SGST", "UTGST"].map((x) =>
+      h("option", { value: x, selected: s.store_local_tax === x }, x)));
+  const showLogo = h("input", { type: "checkbox", checked: s.show_receipt_logo === "true" });
+  const logoWidth = h("input", { class: "input num", type: "number", min: "12",
+    max: "65", value: s.receipt_logo_width || "32", step: "1" });
+  const logoInput = h("input", { class: "input", type: "file", accept: "image/png,image/jpeg,image/webp" });
+  const logoPreview = h("div", { style: "margin:10px 0;min-height:20px" },
+    s.store_logo ? h("img", { src: s.store_logo, alt: "Saved receipt logo",
+      style: "max-width:240px;max-height:100px;object-fit:contain" }) :
+      h("span", { class: "form-hint" }, "No logo saved"));
+  logoInput.addEventListener("change", () => {
+    const file = logoInput.files?.[0];
+    if (!file) return;
+    if (file.size > 200 * 1024 || !["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      logoInput.value = "";
+      return toast("Use a PNG, JPEG or WebP logo up to 200 KiB.", "warn");
+    }
+    const previewUrl = URL.createObjectURL(file);
+    logoPreview.replaceChildren(h("img", {
+      src: previewUrl, alt: "Selected logo preview",
+      style: "max-width:240px;max-height:100px;object-fit:contain",
+      onload: () => URL.revokeObjectURL(previewUrl),
+    }));
+  });
+  const brandingCard = h("div", { class: "card card-pad", style: "margin-top:16px" },
+    h("h3", { style: "margin-bottom:6px" }, "Receipt printing & logo"),
+    h("p", { class: "form-hint", style: "margin-bottom:12px" },
+      "A receipt heading alone does not establish GST compliance. Confirm the required invoice fields, " +
+      "e-invoicing applicability and treatment of each supply with your accountant."),
+    h("p", { class: "form-hint", style: "margin-bottom:12px" },
+      "Choose paper width for browser printing, export to PDF via the print dialog, and optionally print your shop logo. " +
+      "Select matching paper size in the printer's own dialog as well."),
+    h("div", { class: "field" }, h("label", {}, "How are product prices entered?"), priceTaxSelect,
+      h("p", { class: "form-hint" }, "This setting changes how ALL catalog prices are interpreted for NEW sales. " +
+        "Do not switch it without reviewing your SKU prices. Past invoices and refunds keep their original mode.")),
+    h("div", { class: "field" }, h("label", {}, "Paper / print layout"), paperSelect),
+    h("div", { class: "field" }, h("label", {}, "Receipt heading"), titleSelect),
+    h("div", { class: "field" }, h("label", {}, "Local tax component"), localTaxSelect),
+    h("div", { class: "field" }, h("label", {}, "Upload shop logo (PNG/JPEG/WebP, maximum 200 KiB)"), logoInput),
+    logoPreview,
+    h("label", { class: "credit-toggle" }, showLogo, h("span", {}, "Print logo on receipts")),
+    h("div", { class: "field" }, h("label", {}, "Logo width in mm (12–65)"), logoWidth),
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
+      h("button", { class: "btn primary", onclick: async () => {
+        try {
+          const values = {
+            receipt_paper: paperSelect.value,
+            price_tax_mode: priceTaxSelect.value,
+            receipt_heading: titleSelect.value,
+            receipt_logo_width: logoWidth.value,
+            show_receipt_logo: showLogo.checked ? "true" : "false",
+            store_local_tax: localTaxSelect.value,
+          };
+          if (logoInput.files?.length) {
+            values.store_logo = await new Promise((resolve, reject) => {
+              const reader = new FileReader();
+              reader.onload = () => resolve(reader.result);
+              reader.onerror = () => reject(new Error("Could not read the selected logo"));
+              reader.readAsDataURL(logoInput.files[0]);
+            });
+          }
+          state.settings = await api.saveSettings(values);
+          toast("Receipt printing preferences saved.", "success");
+          renderSettingsView(main);
+        } catch (e) { toastError(e); }
+      } }, icon("i-check"), "Save print settings"),
+      h("button", { class: "btn", onclick: () => {
+        // Explicitly non-transactional calibration slip, not a fabricated sale.
+        const settingsNow = { ...state.settings, receipt_paper: paperSelect.value,
+          show_receipt_logo: showLogo.checked ? "true" : "false",
+          receipt_logo_width: logoWidth.value };
+        const calibration = h("div", { class: "receipt" },
+          settingsNow.store_logo && settingsNow.show_receipt_logo === "true" ?
+            h("div", { class: "r-center" }, h("img", {
+              src: settingsNow.store_logo, class: "receipt-logo",
+              style: `width:${Math.min(65, Math.max(12, Number(settingsNow.receipt_logo_width) || 32))}mm`,
+              alt: "Store logo" })) : null,
+          h("div", { class: "r-center r-store" }, settingsNow.store_name),
+          h("div", { class: "r-center" }, settingsNow.store_address || ""),
+          h("hr"), h("div", { class: "r-center r-bold" }, "TEST PRINT - NOT A SALE"),
+          h("div", { class: "r-center" }, "Adjust paper size, margins and logo alignment on your printer."),
+          h("hr"));
+        // Use chosen paper without forcing the user to save first.
+        const saved = state.settings.receipt_paper;
+        state.settings.receipt_paper = paperSelect.value;
+        printReceipt(calibration);
+        state.settings.receipt_paper = saved;
+      } }, icon("i-printer"), "Print test slip"),
+      h("button", { class: "btn subtle-danger", onclick: async () => {
+        if (!state.settings.store_logo) return toast("No saved logo to remove.", "warn");
+        if (!(await confirmDialog({title:"Remove store logo?", message:"The stored receipt logo will be removed.",
+          confirmLabel:"Remove logo", danger:true}))) return;
+        try {
+          state.settings = await api.saveSettings({ store_logo: "" });
+          toast("Logo removed.", "success"); renderSettingsView(main);
+        } catch (e) { toastError(e); }
+      } }, "Remove logo")));
 
   let productsCount = null;
   try {
@@ -81,14 +207,16 @@ export async function renderSettingsView(main) {
     h("span", {}));
 
   const taxCard = h("div", { class: "card card-pad", style: "margin-top:16px" },
-    h("h3", { style: "margin-bottom:6px" }, "Tax breakup on receipts"),
+    h("h3", { style: "margin-bottom:6px" }, "Legacy / unregistered tax display"),
     h("label", { class: "credit-toggle", style: "margin-bottom:10px" },
       breakupOn,
       h("span", {}, "Show tax breakup lines on bills (e.g. GST as CGST + SGST)")),
     h("p", { style: "color:var(--text-2);font-size:12.5px;margin-bottom:12px" },
       "Each product's tax rate is split between the enabled components. " +
       "Example: a 5% product with two 50% components prints CGST 2.5% and SGST 2.5%. " +
-      "Disable the second component for single-line taxes such as IGST."),
+      "Disable the second component for single-line taxes such as IGST. " +
+      "For a store with GSTIN, new sale receipts instead use the selected intra/inter-state type, " +
+      "and save the breakup at checkout."),
     compHead,
     ...compRows,
     h("button", {
@@ -182,7 +310,7 @@ export async function renderSettingsView(main) {
         h("h2", {}, "Settings"),
         h("div", { class: "sub" }, "Store details and receipt preferences"))),
 
-    h("div", { style: "max-width:620px" },
+    h("div", { style: "max-width:680px" },
       h("div", { class: "card card-pad" },
         h("h3", { style: "margin-bottom:14px" }, "Store"),
         form,
@@ -193,7 +321,9 @@ export async function renderSettingsView(main) {
               store_name: inputs.store_name.value.trim() || "My Store",
               store_address: addressIn.value.trim(),
               store_phone: inputs.store_phone.value.trim(),
-              currency: inputs.currency.value.trim() || "$",
+              currency: inputs.currency.value.trim() || "₹",
+              ...Object.fromEntries(Object.entries(businessInputs).map(([k, el]) =>
+                [k, el.value.trim()])) ,
               tax_label: inputs.tax_label.value.trim() || "Tax",
               low_stock_threshold: String(parseInt(inputs.low_stock_threshold.value, 10) || 5),
               receipt_footer: footerIn.value.trim(),
@@ -207,6 +337,7 @@ export async function renderSettingsView(main) {
           },
         }, icon("i-check"), "Save settings")),
 
+      brandingCard,
       taxCard,
 
       h("div", { class: "card card-pad", style: "margin-top:16px" },

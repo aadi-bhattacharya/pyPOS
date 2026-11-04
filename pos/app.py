@@ -8,7 +8,7 @@ from pathlib import Path
 
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_file, session
 
-from pos.db import connect, migrate as migrate_db
+from pos.db import connect, init_db
 from pos import catalog, reports, sales, backups, gdrive
 from pos import customers as customers_mod
 from pos import parked as parked_mod
@@ -345,13 +345,15 @@ def create_app(db_path=None, extra_hosts=()):
             quantity=data.get("quantity", 0),
             cost_price=data.get("cost_price"),
             tax_rate=data.get("tax_rate", 0),
+            hsn_code=data.get("hsn_code", ""),
+            unit_code=data.get("unit_code", "NOS"),
         )
         return jsonify(catalog.get_product(get_db(), pid)), 201
 
     @app.patch("/api/products/<int:pid>")
     def api_products_update(pid):
         fields = {}
-        for key in ("SKU", "barcode", "price", "cost_price", "tax_rate", "group_id"):
+        for key in ("SKU", "barcode", "price", "cost_price", "tax_rate", "group_id", "hsn_code", "unit_code"):
             if key in body():
                 fields[key] = body()[key]
         catalog.update_product(get_db(), pid, **fields)
@@ -392,6 +394,8 @@ def create_app(db_path=None, extra_hosts=()):
             discount_value=discount.get("value"),
             customer_id=data.get("customer_id"),
             use_credit=bool(data.get("use_credit")),
+            supply_type=data.get("supply_type", "intra"),
+            place_of_supply=data.get("place_of_supply", ""),
         )
         return jsonify(receipt), 201
 
@@ -482,7 +486,7 @@ def create_app(db_path=None, extra_hosts=()):
     @auth.require_auth(lambda: auth.is_configured(_admin_password()))
     def api_backup_restore(name):
         backups.restore_backup(name, live_path=db_path())
-        migrate_db(app.config["DB_PATH"])
+        init_db(app.config["DB_PATH"])
         return jsonify({"ok": True})
 
     @app.delete("/api/backups/<path:name>")
@@ -500,7 +504,7 @@ def create_app(db_path=None, extra_hosts=()):
         if not f.filename.lower().endswith((".db", ".sqlite", ".sqlite3")):
             return fail(400, "Upload a .db / .sqlite file")
         backups.save_upload_and_restore(f, live_path=db_path())
-        migrate_db(app.config["DB_PATH"])
+        init_db(app.config["DB_PATH"])
         return jsonify({"ok": True})
 
     # ---------------- Google Drive (native OAuth) ----------------
@@ -580,7 +584,9 @@ def create_app(db_path=None, extra_hosts=()):
             name=data.get("name"),
             phone=data.get("phone"),
             email=data.get("email"),
-            notes=data.get("notes"))
+            notes=data.get("notes"),
+            gstin_number=data.get("gstin", ""),
+            billing_address=data.get("billing_address", ""))
         return jsonify(cust), 201
 
     @app.get("/api/customers/<int:cid>")
@@ -597,7 +603,9 @@ def create_app(db_path=None, extra_hosts=()):
         return jsonify(customers_mod.update_customer(
             get_db(), cid,
             name=data.get("name"), phone=data.get("phone"),
-            email=data.get("email"), notes=data.get("notes")))
+            email=data.get("email"), notes=data.get("notes"),
+            gstin_number=data.get("gstin"),
+            billing_address=data.get("billing_address")))
 
     @app.delete("/api/customers/<int:cid>")
     def api_customer_delete(cid):
@@ -682,7 +690,13 @@ def create_app(db_path=None, extra_hosts=()):
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(header)
-        writer.writerows(rows)
+        # Prevent spreadsheet formula injection via user-controlled names,
+        # addresses and SKU fields. Preserve typed numeric cells (including
+        # negative monetary amounts) as numbers.
+        for row in rows:
+            writer.writerow(["'" + cell if isinstance(cell, str) and
+                cell.lstrip().startswith(("=", "+", "-", "@")) else cell
+                for cell in row])
         data = "\ufeff" + buf.getvalue()  # BOM so Excel opens UTF-8 cleanly
         return Response(
             data, mimetype="text/csv",
@@ -694,23 +708,64 @@ def create_app(db_path=None, extra_hosts=()):
             request.args.get("from_date"), request.args.get("to_date"))
         cur = get_db().cursor()
         cur.execute(
-            ''' SELECT s.id, s.timestamp, s.status, s.subtotal, s.discount_total,
-                       s.tax_total, s.total,
-                       COALESCE((SELECT SUM(quantity) FROM sale_items si
-                                 WHERE si.sale_id = s.id), 0),
-                       COALESCE((SELECT GROUP_CONCAT(DISTINCT method) FROM payments p
-                                 WHERE p.sale_id = s.id), '')
-                FROM sales s
-                WHERE (? IS NULL OR s.timestamp >= ?)
-                  AND (? IS NULL OR s.timestamp <= ?)
-                ORDER BY s.id DESC''',
+            """SELECT s.id, COALESCE(s.invoice_number, ''), s.timestamp,
+                      s.status, COALESCE(s.parent_sale_id, ''),
+                      s.subtotal, s.discount_total, s.tax_total, s.total,
+                      CASE WHEN s.status = 'REFUNDED' THEN -s.total
+                           WHEN s.status = 'VOID' THEN 0 ELSE s.total END,
+                      COALESCE((SELECT SUM(quantity) FROM sale_items si
+                                WHERE si.sale_id = s.id), 0),
+                      COALESCE((SELECT GROUP_CONCAT(DISTINCT method) FROM payments p
+                                WHERE p.sale_id = s.id), '')
+               FROM sales s
+               WHERE (? IS NULL OR s.timestamp >= ?)
+                 AND (? IS NULL OR s.timestamp <= ?)
+               ORDER BY s.id DESC""",
             (from_ts, from_ts, to_ts, to_ts))
-        rows = [tuple(r) for r in cur.fetchall()]
         return _csv_response(
-            rows,
-            ["receipt", "timestamp_utc", "status", "subtotal", "discount",
-             "tax", "total", "items", "payment_methods"],
+            [tuple(r) for r in cur.fetchall()],
+            ["receipt", "invoice_number", "timestamp_utc", "status",
+             "parent_sale", "subtotal", "discount", "tax", "total",
+             "signed_net_effect", "items", "payment_methods"],
             "pypos-sales.csv")
+
+    @app.get("/api/export/sale-lines.csv")
+    def api_export_sale_lines():
+        """Recorded item-level GST data, without reconstructing missing older records.
+
+        Legacy rows can have empty HSN or default recorded tax cents. Such
+        omissions remain explicit rather than being replaced with estimates.
+        """
+        from_ts, to_ts = sales.parse_utc_bounds(
+            request.args.get("from_date"), request.args.get("to_date"))
+        cur = get_db().cursor()
+        cur.execute(
+            """SELECT s.id AS receipt, COALESCE(s.invoice_number, '') AS invoice_number,
+                      s.timestamp, s.status, COALESCE(s.parent_sale_id, '') AS parent_sale,
+                      COALESCE(si.sku_at_sale, '') AS sku, 
+                      COALESCE(si.description_at_sale, '') AS description,
+                      COALESCE(si.hsn_at_sale, '') AS hsn,
+                      COALESCE(si.unit_at_sale, '') AS uqc,
+                      si.quantity, si.unit_price, si.tax_rate_at_sale,
+                      si.discount_cents, si.tax_cents
+               FROM sales s JOIN sale_items si ON si.sale_id = s.id
+               WHERE (? IS NULL OR s.timestamp >= ?)
+                 AND (? IS NULL OR s.timestamp <= ?)
+               ORDER BY s.id DESC, si.id ASC""",
+            (from_ts, from_ts, to_ts, to_ts))
+        rows = []
+        for r in cur.fetchall():
+            rows.append((r["receipt"], r["invoice_number"], r["timestamp"],
+                         r["status"], r["parent_sale"], r["sku"], r["description"],
+                         r["hsn"], r["uqc"], r["quantity"], r["unit_price"],
+                         r["tax_rate_at_sale"],
+                         round(int(r["discount_cents"] or 0) / 100, 2),
+                         round(int(r["tax_cents"] or 0) / 100, 2)))
+        return _csv_response(rows, ["receipt", "invoice_number", "timestamp_utc",
+                    "status", "parent_sale", "sku_at_sale", "description_at_sale",
+                    "hsn_sac_at_sale", "unit_code_at_sale", "quantity", "unit_price",
+                    "tax_percent_at_sale", "recorded_discount", "recorded_tax"],
+                    "pypos-sale-lines.csv")
 
     @app.get("/api/export/inventory.csv")
     def api_export_inventory():
@@ -720,12 +775,12 @@ def create_app(db_path=None, extra_hosts=()):
             attrs = "; ".join(f"{a['name']}={a['value']}" for a in p["attributes"])
             stock_value = round((p["cost_price"] or 0) * p["quantity"], 2)
             rows.append([p["SKU"], p["group_name"] or "", attrs, p["barcode"] or "",
-                         p["quantity"], p["price"], p["cost_price"], p["tax_rate"],
+                         p["quantity"], p["price"], p["cost_price"], p["tax_rate"], p["hsn_code"], p["unit_code"],
                          stock_value])
         return _csv_response(
             rows,
             ["sku", "product", "variants", "barcode", "stock", "price",
-             "cost", "tax_percent", "stock_value_at_cost"],
+             "cost", "tax_percent", "hsn_sac", "unit_code", "stock_value_at_cost"],
             "pypos-inventory.csv")
 
     return app

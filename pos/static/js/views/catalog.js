@@ -213,7 +213,8 @@ function renderTable() {
           : null),
       h("td", {},
         h("div", { class: "cell-main" }, p.SKU),
-        p.barcode ? h("div", { class: "cell-sub" }, p.barcode) : null),
+        p.barcode ? h("div", { class: "cell-sub" }, p.barcode) : null,
+        p.hsn_code ? h("div", { class: "cell-sub" }, `HSN/SAC ${p.hsn_code}`) : null),
       h("td", { class: "num" }, fmt(p.price)),
       h("td", { class: "num cell-sub" },
         Number(p.cost_price) > 0 ? fmt(p.cost_price) : "—"),
@@ -322,7 +323,9 @@ function productModal(existing = null) {
     "number", "0.01");
   const fCost = fieldInput("Cost",
     existing?.cost_price ? String(existing.cost_price) : "", "number", "0.01");
-  const fTax = fieldInput("Tax %", existing != null ? trimRate(existing.tax_rate) : "5",
+  const fHsn = fieldInput("HSN / SAC (optional)", existing?.hsn_code || "");
+  const fUnit = fieldInput("Quantity unit (UQC, e.g. NOS / PCS)", existing?.unit_code || "NOS");
+  const fTax = fieldInput("GST rate %", existing != null ? trimRate(existing.tax_rate) : "0",
     "number", "0.01");
   const fQty = fieldInput("Opening stock", "0", "number", "1");
 
@@ -356,6 +359,8 @@ function productModal(existing = null) {
       h("div", { class: "field" }, h("label", {}, "Group"), groupSel),
       h("div", { class: "form-row" }, fSKU.wrap, fBarcode.wrap),
       h("div", { class: "form-row" }, fPrice.wrap, fCost.wrap, fTax.wrap),
+      h("div", { class: "form-row" }, fHsn.wrap, fUnit.wrap),
+      h("p", { class: "form-hint" }, "Enter the correct applicable GST rate and HSN/SAC for the product. Rates are not inferred automatically."),
       isEdit
         ? h("p", { class: "form-hint", style: "margin-bottom:13px" },
             `Stock (${existing.quantity}) is adjusted from the catalog table.`)
@@ -381,17 +386,23 @@ function productModal(existing = null) {
       price: parseFloat(fPrice.input.value),
       cost_price: parseFloat(fCost.input.value) || 0,
       tax_rate: parseFloat(fTax.input.value) || 0,
+      hsn_code: fHsn.input.value.trim(),
+      unit_code: fUnit.input.value.trim().toUpperCase() || "NOS",
       group_id: groupSel.value ? Number(groupSel.value) : null,
     };
 
     // inline validation — mark fields in place instead of only toasting
-    [fSKU, fBarcode, fPrice, fCost, fTax, fQty].forEach((f) => setFieldError(f, null));
+    [fSKU, fBarcode, fPrice, fCost, fTax, fQty, fHsn, fUnit].forEach((f) => setFieldError(f, null));
     let bad = null;
     if (!payload.SKU) bad = setFieldError(fSKU, "SKU is required");
     if (isNaN(payload.price) || payload.price < 0)
       bad = setFieldError(fPrice, "Enter a valid price");
     if (isNaN(payload.tax_rate) || payload.tax_rate < 0)
       bad = setFieldError(fTax, "Tax must be 0 or more");
+    if (payload.hsn_code && !/^\d{2,8}$/.test(payload.hsn_code))
+      bad = setFieldError(fHsn, "Enter 2–8 digits");
+    if (!/^[A-Z]{2,8}$/.test(payload.unit_code))
+      bad = setFieldError(fUnit, "Use 2–8 letters, e.g. NOS or PCS");
     if (!isEdit) {
       const q = parseInt(fQty.input.value, 10);
       if (isNaN(q) || q < 0) bad = setFieldError(fQty, "Stock can't be negative");

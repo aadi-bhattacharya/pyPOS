@@ -159,7 +159,7 @@ class RefundVoidTests(POSTestCase):
         pid, r = self.complete_sale(qty=2)
         voided = sales.void_sale(self.conn, r["id"])
         self.assertEqual(voided["status"], "VOID")
-        self.assertEqual(len(voided["items"]), 0)
+        self.assertEqual(len(voided["items"]), 1)  # preserve audit trail
         self.assertEqual(catalog.get_product(self.conn, pid)["quantity"], 7)
         with self.assertRaises(sales.AlreadyProcessedError):
             sales.void_sale(self.conn, r["id"])

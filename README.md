@@ -1,7 +1,13 @@
 # pyPOS
 
 A simple, practical point-of-sale system for small shops. Runs entirely on
-your machine — one Python dependency, no internet needed, data stays local.
+your machine, needs no internet for sales, and keeps data local.
+
+**India-focused edition:** ₹ / Indian number grouping, GST-inclusive and
+exclusive prices, HSN/SAC and UQC, FY invoice references, configurable invoice
+details, 58/80 mm/A4 printing with your own shop logo, and audit CSV exports.
+Start with [INDIA_SETUP.md](INDIA_SETUP.md) and [CHANGES_INDIA.md](CHANGES_INDIA.md).
+**This is not a certified GST invoicing, filing or IRN/e-invoicing system.**
 
 ![stack](https://img.shields.io/badge/python-3.10+-blue) ![ui](https://img.shields.io/badge/ui-browser%20(offline)-purple)
 
@@ -25,10 +31,11 @@ your machine — one Python dependency, no internet needed, data stays local.
   products, payment mix, low-stock alerts — plus end-of-day close-outs:
   open the day with a drawer float, watch live X read-outs, then count the
   drawer and print a Z report that records counted cash vs expected.
-- **Settings** — store name/address/phone, currency symbol, tax label, receipt
-  footer, low-stock threshold, and GST-style **tax breakup** on bills: toggle
-  it on and each product's tax rate prints as components (e.g. 5% →
-  CGST 2.5% + SGST 2.5%), with custom component names and rate shares.
+- **Settings** — store name/address/phone, GSTIN, State/UT, optional FSSAI and
+  UPI ID, Indian rupee locale, receipt footer, low-stock threshold, and
+  CGST/SGST/UTGST/IGST components on new bills (selected by supply type for
+  GSTIN-configured businesses). Upload your shop logo and select 58 mm/80 mm/A4
+  receipt paper, including logo sizing, visibility and a test-print slip.
   Optionally **lock Settings behind an admin password** (hashed with
   PBKDF2-SHA256, never stored in plaintext) while the register stays open
   for cashiers. Light/dark theme.
@@ -164,8 +171,10 @@ Click a cart line to select it for `+`/`-`.
 
 ## How money works
 
-- Product prices are **pre-tax**; each product has a tax rate in percent
-  (`5` = 5%).
+- Product prices are **tax-exclusive by default** (the original pyPOS mode).
+  Settings can switch new sales to **GST-inclusive** prices (typical MRP), with
+  tax backed out of the discounted selling price. Each product has a tax rate
+  in percent (`5` = 5%), configured by the merchant.
 - Order-level discounts are allocated proportionally across lines in exact
   cents; tax is applied to each discounted line and rounded half-up.
 - Payments are validated server-side: non-cash tenders apply first, cash
@@ -174,8 +183,9 @@ Click a cart line to select it for `+`/`-`.
   journal (top-ups, spends, refunds); a sale can split between credit and any
   tender, but the balance can never go negative.
 - Partial refunds recompute each returned unit from the line's recorded
-  discount/tax cents, return money across the original tenders in exact
-  proportion (or into store credit), and restock only what came back.
+  discount/tax paise, return money across the original tenders and any
+  store-credit component proportionally (or into store credit on request),
+  and restock only what came back.
 
 ## End of day
 
@@ -264,7 +274,7 @@ them or run stock to zero.
 ## Development
 
 ```bash
-python -m unittest discover -s tests   # backend test suite (139 tests)
+python -m unittest discover -s tests   # backend test suite (needs Flask installed)
 ```
 
 There is also a headless end-to-end test that drives the real UI in a virtual

@@ -1,4 +1,5 @@
 // DOM builder, toasts, modals, confirms.
+import { state } from "./api.js";
 
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -129,6 +130,10 @@ export function confirmDialog({ title = "Are you sure?", message = "", confirmLa
 export function printReceipt(receiptEl) {
   const root = document.getElementById("print-root");
   root.innerHTML = "";
+  root.dataset.paper = state.settings.receipt_paper || "80mm";
   root.append(receiptEl.cloneNode(true));
-  window.print();
+  // Let the embedded logo load before opening the browser print dialog.
+  const images = [...root.querySelectorAll("img")];
+  Promise.all(images.map((img) => img.decode?.().catch(() => {}) || Promise.resolve()))
+    .then(() => window.print());
 }

@@ -5,7 +5,7 @@ export const state = {
     store_name: "My Store",
     store_address: "",
     store_phone: "",
-    currency: "$",
+    currency: "₹",
     tax_label: "Tax",
     receipt_footer: "Thank you for shopping with us!",
     low_stock_threshold: "5",
@@ -134,8 +134,8 @@ export async function refreshSettings() {
 
 export function fmt(amount) {
   const n = Number(amount || 0);
-  const sym = state.settings.currency || "$";
-  const str = Math.abs(n).toLocaleString(undefined, {
+  const sym = state.settings.currency || "₹";
+  const str = Math.abs(n).toLocaleString("en-IN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -146,21 +146,26 @@ export function fmtDate(ts) {
   if (!ts) return "";
   // SQLite CURRENT_TIMESTAMP is UTC "YYYY-MM-DD HH:MM:SS"
   const d = new Date(ts.replace(" ", "T") + "Z");
-  return d.toLocaleString(undefined, {
+  return d.toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
     month: "short", day: "numeric",
     hour: "2-digit", minute: "2-digit",
   });
 }
 
 export function todayISO(offsetDays = 0) {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  // Browser timezone need not match the shop. India has no DST.
+  const d = new Date(Date.now() + offsetDays * 86400000);
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit", day: "2-digit",
+  }).formatToParts(d);
+  const get = (type) => parts.find((p) => p.type === type).value;
+  return `${get("year")}-${get("month")}-${get("day")}`;
 }
 
 // Mirror of the server's cent-exact totals math so the register preview
 // always matches the final receipt. Tax rates are percent points.
-export function computeTotals(lines, discountMode, discountValue) {
+export function computeTotals(lines, discountMode, discountValue, taxInclusive = false) {
   const prepared = lines.map((l) => ({
     gross: Math.round(Number(l.price) * l.quantity * 100),
     ratePct: Number(l.tax_rate || 0),
@@ -187,7 +192,8 @@ export function computeTotals(lines, discountMode, discountValue) {
     allocated += share;
     const net = l.gross - share;
     // net is in cents; tax cents = net × pct/100 (ratePct is percent points)
-    return { gross: l.gross, discount: share, net, tax: Math.round((net * l.ratePct) / 100) };
+    return { gross: l.gross, discount: share, net,
+      tax: Math.round((net * l.ratePct) / (taxInclusive ? (100 + l.ratePct) : 100)) };
   });
 
   const taxTotal = lineDetails.reduce((a, l) => a + l.tax, 0);
@@ -195,6 +201,6 @@ export function computeTotals(lines, discountMode, discountValue) {
     subtotal: grossTotal / 100,
     discount: disc / 100,
     tax: taxTotal / 100,
-    total: (grossTotal - disc + taxTotal) / 100,
+    total: (grossTotal - disc + (taxInclusive ? 0 : taxTotal)) / 100,
   };
 }

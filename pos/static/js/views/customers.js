@@ -129,6 +129,11 @@ function customerModal(existing = null) {
   const name = h("input", { class: "input", value: existing?.name || "", placeholder: "Full name" });
   const phone = h("input", { class: "input", value: existing?.phone || "", placeholder: "Phone (optional)" });
   const email = h("input", { class: "input", type: "email", value: existing?.email || "", placeholder: "Optional" });
+  const gstin = h("input", { class: "input", value: existing?.gstin || "", maxlength: "15",
+    placeholder: "Optional, 15 characters" });
+  const billingAddress = h("textarea", { class: "input", rows: "2",
+    placeholder: "Customer billing address (optional)" });
+  billingAddress.value = existing?.billing_address || "";
   const notes = h("textarea", { class: "input", rows: "2", placeholder: "Optional" }, existing?.notes || "");
 
   const saveBtn = h("button", { class: "btn primary" },
@@ -137,6 +142,7 @@ function customerModal(existing = null) {
     const payload = {
       name: name.value, phone: phone.value,
       email: email.value, notes: notes.value,
+      gstin: gstin.value, billing_address: billingAddress.value,
     };
     try {
       if (existing) {
@@ -162,6 +168,8 @@ function customerModal(existing = null) {
       h("div", { class: "field" }, h("label", {}, "Name *"), name),
       h("div", { class: "field" }, h("label", {}, "Phone"), phone),
       h("div", { class: "field" }, h("label", {}, "Email"), email),
+      h("div", { class: "field" }, h("label", {}, "Customer GSTIN"), gstin),
+      h("div", { class: "field" }, h("label", {}, "Billing address"), billingAddress),
       h("div", { class: "field" }, h("label", {}, "Notes"), notes)),
     footer: [
       h("button", { class: "btn", onclick: () => m.close() }, "Cancel"),
@@ -288,9 +296,11 @@ async function detailModal(id) {
       h("div", { style: "display:flex;gap:18px;margin-bottom:12px;font-size:13px;color:var(--text-2)" },
         h("span", {}, h("strong", {}, String(c.orders)), " orders"),
         h("span", {}, h("strong", {}, fmt(c.total_spent)), " lifetime")),
-      (c.phone || c.email || c.notes)
+      (c.phone || c.email || c.notes || c.gstin || c.billing_address)
         ? h("div", { class: "card", style: "padding:10px 14px;margin-bottom:14px;font-size:13px" },
             c.phone ? h("div", {}, c.phone) : null,
+            c.gstin ? h("div", {}, `GSTIN: ${c.gstin}`) : null,
+            c.billing_address ? h("div", {}, c.billing_address) : null,
             c.email ? h("div", {}, c.email) : null,
             c.notes ? h("div", { style: "color:var(--text-2)" }, c.notes) : null)
         : null,

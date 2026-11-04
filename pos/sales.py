@@ -1,5 +1,8 @@
+import json
 from decimal import Decimal, ROUND_HALF_UP
-from datetime import datetime
+from .india import next_invoice_number
+from datetime import datetime, timezone
+from .india import IST
 
 from .catalog import (
     ProductNotFoundError,
@@ -46,11 +49,11 @@ def _money(value):
 
 
 def _cents(value):
-    """Decimal dollars -> integer cents (half-up)."""
+    """Decimal currency units -> integer paise (half-up)."""
     return int(_money(value) * 100)
 
 
-def compute_totals(lines, discount_mode=None, discount_value=None):
+def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive=False):
     """
     Compute sale totals for lines of {price, tax_rate, quantity}.
 
@@ -104,9 +107,11 @@ def compute_totals(lines, discount_mode=None, discount_value=None):
             share = disc_cents - allocated
         allocated += share
         net_cents = ln["gross_cents"] - share
-        tax_cents = int(
-            (_money(Decimal(net_cents) / 100 * ln["rate_fraction"])) * 100
-        )
+        tax_cents = int(_money(
+            (Decimal(net_cents) / 100 * ln["rate_fraction"] /
+             (Decimal(1) + ln["rate_fraction"])) if tax_inclusive
+            else (Decimal(net_cents) / 100 * ln["rate_fraction"])
+        ) * 100)
         result_lines.append({
             **ln,
             "discount_cents": share,
@@ -121,7 +126,8 @@ def compute_totals(lines, discount_mode=None, discount_value=None):
         "discount_total": Decimal(disc_cents) / 100,
         "subtotal_net": Decimal(gross_total_cents - disc_cents) / 100,
         "tax_total": Decimal(tax_total_cents) / 100,
-        "total": Decimal(gross_total_cents - disc_cents + tax_total_cents) / 100,
+        "total": Decimal(gross_total_cents - disc_cents +
+                         (0 if tax_inclusive else tax_total_cents)) / 100,
     }
 
 
@@ -148,7 +154,7 @@ def _normalize_items(conn, items):
     cur = conn.cursor()
     marks = ",".join("?" * len(order))
     cur.execute(
-        f''' SELECT p.id, p.SKU, p.price, p.tax_rate, p.quantity, g.name AS group_name
+        f''' SELECT p.id, p.SKU, p.price, p.tax_rate, p.quantity, p.hsn_code, p.unit_code, g.name AS group_name
              FROM products p LEFT JOIN product_groups g ON g.id = p.group_id
              WHERE p.id IN ({marks}) ''',
         order,
@@ -164,11 +170,19 @@ def _normalize_items(conn, items):
         if item["quantity"] > row["quantity"]:
             name = row["group_name"] or f"Product {pid}"
             raise InsufficientStockError(f"{name}: only {row['quantity']} left in stock")
+        attributes = cur.execute(
+            """SELECT attribute_name, attribute_value FROM product_attributes
+               WHERE product_id = ? ORDER BY attribute_name COLLATE NOCASE""", (pid,)).fetchall()
+        variant = ", ".join(f"{a['attribute_name']}: {a['attribute_value']}" for a in attributes)
+        group_name = row["group_name"] or f"Product {pid}"
         normalized.append({**item, **{
+            "description": f"{group_name} ({variant})" if variant else group_name,
             "SKU": row["SKU"],
             "price": row["price"],
             "tax_rate": row["tax_rate"],
             "group_name": row["group_name"],
+            "hsn_code": row["hsn_code"],
+            "unit_code": row["unit_code"],
         }})
     return normalized
 
@@ -223,29 +237,35 @@ def _normalize_payments(payments, total, currency_note=True):
     return applied, change
 
 
-def _refund_line_money(row, k, qty_orig):
-    """
-    Exact money for refunding k of qty_orig units from one original line.
+def _refund_line_money(row, k, qty_orig, tax_inclusive=False, already_qty=0):
+    """Cumulative cent allocation for partial refunds.
 
-    Uses the per-line discount/tax cents recorded at checkout so a partial
-    return refunds exactly what was paid for those units (half-up rounding
-    per share). Legacy lines without recorded cents fall back to gross price
-    and rate-derived tax.
+    Take the difference between total allocations at previous/new quantities,
+    rather than rounding independent refunds. Consequently repeated partial
+    refunds reconcile to the original recorded discount and tax to the cent.
     """
     gross_c = _cents(_d(row["unit_price"]) * qty_orig)
-    disc_total = int(_money(row["discount_cents"] or 0)) if row[
-        "discount_cents"] is not None else 0
-    tax_total = int(_money(row["tax_cents"] or 0)) if row[
-        "tax_cents"] is not None else 0
+    disc_c = int(_d(row["discount_cents"] or 0))
+    recorded_tax_c = int(_d(row["tax_cents"] or 0))
 
-    r_gross = int(_money(Decimal(gross_c) * k / Decimal(qty_orig)))
-    r_disc = int(_money(Decimal(disc_total) * k / Decimal(qty_orig)))
+    def apportioned(cents, quantity):
+        return int(_money(Decimal(cents) * quantity / qty_orig))
+
+    before = already_qty
+    after = before + k
+    r_gross = apportioned(gross_c, after) - apportioned(gross_c, before)
+    r_disc = apportioned(disc_c, after) - apportioned(disc_c, before)
     r_net = r_gross - r_disc
-    if tax_total > 0:
-        r_tax = int(_money(Decimal(tax_total) * k / Decimal(qty_orig)))
+    if recorded_tax_c:
+        r_tax = apportioned(recorded_tax_c, after) - apportioned(recorded_tax_c, before)
     else:
-        rate_fraction = _d(row["tax_rate_at_sale"]) / Decimal(100)
-        r_tax = int((_money(Decimal(r_net) / 100 * rate_fraction)) * 100)
+        # A legacy invoice may pre-date recorded tax cents. Reconstruct only
+        # its tax rate's share; newly recorded zero-tax lines remain zero.
+        rate = _d(row["tax_rate_at_sale"]) / 100
+        full_net = gross_c - disc_c
+        fraction = rate / (1 + rate) if tax_inclusive else rate
+        tax_estimate = int(_money(Decimal(full_net) / 100 * fraction) * 100)
+        r_tax = apportioned(tax_estimate, after) - apportioned(tax_estimate, before)
     return r_gross, r_disc, r_net, r_tax
 
 
@@ -255,7 +275,7 @@ def _split_refund(total, parts):
     cents) proportionally; last part absorbs the rounding remainder so the
     shares always sum to `total`.
     """
-    parts = [max(0, int(p)) for p in parts]
+    parts = [max(Decimal(0), _d(p)) for p in parts]
     total_orig = sum(parts)
     if total_orig <= 0 or total <= 0:
         return [0] * len(parts)
@@ -263,7 +283,7 @@ def _split_refund(total, parts):
     allocated = 0
     for i, c in enumerate(parts):
         if i < len(parts) - 1:
-            s = total * c // total_orig
+            s = int(Decimal(total) * c / total_orig)
             allocated += s
         else:
             s = total - allocated
@@ -272,7 +292,7 @@ def _split_refund(total, parts):
 
 
 def checkout(conn, items, payments=None, discount_mode=None, discount_value=None,
-             customer_id=None, use_credit=False):
+             customer_id=None, use_credit=False, supply_type="intra", place_of_supply=""):
     """
     Complete a sale atomically: validate stock, recompute all money server-side,
     insert sale + items + payments, decrement inventory (via trigger), commit.
@@ -281,16 +301,24 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
     `use_credit` any available store credit is spent first and the rest of the
     balance due must be covered by `payments`.
     """
+    if supply_type not in ("intra", "inter"):
+        raise InvalidSaleError("Supply type must be intra or inter-state")
+    place_of_supply = str(place_of_supply or "").strip()
+    if len(place_of_supply) > 120:
+        raise InvalidSaleError("Place of supply is too long")
     conn.execute("BEGIN IMMEDIATE")
     try:
         normalized = _normalize_items(conn, items)
-        totals = compute_totals(normalized, discount_mode, discount_value)
+        cfg_checkout = settings_mod.get_settings(conn)
+        tax_inclusive = cfg_checkout.get("price_tax_mode") == "inclusive"
+        totals = compute_totals(normalized, discount_mode, discount_value,
+                                tax_inclusive=tax_inclusive)
 
         customer = None
         if customer_id is not None:
             cur = conn.cursor()
             cur.execute(
-                ''' SELECT id, name, store_credit_cents FROM customers
+                ''' SELECT id, name, store_credit_cents, gstin, billing_address FROM customers
                     WHERE id = ? ''', (int(customer_id),))
             row = cur.fetchone()
             if row is None:
@@ -314,14 +342,59 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
             # fully covered by store credit
             applied_payments, change = [], Decimal(0)
 
+        cfg = settings_mod.get_settings(conn)
+        if supply_type == "inter" and not place_of_supply:
+            raise InvalidSaleError("Enter the inter-state place of supply")
+        if supply_type == "intra":
+            place_of_supply = cfg.get("store_state") or ""
+        # Tax allocation and business details are captured at checkout; editing
+        # Settings or customer records must not rewrite old invoices.
+        tax_cfg = dict(cfg)
+        if cfg.get("store_gstin"):
+            tax_cfg.update({"tax_breakup": "true", "tax_comp1_enabled": "true",
+                            "tax_comp1_name": "IGST" if supply_type == "inter" else "CGST",
+                            "tax_comp1_share": "100" if supply_type == "inter" else "50",
+                            "tax_comp2_enabled": "false" if supply_type == "inter" else "true",
+                            "tax_comp2_name": cfg.get("store_local_tax") or "SGST",
+                            "tax_comp2_share": "50"})
+        tax_items = [{"tax_rate_at_sale": src["tax_rate"], "tax_cents": tot["tax_cents"]}
+                     for src, tot in zip(normalized, totals["lines"])]
+        invoice_snapshot = {
+            "store_name": cfg.get("store_name") or "",
+            "store_address": cfg.get("store_address") or "",
+            "store_phone": cfg.get("store_phone") or "",
+            "store_gstin": cfg.get("store_gstin") or "",
+            "store_state": cfg.get("store_state") or "",
+            "store_state_code": cfg.get("store_state_code") or "",
+            "store_fssai": cfg.get("store_fssai") or "",
+            "store_upi_id": cfg.get("store_upi_id") or "",
+            "receipt_heading": cfg.get("receipt_heading") or "Retail receipt",
+            "currency": cfg.get("currency") or "₹",
+            "tax_label": cfg.get("tax_label") or "GST",
+            "receipt_footer": cfg.get("receipt_footer") or "",
+            "supply_type": supply_type,
+            "price_tax_mode": "inclusive" if tax_inclusive else "exclusive",
+            "place_of_supply": place_of_supply,
+            "customer_name": customer.get("name") if customer else "",
+            "customer_gstin": customer.get("gstin") if customer else "",
+            "customer_address": customer.get("billing_address") if customer else "",
+            "tax_breakup": _tax_breakup(conn, tax_items, tax_cfg),
+            "tax_configuration": {
+                k: tax_cfg.get(k) for k in ("tax_breakup", "tax_comp1_enabled",
+                "tax_comp1_name", "tax_comp1_share", "tax_comp2_enabled",
+                "tax_comp2_name", "tax_comp2_share")
+            },
+        }
+        invoice_number = next_invoice_number(conn)
         cur = conn.cursor()
         cur.execute(
             ''' INSERT INTO sales(subtotal, tax_total, discount_total, total,
-                                  status, customer_id)
-                VALUES(?, ?, ?, ?, 'COMPLETED', ?) ''',
+                                  status, customer_id, invoice_number, invoice_snapshot)
+                VALUES(?, ?, ?, ?, 'COMPLETED', ?, ?, ?) ''',
             (float(totals["subtotal_gross"]), float(totals["tax_total"]),
              float(totals["discount_total"]), float(totals["total"]),
-             customer["id"] if customer else None),
+             customer["id"] if customer else None, invoice_number,
+             json.dumps(invoice_snapshot, ensure_ascii=False)),
         )
         sale_id = cur.lastrowid
 
@@ -332,11 +405,14 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
             cur.execute(
                 ''' INSERT INTO sale_items(sale_id, product_id, quantity,
                                            unit_price, tax_rate_at_sale,
-                                           discount_cents, tax_cents)
-                    VALUES(?, ?, ?, ?, ?, ?, ?) ''',
+                                           discount_cents, tax_cents, hsn_at_sale, unit_at_sale,
+                                           description_at_sale, sku_at_sale)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ''',
                 (sale_id, src_line["product_id"], src_line["quantity"],
                  float(src_line["price"]), float(src_line["tax_rate"]),
-                 line_cents["discount_cents"], line_cents["tax_cents"]),
+                 line_cents["discount_cents"], line_cents["tax_cents"],
+                 src_line["hsn_code"], src_line["unit_code"],
+                 src_line["description"], src_line["SKU"]),
             )
 
         for p in applied_payments:
@@ -369,14 +445,14 @@ def get_sale(conn, sale_id):
     return dict(row) if row else None
 
 
-def _tax_breakup(conn, item_rows):
+def _tax_breakup(conn, item_rows, cfg=None):
     """
     Split each tax rate into receipt components (e.g. 5% GST -> CGST 2.5% +
     SGST 2.5%), configured in Settings. Returns [{name, rate, amount}] or []
     when the breakup is disabled. Cent-exact: components always sum to the
     sale's tax total.
     """
-    cfg = settings_mod.get_settings(conn)
+    cfg = cfg if cfg is not None else settings_mod.get_settings(conn)
     if cfg.get("tax_breakup") != "true":
         return []
 
@@ -425,7 +501,9 @@ def get_sale_detail(conn, sale_id):
     cur = conn.cursor()
     cur.execute(
         ''' SELECT si.product_id, si.quantity, si.unit_price, si.tax_rate_at_sale,
-                   si.tax_cents, g.name AS group_name, p.SKU
+                   si.tax_cents, si.hsn_at_sale, si.unit_at_sale,
+                   si.description_at_sale, si.sku_at_sale,
+                   g.name AS group_name, p.SKU
             FROM sale_items si
             JOIN products p ON p.id = si.product_id
             LEFT JOIN product_groups g ON g.id = p.group_id
@@ -464,13 +542,15 @@ def get_sale_detail(conn, sale_id):
     for r in item_rows:
         variant = ", ".join(attrs_by_product.get(r["product_id"], []))
         name = r["group_name"] or f"Product {r['product_id']}"
-        display_name = f"{name} ({variant})" if variant else name
+        display_name = r["description_at_sale"] or (f"{name} ({variant})" if variant else name)
         line_gross = _money(_d(r["unit_price"]) * r["quantity"])
         refunded_qty = min(refunded_by_pid.get(r["product_id"], 0), r["quantity"])
         items.append({
             "product_id": r["product_id"],
             "name": display_name,
-            "SKU": r["SKU"],
+            "SKU": r["sku_at_sale"] or r["SKU"],
+            "hsn_code": r["hsn_at_sale"],
+            "unit_code": r["unit_at_sale"],
             "quantity": r["quantity"],
             "unit_price": float(r["unit_price"]),
             "tax_rate": float(r["tax_rate_at_sale"]),
@@ -498,6 +578,10 @@ def get_sale_detail(conn, sale_id):
         ''' SELECT COALESCE(SUM(-delta_cents), 0) AS c FROM credit_events
             WHERE sale_id = ? AND delta_cents < 0 ''', (sale_id,))
     credit_used = cur.fetchone()["c"]
+    cur.execute(
+        """SELECT COALESCE(SUM(delta_cents), 0) AS c FROM credit_events
+           WHERE sale_id = ? AND delta_cents > 0""", (sale_id,))
+    credit_returned = cur.fetchone()["c"] if sale["status"] == "REFUNDED" else 0
 
     customer_name = None
     if sale["customer_id"]:
@@ -508,6 +592,8 @@ def get_sale_detail(conn, sale_id):
     paid = sum(p["amount"] for p in payments)
     return {
         "id": sale["id"],
+        "invoice_number": sale.get("invoice_number"),
+        "invoice": json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else None,
         "timestamp": sale["timestamp"],
         "status": sale["status"],
         "parent_sale_id": sale["parent_sale_id"],
@@ -519,6 +605,8 @@ def get_sale_detail(conn, sale_id):
         "customer_id": sale["customer_id"],
         "customer_name": customer_name,
         "store_credit_used": round(credit_used / 100, 2),
+        "store_credit_refunded": round(credit_returned / 100, 2),
+        "refunded_to_credit": credit_returned > 0,
         "items": items,
         "payments": payments,
         "children": children,
@@ -526,7 +614,8 @@ def get_sale_detail(conn, sale_id):
         "fully_refunded": bool(items) and all(
             it["refundable_qty"] == 0 for it in items) and any(
             c["status"] == "REFUNDED" for c in children),
-        "tax_breakup": _tax_breakup(conn, item_rows),
+        "tax_breakup": (json.loads(sale["invoice_snapshot"]).get("tax_breakup", [])
+                        if sale.get("invoice_snapshot") else _tax_breakup(conn, item_rows)),
     }
 
 
@@ -542,7 +631,7 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0)
         where.append("s.status = ?")
         params.append(status)
     sql = '''
-        SELECT s.id, s.timestamp, s.subtotal, s.tax_total, s.discount_total,
+        SELECT s.id, s.invoice_number, s.timestamp, s.subtotal, s.tax_total, s.discount_total,
                s.total, s.status, s.parent_sale_id, s.customer_id,
                c.name AS customer_name,
                COALESCE(i.item_count, 0) AS item_count,
@@ -661,8 +750,12 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
             raise AlreadyProcessedError(
                 f"Sale {sale_id} has nothing left to refund")
 
+        # Refunds use the ORIGINAL sale's price mode, not today's Settings.
+        source_snapshot = json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else {}
+        tax_inclusive = source_snapshot.get("price_tax_mode") == "inclusive"
         # Validate quantities against what remains refundable; compute money.
         gross_c = disc_c = tax_c = net_c = 0
+        refund_tax_lines = []
         for pid in order:
             row = orig_by_pid[pid]
             qty_orig = int(row["quantity"])
@@ -672,20 +765,31 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                 raise SalesError(
                     f"Only {remaining} unit(s) of that item can still be "
                     f"refunded on sale {sale_id}")
-            rg, rd, rn, rt = _refund_line_money(row, k, qty_orig)
+            rg, rd, rn, rt = _refund_line_money(row, k, qty_orig, tax_inclusive, already.get(pid, 0))
             gross_c += rg
             disc_c += rd
             net_c += rn
             tax_c += rt
+            refund_tax_lines.append({"tax_rate_at_sale": row["tax_rate_at_sale"],
+                                     "tax_cents": rt})
 
-        refund_total_cents = net_c + tax_c
+        refund_total_cents = net_c if tax_inclusive else net_c + tax_c
 
+        parent_invoice = json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else None
+        refund_invoice = None
+        if parent_invoice:
+            refund_invoice = dict(parent_invoice)
+            refund_invoice["refund_destination"] = "credit" if to_credit else "original"
+            refund_invoice["tax_breakup"] = _tax_breakup(
+                conn, refund_tax_lines,
+                parent_invoice.get("tax_configuration") or settings_mod.get_settings(conn))
         cur.execute(
             ''' INSERT INTO sales(subtotal, tax_total, discount_total, total,
-                                  status, parent_sale_id, customer_id)
-                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?) ''',
+                                  status, parent_sale_id, customer_id, invoice_snapshot)
+                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?) ''',
             (gross_c / 100, tax_c / 100, disc_c / 100, refund_total_cents / 100,
-             sale_id, sale["customer_id"]),
+             sale_id, sale["customer_id"],
+             json.dumps(refund_invoice, ensure_ascii=False) if refund_invoice else None),
         )
         refund_id = cur.lastrowid
 
@@ -693,24 +797,24 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
             row = orig_by_pid[pid]
             k = requested[pid]
             qty_orig = int(row["quantity"])
-            rg, rd, rn, rt = _refund_line_money(row, k, qty_orig)
+            rg, rd, rn, rt = _refund_line_money(row, k, qty_orig, tax_inclusive, already.get(pid, 0))
             cur.execute(
                 ''' INSERT INTO sale_items(sale_id, product_id, quantity,
                                            unit_price, tax_rate_at_sale,
-                                           discount_cents, tax_cents)
-                    VALUES(?, ?, ?, ?, ?, ?, ?) ''',
+                                           discount_cents, tax_cents, hsn_at_sale, unit_at_sale,
+                                           description_at_sale, sku_at_sale)
+                    VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ''',
                 (refund_id, pid, k, float(row["unit_price"]),
-                 float(row["tax_rate_at_sale"]), rd, rt),
+                 float(row["tax_rate_at_sale"]), rd, rt, row["hsn_at_sale"], row["unit_at_sale"],
+                 row["description_at_sale"], row["sku_at_sale"]),
             )
 
-        refunded_to_credit = False
         if to_credit:
             if not sale["customer_id"]:
                 raise SalesError(
                     "Refunding to store credit needs a customer on the sale")
             _apply_credit(conn, sale["customer_id"], refund_total_cents,
                           f"Refund of sale #{sale_id}", sale_id=refund_id)
-            refunded_to_credit = True
         else:
             cur.execute(
                 ''' SELECT method, amount FROM payments
@@ -721,32 +825,79 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                 raise SalesError(
                     "This sale was paid with store credit — "
                     "refund to store credit instead")
-            is_partial_refund = refund_total_cents < _cents(sale["total"])
-            split = _split_refund(total=refund_total_cents,
-                                  parts=[_cents(p["amount"] or 0)
-                                         for p in original_payments])
-            for p, share_cents in zip(original_payments, split):
-                if share_cents > 0:
+
+            original_tender_cents = sum(_cents(p["amount"]) for p in original_payments)
+            original_total_cents = _cents(sale["total"])
+            original_credit_cents = max(0, original_total_cents - original_tender_cents)
+            # Earlier explicit credit refunds must not force later returns to
+            # the original tender. Track only returns choosing 'original'.
+            previous = cur.execute(
+                ''' SELECT total, invoice_snapshot FROM sales
+                    WHERE parent_sale_id = ? AND status = 'REFUNDED' AND id != ? ''',
+                (sale_id, refund_id)).fetchall()
+            previous_original_cents = 0
+            for child in previous:
+                snapshot = json.loads(child["invoice_snapshot"]) if child["invoice_snapshot"] else {}
+                if snapshot.get("refund_destination") != "credit":
+                    previous_original_cents += _cents(child["total"])
+
+            # Use cumulative allocation so many small partial refunds exactly
+            # reconcile to the original tender/credit split at the last refund.
+            accumulated = min(original_total_cents,
+                              previous_original_cents + refund_total_cents)
+            target_tender_total = _split_refund(accumulated,
+                                     [original_tender_cents, original_credit_cents])[0]
+            # Payments can contain repeated methods (two cash entries).
+            # Combine them by method to make cumulative refunds unambiguous.
+            tender_by_method = {}
+            for p in original_payments:
+                method = p["method"]
+                tender_by_method[method] = tender_by_method.get(method, 0) + _cents(p["amount"])
+            methods = list(tender_by_method)
+            target_each_payment = _split_refund(
+                target_tender_total, [tender_by_method[method] for method in methods])
+            already_paid = cur.execute(
+                ''' SELECT p.method, COALESCE(SUM(p.amount), 0) AS amount
+                    FROM payments p JOIN sales rs ON rs.id = p.sale_id
+                    WHERE rs.parent_sale_id = ? AND rs.status = 'REFUNDED'
+                    GROUP BY p.method ''', (sale_id,)).fetchall()
+            paid_by_method = {r["method"]: _cents(r["amount"]) for r in already_paid}
+            is_partial_refund = refund_total_cents < original_total_cents
+            tender_now_cents = 0
+            for method, target in zip(methods, target_each_payment):
+                prior = paid_by_method.get(method, 0)
+                share_cents = target - prior
+                if share_cents < 0:
+                    raise SalesError("Previous refunds exceed the original tender allocation")
+                if share_cents:
                     cur.execute(
                         ''' INSERT INTO payments(sale_id, method, amount, is_partial)
                             VALUES(?, ?, ?, ?) ''',
-                        (refund_id, p["method"], share_cents / 100,
+                        (refund_id, method, share_cents / 100,
                          1 if is_partial_refund else 0),
                     )
+                    tender_now_cents += share_cents
+            credit_now_cents = refund_total_cents - tender_now_cents
+            if credit_now_cents < 0:
+                raise SalesError("Refund would exceed original tender allocation")
+            if credit_now_cents:
+                if not sale["customer_id"]:
+                    raise SalesError("Store credit refund needs an original customer")
+                _apply_credit(conn, sale["customer_id"], credit_now_cents,
+                              f"Return credit from sale #{sale_id}", sale_id=refund_id)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
 
-    detail = get_sale_detail(conn, refund_id)
-    detail["refunded_to_credit"] = refunded_to_credit
-    return detail
+    return get_sale_detail(conn, refund_id)
 
 
 def void_sale(conn, sale_id):
-    """
-    Void a completed sale: delete its items while it is still COMPLETED so the
-    restore_inventory_on_item_delete trigger returns stock, then mark VOID.
+    """Void a never-refunded sale, retaining its original invoice item audit trail.
+
+    Rather than deleting the lines and losing evidence of what was sold,
+    reverse inventory and preserve the lines while changing the sale status.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -755,14 +906,22 @@ def void_sale(conn, sale_id):
             raise SaleNotFoundError(f"No sale with id {sale_id}")
         if sale["status"] != "COMPLETED":
             raise AlreadyProcessedError(
-                f"Sale {sale_id} is {sale['status']} and cannot be voided"
-            )
+                f"Sale {sale_id} is {sale['status']} and cannot be voided")
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM sale_items WHERE sale_id = ?", (sale_id,))
-        if cur.fetchone() is None:
+        if cur.execute(
+                "SELECT 1 FROM sales WHERE parent_sale_id = ? AND status = 'REFUNDED' LIMIT 1",
+                (sale_id,)).fetchone():
+            raise AlreadyProcessedError(
+                "A refunded sale cannot be voided: refund stock was already restored")
+        item_rows = cur.execute(
+            "SELECT product_id, quantity FROM sale_items WHERE sale_id = ?",
+            (sale_id,)).fetchall()
+        if not item_rows:
             raise SalesError(f"Sale {sale_id} has no items to void")
-        cur.execute("DELETE FROM sale_items WHERE sale_id = ?", (sale_id,))
-        cur.execute("UPDATE sales SET status = 'VOID' WHERE id = ?", (sale_id,))
+        for row in item_rows:
+            cur.execute("UPDATE products SET quantity=quantity+? WHERE id=?",
+                        (row["quantity"], row["product_id"]))
+        cur.execute("UPDATE sales SET status='VOID' WHERE id=?", (sale_id,))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -776,7 +935,7 @@ def parse_utc_bounds(from_local_date=None, to_local_date=None):
     format stored by SQLite CURRENT_TIMESTAMP ('YYYY-MM-DD HH:MM:SS').
     """
     out_from = out_to = None
-    tz = datetime.now().astimezone().tzinfo
+    tz = IST
     if from_local_date:
         dt = datetime.strptime(str(from_local_date), "%Y-%m-%d").replace(tzinfo=tz)
         out_from = datetime.utcfromtimestamp(dt.timestamp()).strftime("%Y-%m-%d %H:%M:%S")

@@ -1,6 +1,15 @@
 import sqlite3
 
 from .db import connect
+from .india import hsn
+import re
+
+
+def _unit(value):
+    value = str(value or "NOS").strip().upper()
+    if not re.fullmatch(r"[A-Z]{2,8}", value):
+        raise InvalidInputError("Unit of quantity must be 2–8 letters, e.g. NOS or PCS")
+    return value
 
 
 class CatalogError(Exception):
@@ -104,7 +113,7 @@ def get_group(conn, group_id):
     return dict(row) if row else None
 
 
-def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_price, tax_rate):
+def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code="", unit_code="NOS"):
     if not SKU or not str(SKU).strip():
         raise InvalidInputError("SKU cannot be empty")
     if price is None or float(price) < 0:
@@ -116,8 +125,8 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
     if tax_rate is None or float(tax_rate) < 0:
         raise InvalidInputError("Tax rate cannot be negative")
 
-    sql = ''' INSERT INTO products(group_id, SKU, barcode, price, quantity, cost_price, tax_rate)
-              VALUES(?, ?, ?, ?, ?, ?, ?) '''
+    sql = ''' INSERT INTO products(group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code, unit_code)
+              VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) '''
     cur = conn.cursor()
     try:
         cur.execute(sql, (
@@ -125,6 +134,7 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
             # column is NOT NULL DEFAULT 0 — never bind an explicit NULL
             float(cost_price) if cost_price is not None else 0.0,
             float(tax_rate) if tax_rate is not None else 0.0,
+            hsn(hsn_code), _unit(unit_code),
         ))
         conn.commit()
         return cur.lastrowid
@@ -209,7 +219,7 @@ add_quantity = adjust_stock
 
 
 def update_product(conn, product_id, **fields):
-    ALLOWED_FIELDS = {"SKU", "barcode", "cost_price", "tax_rate", "price", "group_id"}
+    ALLOWED_FIELDS = {"SKU", "barcode", "cost_price", "tax_rate", "price", "group_id", "hsn_code", "unit_code"}
     NON_NEGATIVE_FIELDS = {"cost_price", "tax_rate", "price"}
 
     if not fields:
@@ -232,6 +242,11 @@ def update_product(conn, product_id, **fields):
 
     if "SKU" in fields and (not fields["SKU"] or not str(fields["SKU"]).strip()):
         raise InvalidInputError("SKU cannot be empty")
+
+    if "hsn_code" in fields:
+        fields["hsn_code"] = hsn(fields["hsn_code"])
+    if "unit_code" in fields:
+        fields["unit_code"] = _unit(fields["unit_code"])
 
     values = []
     assignments = []
@@ -304,7 +319,7 @@ def _attach_attributes(conn, products):
 
 PRODUCT_SELECT = '''
     SELECT p.id, p.group_id, p.SKU, p.barcode, p.price, p.quantity,
-           p.cost_price, p.tax_rate, p.updated, g.name AS group_name
+           p.cost_price, p.tax_rate, p.hsn_code, p.unit_code, p.updated, g.name AS group_name
     FROM products p
     LEFT JOIN product_groups g ON g.id = p.group_id
 '''

@@ -156,6 +156,23 @@ def migrate(conn):
                 f"ALTER TABLE sale_items ADD COLUMN {col} REAL NOT NULL DEFAULT 0")
             changed = True
 
+    for table, new_columns in {
+        "products": {"hsn_code": "TEXT NOT NULL DEFAULT ''",
+                     "unit_code": "TEXT NOT NULL DEFAULT 'NOS'"},
+        "customers": {"gstin": "TEXT NOT NULL DEFAULT ''",
+                      "billing_address": "TEXT NOT NULL DEFAULT ''"},
+        "sale_items": {"hsn_at_sale": "TEXT NOT NULL DEFAULT ''",
+                       "unit_at_sale": "TEXT NOT NULL DEFAULT 'NOS'",
+                       "description_at_sale": "TEXT NOT NULL DEFAULT ''",
+                       "sku_at_sale": "TEXT NOT NULL DEFAULT ''"},
+        "sales": {"invoice_number": "TEXT", "invoice_snapshot": "TEXT"},
+    }.items():
+        existing = _columns(conn, table)
+        for column, sql_type in new_columns.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+                changed = True
+
     if changed:
         conn.commit()
 

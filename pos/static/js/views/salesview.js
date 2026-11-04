@@ -1,4 +1,4 @@
-import { api, fmt, fmtDate } from "../api.js";
+import { api, fmt, fmtDate, todayISO } from "../api.js";
 import { h, icon, openModal, closeModalAll, toast, toastError, confirmDialog, printReceipt } from "../ui.js";
 import { buildReceipt, methodLabel } from "../receipt.js";
 import { showReceiptModal } from "./register.js";
@@ -17,24 +17,8 @@ const PRESETS = [
 
 function dateRange() {
   if (preset === "all") return {};
-  const to = new Date();
-  let from = new Date();
-  if (preset === "today") {
-    // same day
-  } else {
-    from.setDate(from.getDate() - (Number(preset) - 1));
-  }
-  return {
-    from_date: isoLocal(from),
-    to_date: isoLocal(to),
-  };
-}
-
-function isoLocal(d) {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
+  const startOffset = preset === "today" ? 0 : -(Number(preset) - 1);
+  return { from_date: todayISO(startOffset), to_date: todayISO() };
 }
 
 export async function renderSales(main) {
@@ -57,7 +41,7 @@ export async function renderSales(main) {
     for (const [value, label] of PRESETS) {
       presetChips.append(h("button", {
         class: `chip${preset === value ? " active" : ""}`,
-        onclick: () => { preset = value; renderPresetChips(); loadRows(); },
+        onclick: () => { preset = value; renderSales(main); },
       }, label));
     }
   };
@@ -72,6 +56,10 @@ export async function renderSales(main) {
         h("div", { class: "sub", id: "sales-sub" })),
       h("div", { class: "view-actions" },
         statusSel,
+        h("a", { class: "btn", href: `/api/export/sales.csv?${new URLSearchParams(dateRange())}`,
+          title: "Export all sale statuses for the selected period" }, "Sales CSV"),
+        h("a", { class: "btn", href: `/api/export/sale-lines.csv?${new URLSearchParams(dateRange())}`,
+          title: "Export recorded HSN/SAC and tax for each sale line" }, "Line items CSV"),
         h("button", { class: "btn ghost icon-only", title: "Refresh",
           onclick: () => loadRows() }, icon("i-refresh")))),
     h("div", { style: "margin-bottom:14px" }, presetChips),
@@ -110,11 +98,12 @@ async function loadRows() {
   }
 
   const total = rows.filter((r) => r.status === "COMPLETED")
-    .reduce((a, r) => a + r.total, 0);
+    .reduce((a, r) => a + r.total, 0) - rows.filter((r) => r.status === "REFUNDED")
+      .reduce((a, r) => a + r.total, 0);
   tableEl.append(
     h("div", { style: "display:flex;justify-content:flex-end;margin-bottom:8px" },
       h("span", { class: "pill muted" },
-        `Net completed: ${fmt(total)}`)),
+        `Net after refunds: ${fmt(total)}`)),
     h("div", { class: "table-wrap" },
       h("table", { class: "table" },
         h("thead", {}, h("tr", {},
@@ -135,14 +124,14 @@ function rowHtml(r) {
     actions.push(
       actionBtn("i-undo", "Refund sale", () => refundDialog(r.id, () => {})));
   }
-  if (r.status === "COMPLETED") {
+  if (r.status === "COMPLETED" && !r.refunded) {
     actions.push(actionBtn("i-ban", "Void sale", () => voidFlow(r)));
   }
   actions.unshift(actionBtn("i-eye", "View details", () => detailModal(r.id)));
 
   return h("tr", {},
     h("td", {}, h("div", { class: "cell-main" },
-      `#${String(r.id).padStart(5, "0")}`),
+      r.invoice_number || `#${String(r.id).padStart(5, "0")}`),
       r.parent_sale_id ? h("div", { class: "cell-sub" },
         `refund of #${String(r.parent_sale_id).padStart(5, "0")}`) : null,
       r.customer_name ? h("div", { class: "cell-sub" }, r.customer_name) : null),
@@ -183,7 +172,7 @@ async function detailModal(id) {
     : null;
 
   openModal({
-    title: `Sale #${String(sale.id).padStart(5, "0")}`,
+    title: sale.invoice_number ? `Invoice ${sale.invoice_number}` : `Sale #${String(sale.id).padStart(5, "0")}`,
     narrow: true,
     body: h("div", {},
       receiptEl,

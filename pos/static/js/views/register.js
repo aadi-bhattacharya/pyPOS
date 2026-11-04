@@ -45,7 +45,8 @@ export async function renderRegister(main) {
       h("div", { class: "view-title" },
         h("h2", {}, "Register"),
         h("div", { class: "sub" },
-          lowCount > 0 ? `${lowCount} product${lowCount > 1 ? "s" : ""} running low on stock` : "All stocked up"))),
+          (lowCount > 0 ? `${lowCount} product${lowCount > 1 ? "s" : ""} running low on stock` : "All stocked up") +
+          ` · GST ${state.settings.price_tax_mode === "inclusive" ? "included" : "added at checkout"}`))),
     );
 
   const grid = h("div", { class: "register-grid" });
@@ -321,7 +322,8 @@ function cartTotals() {
     const p = byId(id);
     return { price: p.price, tax_rate: p.tax_rate, quantity: qty };
   });
-  return computeTotals(lines, discountValue > 0 ? discountMode : null, discountValue);
+  return computeTotals(lines, discountValue > 0 ? discountMode : null, discountValue,
+    state.settings.price_tax_mode === "inclusive");
 }
 
 function renderCart() {
@@ -867,9 +869,9 @@ function openPayment() {
       }
     };
     quickWrap.append(h("div", { class: "quick-cash" }, exact,
-      ...[5, 10, 20, 50, 100].filter((n) => n >= balance).map((note) => {
+      ...[10, 20, 50, 100, 200, 500, 2000].filter((n) => n >= balance).map((note) => {
         const b = h("button", { class: "chip" },
-          `${state.settings.currency || "$"}${note}`);
+          `${state.settings.currency || "₹"}${note}`);
         b.onclick = () => {
           const last = lastCashRow();
           if (last) {
@@ -883,6 +885,21 @@ function openPayment() {
         return b;
       })));
   }
+
+  const supplySelect = h("select", { class: "input" },
+    h("option", { value: "intra" }, "Within same state (CGST + SGST/UTGST)"),
+    h("option", { value: "inter" }, "Inter-state (IGST)"));
+  const posInput = h("input", { class: "input", placeholder: "e.g. Maharashtra (27)",
+    value: "" });
+  const posField = h("div", { class: "field", style: "display:none" },
+    h("label", {}, "Place of supply (State/UT) *"), posInput);
+  supplySelect.addEventListener("change", () => {
+    posField.style.display = supplySelect.value === "inter" ? "" : "none";
+  });
+  const supplyBox = h("div", { class: "field" },
+    h("label", {}, "GST supply type"), supplySelect,
+    h("div", { class: "form-hint" },
+      "Use the correct place-of-supply classification for this sale. Verify exceptions separately."));
 
   const backBtn = h("button", { class: "btn" }, "Back");
   const completeBtn = h("button", {
@@ -909,6 +926,8 @@ function openPayment() {
           : null,
         customer_id: customer ? customer.id : null,
         use_credit: creditApplied > 0,
+        supply_type: supplySelect.value,
+        place_of_supply: posInput.value.trim(),
       };
 
       const receipt = await api.checkout(payload);
@@ -947,6 +966,8 @@ function openPayment() {
         h("span", { class: "lbl" }, "Amount due"),
         bannerAmtEl),
       creditToggle,
+      supplyBox,
+      posField,
       rowsWrap,
       h("button", {
         class: "btn sm",
@@ -964,7 +985,8 @@ export function showReceiptModal(receipt) {
   const m = openModal({
     title: receipt.status === "REFUNDED"
       ? `Refund #${receipt.id}`
-      : `Sale #${String(receipt.id).padStart(5, "0")} complete`,
+      : receipt.invoice_number ? `Invoice ${receipt.invoice_number} complete` :
+        `Sale #${String(receipt.id).padStart(5, "0")} complete`,
     narrow: true,
     body: receiptEl,
     footer: [
