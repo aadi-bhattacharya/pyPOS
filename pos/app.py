@@ -16,8 +16,12 @@ from pos import cash_sessions
 from pos import settings as settings_mod
 from pos import auth
 from pos import loyalty
+from pos import catalog_import
+from pos import operations
+from pos import staff
 from pos.demo import seed_demo_data
 from pos.security import install_security
+from pos.india import LOGO_PATTERN
 
 NOT_FOUND_ERRORS = (
     catalog.GroupNotFoundError,
@@ -42,15 +46,17 @@ CONFLICT_ERRORS = (
 _LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>pyPOS — Settings login</title>
+<title>{brand_name} — Settings login</title>
 <link rel="stylesheet" href="/static/css/app.css">
 <style>
   body {{ display: grid; place-items: center; min-height: 100vh; margin: 0; }}
   .login-card {{ width: 320px; padding: 28px 30px; }}
   .login-brand {{ text-align: center; margin-bottom: 18px; }}
   .login-brand .brand-mark {{ display: inline-grid; place-items: center;
-    width: 40px; height: 40px; border-radius: 9px; background: #2F66C4;
-    color: #fff; font-weight: 800; font-size: 20px; }}
+    width: 40px; height: 40px; border-radius: 9px; background: {accent};
+    color: {foreground}; font-weight: 800; font-size: 20px; }}
+  .login-brand .brand-mark.has-image {{ background: #fff; border: 1px solid var(--border); overflow:hidden; }}
+  .login-brand .brand-mark img {{ width: 100%; height: 100%; object-fit: contain; }}
   .login-brand h1 {{ font-size: 15px; margin: 8px 0 2px; }}
   .login-brand p {{ margin: 0; color: var(--muted); font-size: 12px; }}
   .login-error {{ color: var(--danger); font-size: 12.5px; font-weight: 600;
@@ -60,8 +66,8 @@ _LOGIN_PAGE = """<!DOCTYPE html>
 <body>
   <div class="card login-card">
     <div class="login-brand">
-      <span class="brand-mark">P</span>
-      <h1>pyPOS</h1>
+      {brand_mark}
+      <h1>{brand_name}</h1>
       <p>Settings access</p>
     </div>
     {error}
@@ -70,7 +76,7 @@ _LOGIN_PAGE = """<!DOCTYPE html>
 </body></html>"""
 
 
-def _login_page(error="", body=None, next="/#/settings", escaped_next=None):
+def _login_page(error="", body=None, next="/#/settings", escaped_next=None, branding=None):
     if body is None:
         body = """
     <form method="post" action="/login">
@@ -81,7 +87,22 @@ def _login_page(error="", body=None, next="/#/settings", escaped_next=None):
       <button class="btn primary block" type="submit">Log in</button>
     </form>""".format(
             next=html.escape(escaped_next if escaped_next is not None else next))
-    return _LOGIN_PAGE.format(error=error, body=body)
+    branding = branding or {}
+    name = str(branding.get("pos_display_name") or "pyPOS").strip() or "pyPOS"
+    raw_color = str(branding.get("pos_accent_color") or "#1B6BB5")
+    import re
+    color = raw_color if re.fullmatch(r"#[0-9A-Fa-f]{6}", raw_color) else "#1B6BB5"
+    rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
+    foreground = "#151515" if sum(x * w for x, w in zip(rgb, (0.299, 0.587, 0.114))) / 255 > 0.58 else "#ffffff"
+    mode = branding.get("pos_logo_mode") or "default"
+    src = branding.get("pos_logo") if mode == "custom" else branding.get("store_logo") if mode == "receipt" else ""
+    if isinstance(src, str) and LOGO_PATTERN.fullmatch(src):
+        mark = f'<span class="brand-mark has-image"><img alt="" src="{html.escape(src, quote=True)}"></span>'
+    else:
+        # Use a plain text initial, escaped even for user-supplied store names.
+        mark = f'<span class="brand-mark">{html.escape(name[0].upper())}</span>' if mode != "none" else ""
+    return _LOGIN_PAGE.format(error=error, body=body, brand_name=html.escape(name),
+                              brand_mark=mark, accent=color, foreground=foreground)
 
 
 def _assets_on_disk() -> bool:
@@ -142,16 +163,156 @@ def create_app(db_path=None, extra_hosts=()):
             return "/" + nxt
         return "/#/settings"
 
+    def _login_branding():
+        conn = connect(app.config.get("DB_PATH"))
+        try:
+            return settings_mod.get_settings(conn)
+        finally:
+            conn.close()
+
+    # Staff PIN access is opt-in. Existing single-operator installs are unaffected
+    # until an administrator deliberately enrols the first staff account.
+    @app.before_request
+    def _staff_guard():
+        if request.path.startswith("/static/"):
+            return None
+        conn = connect(app.config.get("DB_PATH"))
+        try:
+            enabled = staff.configured(conn)
+            g.staff_enabled = enabled
+            if not enabled:
+                return None
+            actor = staff.get_user(conn, session.get("staff_user_id")) if session.get("staff_user_id") else None
+            g.staff_actor = actor if actor and actor["active"] else None
+        finally:
+            conn.close()
+        if request.path == "/":
+            return None if g.staff_actor else redirect("/staff-login")
+        if not request.path.startswith("/api/"):
+            return None
+        if request.path in ("/api/staff/status", "/api/settings/auth"):
+            return None
+        if not g.staff_actor:
+            return jsonify({"error":"Staff sign-in required", "code":"staff_login_required"}),401
+        path = request.path
+        # Staff identities are separate from the legacy Settings password.
+        # A manager with Settings authentication must still not gain access to
+        # the operator database or private backup downloads.
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            if path.startswith(("/api/backups", "/api/staff/")) and g.staff_actor["role"] != "admin":
+                return jsonify({"error":"Administrator access required", "code":"staff_forbidden"}),403
+            return None
+        admin = (path.startswith("/api/staff/") or path == "/api/staff" or
+                 path.startswith("/api/backups") or path.startswith("/api/demo-data") or
+                 path.startswith("/api/settings"))
+        manager = (path.startswith(("/api/products", "/api/groups", "/api/brands",
+                    "/api/categories", "/api/catalog/import", "/api/suppliers",
+                    "/api/purchases", "/api/stocktakes", "/api/cash-sessions")) or
+                   (path.startswith("/api/sales/") and
+                    (path.endswith("/refund") or path.endswith("/void"))) or
+                   (path.startswith("/api/customers/") and
+                    any(x in path for x in ("/credit", "/loyalty/"))))
+        role=g.staff_actor["role"]
+        if (admin and role != "admin") or (manager and role == "cashier"):
+            return jsonify({"error":"Manager or administrator access required", "code":"staff_forbidden"}),403
+        return None
+
+    @app.after_request
+    def _staff_audit(response):
+        # Append successful staff API actions to a separate operational log.
+        actor = getattr(g, "staff_actor", None)
+        if actor and request.method in ("POST","PUT","PATCH","DELETE") and request.path.startswith("/api/") \
+                and 200 <= response.status_code < 400:
+            conn=connect(app.config.get("DB_PATH"))
+            try:
+                staff.audit(conn,actor,request.method,
+                    request.url_rule.rule if request.url_rule else request.path,response.status_code)
+            except Exception:
+                app.logger.exception("Staff audit write failed")
+            finally:
+                conn.close()
+        return response
+
+    @app.route("/staff-login", methods=["GET","POST"])
+    def staff_login():
+        conn=connect(app.config.get("DB_PATH"))
+        try:
+            if not staff.configured(conn):
+                return redirect("/")
+            error=""
+            if request.method=="POST":
+                actor=staff.verify_login(conn,request.form.get("username"),request.form.get("pin"))
+                if actor:
+                    session["staff_user_id"]=actor["id"]
+                    return redirect("/#/register")
+                auth.throttle_failed_login()
+                error='<div class="login-error">Incorrect username or PIN.</div>'
+        finally:
+            conn.close()
+        form='''<form method="post" action="/staff-login">
+          <div class="field"><label>Staff username</label><input class="input" name="username"
+            autocomplete="username" required autofocus></div>
+          <div class="field"><label>PIN</label><input class="input" name="pin" type="password"
+            inputmode="numeric" autocomplete="current-password" required></div>
+          <button class="btn primary block" type="submit">Open register</button></form>'''
+        return _login_page(error=error,body=form,branding=_login_branding())
+
+    @app.get("/staff-logout")
+    def staff_logout():
+        session.pop("staff_user_id",None)
+        session.pop("settings_auth",None)
+        return redirect("/staff-login")
+
+    @app.get("/api/staff/status")
+    def api_staff_status():
+        conn=connect(app.config.get("DB_PATH"))
+        try:
+            return jsonify({"enabled":staff.configured(conn),
+                "operator":getattr(g,"staff_actor",None)})
+        finally:
+            conn.close()
+
+    @app.get("/api/staff/users")
+    def api_staff_list():
+        if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
+            return jsonify({"error":"Administrator access required"}),403
+        return jsonify(staff.list_users(get_db()))
+
+    @app.post("/api/staff/users")
+    def api_staff_create():
+        conn=get_db()
+        if staff.configured(conn):
+            if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
+                return jsonify({"error":"Administrator access required"}),403
+        elif not auth.is_configured(_admin_password()) or not auth.is_authenticated():
+            return jsonify({"error":"Set an admin password and sign in to Settings before enabling staff PINs"}),403
+        data=body()
+        return jsonify(staff.add_user(conn,data.get("username"),data.get("display_name"),
+            data.get("role"),data.get("pin"))),201
+
+    @app.patch("/api/staff/users/<int:uid>")
+    def api_staff_toggle(uid):
+        if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
+            return jsonify({"error":"Administrator access required"}),403
+        return jsonify(staff.set_active(get_db(),uid,body().get("active")))
+
+    @app.get("/api/staff/audit")
+    def api_staff_audit():
+        if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
+            return jsonify({"error":"Administrator access required"}),403
+        return jsonify(staff.list_audit(get_db()))
+
     @app.route("/login", methods=["GET", "POST"])
     def login():
         stored = _admin_password()
+        branding = _login_branding()
         if not auth.is_configured(stored):
             return _login_page(body="""
             <p class="login-hint">No admin password is set yet, so Settings
-            are currently open. Open pyPOS, go to Settings and set one to
+            are currently open. Open the POS, go to Settings and set one to
             lock this area.</p>
-            <a class="btn block" href="/">Back to pyPOS</a>""",
-                next=_safe_next())
+            <a class="btn block" href="/">Back to Register</a>""",
+                next=_safe_next(), branding=branding)
 
         if request.method == "POST":
             password = request.form.get("password") or ""
@@ -161,11 +322,11 @@ def create_app(db_path=None, extra_hosts=()):
             auth.throttle_failed_login()
             return _login_page(
                 error='<div class="login-error">Wrong password.</div>',
-                next=_safe_next())
+                next=_safe_next(), branding=branding)
 
         if auth.is_authenticated():
             return redirect(_safe_next())
-        return _login_page(next=_safe_next())
+        return _login_page(next=_safe_next(), branding=branding)
 
     @app.get("/logout")
     def logout():
@@ -268,6 +429,8 @@ def create_app(db_path=None, extra_hosts=()):
     app.register_error_handler(cash_sessions.SessionError, lambda e: fail(400, e))
     app.register_error_handler(backups.BackupError, lambda e: fail(400, e))
     app.register_error_handler(gdrive.GoogleDriveError, lambda e: fail(400, e))
+    app.register_error_handler(operations.OperationError, lambda e: fail(400, e))
+    app.register_error_handler(staff.StaffError, lambda e: fail(400, e))
     app.register_error_handler(ValueError, lambda e: fail(400, f"Invalid value: {e}"))
 
     def _redirect_uri():
@@ -294,6 +457,36 @@ def create_app(db_path=None, extra_hosts=()):
     def api_groups_update(gid):
         catalog.rename_product_group(get_db(), gid, body().get("name"))
         return jsonify({"id": gid, "name": body().get("name", "").strip()})
+
+    @app.patch("/api/groups/<int:gid>/classification")
+    def api_group_classification(gid):
+        data = body()
+        def optional_id(value):
+            return int(value) if value not in (None, "") else None
+        catalog.classify_group(get_db(), gid,
+            brand_id=optional_id(data.get("brand_id")),
+            category_id=optional_id(data.get("category_id")))
+        return jsonify({"ok": True})
+
+    @app.get("/api/brands")
+    def api_brands():
+        return jsonify(catalog.list_brands(get_db()))
+
+    @app.post("/api/brands")
+    def api_brands_create():
+        new_id = catalog.create_label(get_db(), "brands", body().get("name"))
+        return jsonify({"id": new_id}), 201
+
+    @app.get("/api/categories")
+    def api_categories():
+        return jsonify(catalog.list_categories(get_db()))
+
+    @app.post("/api/categories")
+    def api_categories_create():
+        data = body()
+        new_id = catalog.create_label(get_db(), "categories", data.get("name"),
+            parent_id=int(data["parent_id"]) if data.get("parent_id") else None)
+        return jsonify({"id": new_id}), 201
 
     @app.delete("/api/groups/<int:gid>")
     def api_groups_delete(gid):
@@ -354,10 +547,12 @@ def create_app(db_path=None, extra_hosts=()):
     @app.patch("/api/products/<int:pid>")
     def api_products_update(pid):
         fields = {}
-        for key in ("SKU", "barcode", "price", "cost_price", "tax_rate", "group_id", "hsn_code", "unit_code"):
+        for key in ("SKU", "barcode", "price", "cost_price", "tax_rate", "group_id", "hsn_code", "unit_code", "reorder_point"):
             if key in body():
                 fields[key] = body()[key]
-        catalog.update_product(get_db(), pid, **fields)
+        catalog.update_product(get_db(), pid, **fields,
+                               verified_gst=body().get("verified_gst") is True,
+                               verified_price=body().get("verified_price") is True)
         return jsonify(catalog.get_product(get_db(), pid))
 
     @app.delete("/api/products/<int:pid>")
@@ -379,8 +574,105 @@ def create_app(db_path=None, extra_hosts=()):
     @app.post("/api/products/<int:pid>/stock")
     def api_stock(pid):
         delta = body().get("delta")
-        new_qty = catalog.adjust_stock(get_db(), pid, delta)
+        new_qty = catalog.adjust_stock(get_db(), pid, delta,
+            reason=body().get("reason", ""), kind=body().get("kind", "ADJUSTMENT"))
         return jsonify({"id": pid, "quantity": new_qty})
+
+    # ---------------- inventory ----------------
+    @app.get("/api/inventory/overview")
+    def api_inventory_overview():
+        threshold = settings_mod.get_settings(get_db()).get("low_stock_threshold") or "0"
+        return jsonify(catalog.stock_overview(get_db(), int(float(threshold))))
+
+    @app.get("/api/inventory/movements")
+    def api_inventory_movements():
+        return jsonify(catalog.stock_history(get_db(),
+            product_id=request.args.get("product_id", type=int),
+            limit=request.args.get("limit", default=100, type=int),
+            offset=request.args.get("offset", default=0, type=int)))
+
+    # ---------------- additive catalogue import ----------------
+    def _catalog_import_payload():
+        upload = request.files.get("file")
+        if upload is None or not upload.filename:
+            return None, None, None, None, (jsonify({"error": "Choose a CSV or XLSX file"}), 400)
+        mode = request.form.get("mode", "skip")
+        allow_zero = request.form.get("allow_zero_prices", "false").lower() == "true"
+        # Read at most the configured limit plus one byte. The service also
+        # checks ZIP inflation limits before XML parsing.
+        blob = upload.stream.read(catalog_import.MAX_UPLOAD + 1)
+        items, issues = catalog_import.parse(blob, upload.filename)
+        return items, issues, mode, allow_zero, None
+
+    @app.post("/api/catalog/import/preview")
+    def api_catalog_import_preview():
+        items, issues, mode, allow_zero, error = _catalog_import_payload()
+        if error is not None:
+            return error
+        return jsonify(catalog_import.preview(get_db(), items, issues, mode, allow_zero))
+
+    @app.post("/api/catalog/import/apply")
+    def api_catalog_import_apply():
+        items, issues, mode, allow_zero, error = _catalog_import_payload()
+        if error is not None:
+            return error
+        summary = catalog_import.apply(get_db(), items, issues, mode, allow_zero,
+            force_repeat=request.form.get("force_repeat") == "true",
+            repeat_reason=request.form.get("repeat_reason", ""))
+        return jsonify(summary)
+
+    # ---------------- retail operations: suppliers, receiving, stocktakes ----------------
+    @app.get("/api/suppliers")
+    def api_suppliers():
+        return jsonify(operations.list_suppliers(get_db()))
+
+    @app.post("/api/suppliers")
+    def api_supplier_create():
+        data = body()
+        return jsonify(operations.new_supplier(get_db(), data.get("name"),
+            phone=data.get("phone", ""), gstin=data.get("gstin", ""),
+            address=data.get("address", ""))), 201
+
+    @app.get("/api/purchases")
+    def api_purchases():
+        return jsonify(operations.list_purchases(get_db()))
+
+    @app.post("/api/purchases")
+    def api_purchases_receive():
+        data = body()
+        return jsonify(operations.receive_purchase(get_db(), data.get("supplier_id"),
+            data.get("supplier_invoice"), data.get("lines"), data.get("note", ""),
+            data.get("invoice_gst"), bool(data.get("update_catalog_cost")))), 201
+
+    @app.get("/api/purchases/<int:pid>")
+    def api_purchase_detail(pid):
+        return jsonify(operations.purchase_detail(get_db(), pid))
+
+    @app.post("/api/purchases/<int:pid>/payments")
+    def api_supplier_payment(pid):
+        data=body()
+        return jsonify(operations.pay_supplier(get_db(),pid,data.get("amount"),
+            data.get("method"),data.get("reference", ""),data.get("request_id"))), 201
+
+    @app.get("/api/stocktakes")
+    def api_stocktakes():
+        return jsonify(operations.list_stocktakes(get_db()))
+
+    @app.post("/api/stocktakes")
+    def api_stocktake_start():
+        return jsonify(operations.start_stocktake(get_db(),body().get("note", ""))),201
+
+    @app.get("/api/stocktakes/<int:sid>")
+    def api_stocktake_detail(sid):
+        return jsonify(operations.get_stocktake(get_db(),sid))
+
+    @app.put("/api/stocktakes/<int:sid>/count/<int:pid>")
+    def api_stocktake_count(sid,pid):
+        return jsonify(operations.count_stock(get_db(),sid,pid,body().get("counted")))
+
+    @app.post("/api/stocktakes/<int:sid>/post")
+    def api_stocktake_post(sid):
+        return jsonify(operations.post_stocktake(get_db(),sid))
 
     # ---------------- sales ----------------
     @app.post("/api/sales")
@@ -397,6 +689,8 @@ def create_app(db_path=None, extra_hosts=()):
             use_credit=bool(data.get("use_credit")),
             supply_type=data.get("supply_type", "intra"),
             place_of_supply=data.get("place_of_supply", ""),
+            request_id=data.get("request_id"),
+            salesperson=data.get("salesperson"),
         )
         return jsonify(receipt), 201
 
@@ -410,6 +704,7 @@ def create_app(db_path=None, extra_hosts=()):
             status=request.args.get("status") or None,
             limit=request.args.get("limit", type=int) or 500,
             offset=request.args.get("offset", type=int) or 0,
+            search=request.args.get("q") or None,
         )
         return jsonify(rows)
 
@@ -417,13 +712,21 @@ def create_app(db_path=None, extra_hosts=()):
     def api_sale_get(sid):
         return jsonify(sales.get_sale_detail(get_db(), sid))
 
+    @app.post("/api/sales/<int:sid>/refund/preview")
+    def api_sale_refund_preview(sid):
+        data = body()
+        return jsonify(sales.preview_refund(get_db(), sid, lines=data.get("lines"),
+                                          to_credit=bool(data.get("to_credit"))))
+
     @app.post("/api/sales/<int:sid>/refund")
     def api_sale_refund(sid):
         data = body()
         lines = data.get("lines")
         to_credit = bool(data.get("to_credit"))
         return jsonify(sales.refund_sale(get_db(), sid, lines=lines,
-                                         to_credit=to_credit))
+                                         to_credit=to_credit,
+                                         reason=data.get("reason", ""),
+                                         request_id=data.get("request_id")))
 
     @app.post("/api/sales/<int:sid>/void")
     def api_sale_void(sid):
@@ -510,6 +813,7 @@ def create_app(db_path=None, extra_hosts=()):
 
     # ---------------- Google Drive (native OAuth) ----------------
     def _gdrive_result_page(ok, detail=""):
+        detail = html.escape(str(detail or ""))
         color = "#067647" if ok else "#d92d20"
         icon = "✓" if ok else "✗"
         heading = "Google Drive connected" if ok else "Google Drive connection failed"
@@ -537,11 +841,17 @@ def create_app(db_path=None, extra_hosts=()):
             "gdrive_client_id": client_id,
             "gdrive_client_secret": client_secret,
         })
-        url = gdrive.build_auth_url(client_id, _redirect_uri())
+        state = secrets.token_urlsafe(32)
+        session["gdrive_oauth_state"] = state
+        url = gdrive.build_auth_url(client_id, _redirect_uri(), state=state)
         return jsonify({"auth_url": url})
 
     @app.get("/gdrive/callback")
     def api_gdrive_callback():
+        expected_state = session.pop("gdrive_oauth_state", None)
+        received_state = request.args.get("state") or ""
+        if not expected_state or not secrets.compare_digest(expected_state, received_state):
+            return _gdrive_result_page(False, "Google Drive connection rejected: invalid OAuth state"), 400
         error = request.args.get("error")
         code = request.args.get("code")
         if error:
@@ -571,11 +881,23 @@ def create_app(db_path=None, extra_hosts=()):
         return jsonify({"ok": True})
 
     # ---------------- customers & store credit ----------------
+    @app.get("/api/customers/overview")
+    def api_customers_overview():
+        row = get_db().execute('''
+            SELECT COUNT(*) AS total_customers,
+                   COALESCE(SUM(loyalty_points), 0) AS outstanding_points,
+                   COALESCE(SUM(CASE WHEN loyalty_points > 0 THEN 1 ELSE 0 END), 0) AS point_holders,
+                   COALESCE(SUM(store_credit_cents), 0) AS outstanding_credit_paise
+            FROM customers
+        ''').fetchone()
+        return jsonify(dict(row))
+
     @app.get("/api/customers")
     def api_customers_list():
         return jsonify(customers_mod.list_customers(
             get_db(), query=request.args.get("q") or None,
-            limit=request.args.get("limit", type=int) or 500))
+            limit=min(500, max(1, request.args.get("limit", type=int) or 500)),
+            balance_filter=request.args.get("filter") or "all"))
 
     @app.post("/api/customers")
     def api_customers_create():
@@ -670,7 +992,8 @@ def create_app(db_path=None, extra_hosts=()):
             label=data.get("label"),
             discount_mode=discount.get("mode"),
             discount_value=discount.get("value"),
-            customer_id=data.get("customer_id"))
+            customer_id=data.get("customer_id"),
+            salesperson=data.get("salesperson", ""))
         return jsonify(ticket), 201
 
     @app.get("/api/parked/<int:pid>")
@@ -711,6 +1034,13 @@ def create_app(db_path=None, extra_hosts=()):
             get_db(), counted_cash=data.get("counted_cash"),
             note=data.get("note")))
 
+    @app.post("/api/cash-sessions/movements")
+    def api_cash_movement():
+        data = body()
+        return jsonify(cash_sessions.record_cash_movement(get_db(),
+            data.get("kind"), data.get("amount"), data.get("reason"),
+            data.get("reference", ""))), 201
+
     @app.get("/api/cash-sessions/<int:sid>/report")
     def api_session_report(sid):
         return jsonify(cash_sessions.session_report(get_db(), sid))
@@ -749,6 +1079,15 @@ def create_app(db_path=None, extra_hosts=()):
              "phone", "event_type", "delta_points", "balance_after",
              "reason", "linked_sale_id"], "pypos-loyalty-ledger.csv")
 
+    @app.get("/api/export/refunds.csv")
+    def api_export_refunds():
+        return _csv_response(sales.refund_export_rows(get_db()),
+            ["refund_receipt_id", "timestamp_utc", "original_sale_id",
+             "original_invoice_number", "customer_id", "reason",
+             "subtotal", "discount", "recorded_gst", "total_refunded",
+             "cash", "card", "upi", "store_credit"],
+            "pypos-refunds.csv")
+
     @app.get("/api/export/sales.csv")
     def api_export_sales():
         from_ts, to_ts = sales.parse_utc_bounds(
@@ -757,7 +1096,7 @@ def create_app(db_path=None, extra_hosts=()):
         cur.execute(
             """SELECT s.id, COALESCE(s.invoice_number, ''), s.timestamp,
                       s.status, COALESCE(s.parent_sale_id, ''),
-                      s.subtotal, s.discount_total, s.tax_total, s.total,
+                      s.subtotal, s.discount_total, s.tax_total, s.total, s.salesperson,
                       CASE WHEN s.status = 'REFUNDED' THEN -s.total
                            WHEN s.status = 'VOID' THEN 0 ELSE s.total END,
                       COALESCE((SELECT SUM(quantity) FROM sale_items si
@@ -773,7 +1112,7 @@ def create_app(db_path=None, extra_hosts=()):
             [tuple(r) for r in cur.fetchall()],
             ["receipt", "invoice_number", "timestamp_utc", "status",
              "parent_sale", "subtotal", "discount", "tax", "total",
-             "signed_net_effect", "items", "payment_methods"],
+             "salesperson", "signed_net_effect", "items", "payment_methods"],
             "pypos-sales.csv")
 
     @app.get("/api/export/sale-lines.csv")

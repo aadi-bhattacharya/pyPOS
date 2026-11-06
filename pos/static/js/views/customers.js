@@ -4,6 +4,20 @@ import { h, icon, openModal, closeModalAll, toast, toastError, confirmDialog } f
 let customers = [];
 let searchTerm = "";
 let tableEl = null;
+let customerStatsEl = null;
+let customerFilter = "all";
+let customerSort = "name";
+let overview = { total_customers: 0, outstanding_points: 0, point_holders: 0,
+  outstanding_credit_paise: 0 };
+let customerSearchTimer = null;
+let customerFetchSeq = 0;
+
+async function updateCustomerPage() {
+  await load();
+  renderSub();
+  renderCustomerStats();
+  renderTable();
+}
 
 export async function renderCustomers(main) {
   main.innerHTML = "";
@@ -15,9 +29,33 @@ export async function renderCustomers(main) {
   const searchInput = h("input", {
     class: "input",
     placeholder: "Search name / phone / email…",
-    oninput: () => { searchTerm = searchInput.value.trim(); renderTable(); },
+    value: searchTerm,
+    oninput: () => {
+      searchTerm = searchInput.value.trim();
+      clearTimeout(customerSearchTimer);
+      customerSearchTimer = setTimeout(updateCustomerPage, 220);
+    },
   });
   tableEl = h("div", {});
+  customerStatsEl = h("div", { class: "customer-stats", "aria-label": "Customer loyalty overview" });
+  const filterChips = h("div", { class: "chips", role: "group", "aria-label": "Customer filters" });
+  function buildFilters() {
+    filterChips.replaceChildren(...[
+      ["all", "All customers"], ["points", "With points"],
+      ["credit", "With store credit"],
+    ].map(([value, label]) => h("button", {
+      class: `chip${customerFilter === value ? " active" : ""}`,
+      "aria-pressed": customerFilter === value ? "true" : "false",
+      onclick: () => { customerFilter = value; buildFilters(); updateCustomerPage(); },
+    }, label)));
+  }
+  buildFilters();
+  const sort = h("select", { class: "input", "aria-label": "Sort customers",
+    onchange: () => { customerSort = sort.value; renderTable(); } },
+    h("option", { value: "name" }, "Sort: Name"),
+    h("option", { value: "points" }, "Sort: Most points"),
+    h("option", { value: "spent" }, "Sort: Highest spend"));
+  sort.value = customerSort;
 
   main.innerHTML = "";
   main.append(
@@ -31,63 +69,98 @@ export async function renderCustomers(main) {
           "Loyalty CSV"),
         h("button", { class: "btn primary", onclick: () => customerModal() },
           icon("i-plus"), "New customer"))),
-    h("div", { class: "search-wrap", style: "margin-bottom:12px;max-width:340px" },
-      icon("i-search"), searchInput),
+    customerStatsEl,
+    h("div", { class: "customer-toolbar" },
+      h("div", { class: "search-wrap" }, icon("i-search"), searchInput),
+      filterChips, sort),
     tableEl,
   );
 
   renderSub();
+  renderCustomerStats();
   renderTable();
 }
 
 async function load() {
+  const seq = ++customerFetchSeq;
   try {
-    customers = await api.listCustomers();
+    const [list, info] = await Promise.all([
+      api.listCustomers(searchTerm, customerFilter), api.customerOverview(),
+    ]);
+    if (seq !== customerFetchSeq) return;
+    customers = list;
+    overview = info;
   } catch (e) {
+    if (seq !== customerFetchSeq) return;
     toastError(e);
     customers = [];
   }
 }
 
 function visible() {
-  if (!searchTerm) return customers;
   const q = searchTerm.toLowerCase();
-  return customers.filter((c) =>
-    (c.name || "").toLowerCase().includes(q) ||
-    (c.phone || "").toLowerCase().includes(q) ||
-    (c.email || "").toLowerCase().includes(q));
+  const result = customers.filter((c) =>
+    (!q || (c.name || "").toLowerCase().includes(q) ||
+      (c.phone || "").toLowerCase().includes(q) ||
+      (c.email || "").toLowerCase().includes(q)) &&
+    (customerFilter === "all" ||
+      (customerFilter === "points" && Number(c.loyalty_points) > 0) ||
+      (customerFilter === "credit" && Number(c.store_credit) > 0)));
+  if (customerSort === "points") result.sort((a, b) =>
+    Number(b.loyalty_points) - Number(a.loyalty_points) || a.name.localeCompare(b.name));
+  else if (customerSort === "spent") result.sort((a, b) =>
+    Number(b.total_spent) - Number(a.total_spent) || a.name.localeCompare(b.name));
+  else result.sort((a, b) => a.name.localeCompare(b.name));
+  return result;
 }
 
 function renderSub() {
   const el = document.getElementById("cust-sub");
-  if (el) {
-    const owing = customers.filter((c) => c.store_credit > 0).length;
-    const pointHolders = customers.filter((c) => c.loyalty_points > 0).length;
-    el.textContent = `${customers.length} customer${customers.length === 1 ? "" : "s"}` +
-      (owing ? ` · ${owing} with store credit` : "") +
-      (pointHolders ? ` · ${pointHolders} with loyalty points` : "");
-  }
+  if (el) el.textContent = `${Number(overview.total_customers).toLocaleString("en-IN")} registered customers · ` +
+    `${customers.length}${customers.length >= 500 ? "+" : ""} displayed${searchTerm ? " for this search" : ""}`;
+}
+
+function renderCustomerStats() {
+  if (!customerStatsEl) return;
+  const points = Number(overview.outstanding_points || 0);
+  const credit = Number(overview.outstanding_credit_paise || 0) / 100;
+  const holders = Number(overview.point_holders || 0);
+  const unit = Number(state.settings.loyalty_redeem_paise || 100) / 100;
+  const card = (label, val) => h("div", {}, h("span", { class: "label" }, label),
+    h("strong", {}, val));
+  customerStatsEl.replaceChildren(
+    card("Registered customers", Number(overview.total_customers || 0).toLocaleString("en-IN")),
+    card("Outstanding loyalty points", `${points.toLocaleString("en-IN")} pts`),
+    card("Customers holding points", holders.toLocaleString("en-IN")),
+    card("Store credit outstanding", fmt(credit)));
+  customerStatsEl.title = `All registered customers, including those not listed on this page. ` +
+    `Current conversion rate: ${fmt(unit)} per point. Points are not store credit until redeemed.`;
 }
 
 function renderTable() {
+  if (!tableEl) return;
   tableEl.innerHTML = "";
   const list = visible();
 
   if (!list.length) {
     tableEl.append(h("div", { class: "empty-state card" },
       icon("i-users"),
-      h("h3", {}, customers.length ? "No one matches that search" : "No customers yet"),
-      h("p", {}, customers.length
-        ? "Try a different name, phone or email."
-        : "Add regulars to track purchases and hand out store credit."),
-      !customers.length
+      h("h3", {}, Number(overview.total_customers) ? "No matching customers" : "No customers yet"),
+      h("p", {}, Number(overview.total_customers)
+        ? "Try another search term or switch back to All customers."
+        : "Add customers to track loyalty points, purchases and store credit."),
+      !Number(overview.total_customers)
         ? h("button", { class: "btn primary", onclick: () => customerModal() },
             icon("i-plus"), "New customer")
         : null));
     return;
   }
 
-  tableEl.append(h("div", { class: "table-wrap" },
+  tableEl.append(
+    customers.length >= 500 ? h("div", { class: "report-note", style: "margin-bottom:8px" },
+      "Showing the first 500 matches. Search by customer name or phone to find other records. " +
+      "The summary above covers every customer, not just the displayed rows.") : null,
+    h("div", { class: "table-wrap" },
     h("table", { class: "table" },
       h("thead", {}, h("tr", {},
         h("th", {}, "Customer"),
@@ -113,7 +186,9 @@ function rowHtml(c) {
         ? h("span", { class: "pill ok" }, fmt(c.store_credit))
         : h("span", { style: "color:var(--muted)" }, fmt(0))),
     h("td", { class: "num cell-main mono" },
-      h("span", { class: c.loyalty_points > 0 ? "pill ok" : "" },
+      h("button", { class: "customer-points-btn",
+        title: `Edit ${c.name}'s loyalty points (admin)`,
+        onclick: () => loyaltyModal(c) },
         `${Number(c.loyalty_points || 0).toLocaleString("en-IN")} pts`)),
     h("td", { class: "num" }, String(c.orders)),
     h("td", { class: "num" }, fmt(c.total_spent)),
@@ -210,7 +285,7 @@ async function loyaltyModal(c) {
         toast(`Loyalty balance: ${result.loyalty_points} points.`, "success");
       }
       modal.close();
-      await load(); renderSub(); renderTable();
+      await load(); renderSub(); renderCustomerStats(); renderTable();
       await detailModal(latest.id);
     } catch (e) { toastError(e); submit.disabled = false; }
   };
@@ -247,6 +322,7 @@ function customerModal(existing = null) {
       m.close();
       await load();
       renderSub();
+      renderCustomerStats();
       renderTable();
     } catch (e) {
       toastError(e);
@@ -301,6 +377,7 @@ function creditModal(c) {
       m.close();
       await load();
       renderSub();
+      renderCustomerStats();
       renderTable();
     } catch (e) {
       toastError(e);
@@ -343,6 +420,7 @@ async function deleteFlow(c) {
     toast(`${c.name} deleted.`, "success");
     await load();
     renderSub();
+    renderCustomerStats();
     renderTable();
   } catch (e) {
     toastError(e);

@@ -1,19 +1,28 @@
 import { api, fmt, state, computeTotals } from "../api.js";
 import { h, icon, openModal, toast, toastError, printReceipt } from "../ui.js";
 import { buildReceipt, methodLabel } from "../receipt.js";
+import { publicVariant, publicAttributes } from "../productLabels.js";
+import { renderCashStatusStrip } from "./reports.js";
+import { tenderPreview } from "../tender.js";
 
 let products = [];
 let groups = [];
-let activeGroup = null;
+let categories = [];
+let activeFilter = "all";
+let browseLimit = 18;
+const RECENT_KEY = "pypos.recent-styles";
+const FAVOURITE_KEY = "pypos.favourite-styles";
 let searchTerm = "";
 let cart = new Map();
 let discountMode = "percent";
 let discountValue = 0;
 let selectedLineId = null;
 let customer = null;
+let salesperson = "";
 let useCredit = true;
 
 let rootEl = null;
+let cashStripEl = null;
 let tilesEl = null;
 let chipsEl = null;
 let cartLinesEl = null;
@@ -30,24 +39,30 @@ const METHODS = [
 ];
 
 export async function renderRegister(main) {
-  [products, groups] = await Promise.all([api.listProducts(), api.listGroups()]);
+  [products, groups, categories] = await Promise.all([
+    api.listProducts(), api.listGroups(), api.listCategories(),
+  ]);
   await restoreCart();
 
   main.innerHTML = "";
   rootEl = h("div", { class: "register-root" });
   main.append(rootEl);
 
-  const threshold = Number(state.settings.low_stock_threshold || 5);
-  const lowCount = products.filter((p) => p.quantity <= threshold).length;
+  const headerActions = h("div", { class: "view-actions", "aria-label": "Register actions" },
+    h("a", { class: "btn sm", href: "#/inventory" }, "Inventory"));
+  rootEl.append(h("div", { class: "view-head" },
+    h("div", { class: "view-title" },
+      h("h2", {}, "Register"),
+      h("div", { class: "sub" },
+        "Scan an exact SKU or barcode, or browse a style and choose its variant · GST " +
+        (state.settings.price_tax_mode === "inclusive" ? "included" : "added at checkout"))),
+    headerActions));
 
-  rootEl.append(
-    h("div", { class: "view-head" },
-      h("div", { class: "view-title" },
-        h("h2", {}, "Register"),
-        h("div", { class: "sub" },
-          (lowCount > 0 ? `${lowCount} product${lowCount > 1 ? "s" : ""} running low on stock` : "All stocked up") +
-          ` · GST ${state.settings.price_tax_mode === "inclusive" ? "included" : "added at checkout"}`))),
-    );
+  // Cash status stays visible at the till instead of being buried in Reports.
+  // It is advisory: if fetching drawer status fails, billing still works.
+  cashStripEl = h("section", { class: "reg-cash-strip", "aria-label": "Cash drawer" });
+  rootEl.append(cashStripEl);
+  void renderCashStatusStrip(cashStripEl);
 
   const grid = h("div", { class: "register-grid" });
 
@@ -55,12 +70,13 @@ export async function renderRegister(main) {
   const searchInput = h("input", {
     id: "reg-search",
     class: "input",
-    placeholder: "Scan barcode or search name / SKU…",
+    placeholder: "Scan barcode or search style, size, colour, SKU…",
     autocomplete: "off",
     oninput: () => {
       searchTerm = searchInput.value.trim();
+      browseLimit = 18;
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(renderTiles, 160);
+      searchTimer = setTimeout(renderTiles, 130);
     },
     onkeydown: (e) => {
       if (e.key === "Enter") {
@@ -69,19 +85,21 @@ export async function renderRegister(main) {
       } else if (e.key === "Escape") {
         searchInput.value = "";
         searchTerm = "";
+        browseLimit = 18;
         renderTiles();
       }
     },
   });
   searchInputEl = searchInput;
 
-  chipsEl = h("div", { class: "chips" });
-  tilesEl = h("div", { class: "tile-grid" });
+  chipsEl = h("div", { class: "reg-filters" });
+  tilesEl = h("div", { class: "style-list" });
 
   grid.append(
     h("div", { class: "catalog-pane" },
       h("div", { class: "search-wrap" }, icon("i-search"), searchInput),
       chipsEl,
+      h("div", { class: "reg-browse-hint" }, "One card per style · Choose the exact size and colour before adding"),
       h("div", { class: "product-scroll" }, tilesEl)),
   );
 
@@ -112,8 +130,9 @@ export async function renderRegister(main) {
   rootEl.append(grid);
   rootEl.append(buildStatusbar());
 
-  parkedChipEl = h("button", { class: "chip", onclick: openParkedModal }, "Parked");
-  rootEl.querySelector(".view-head").append(parkedChipEl);
+  parkedChipEl = h("button", { class: "btn sm", onclick: openParkedModal,
+    title: "View parked sales (F6)" }, "Parked");
+  headerActions.append(parkedChipEl);
 
   renderChips();
   renderTiles();
@@ -157,111 +176,259 @@ function buildStatusbar() {
 
 // ================= catalog side =================
 
-function renderChips() {
-  chipsEl.innerHTML = "";
-  const mk = (label, value) =>
-    h("button", {
-      class: `chip${activeGroup === value ? " active" : ""}`,
-      onclick: () => { activeGroup = value; renderChips(); renderTiles(); },
-    }, label);
+function readIds(key) {
+  try {
+    const ids = JSON.parse(localStorage.getItem(key) || "[]");
+    return Array.isArray(ids) ? ids.filter(x => Number.isInteger(x)).slice(0, 100) : [];
+  } catch (_) { return []; }
+}
 
-  chipsEl.append(mk(`All (${products.length})`, null));
-  for (const g of groups) {
-    const count = products.filter((p) => p.group_id === g.id).length;
-    if (count === 0 && !activeGroup) continue;
-    chipsEl.append(mk(g.name, g.id));
+function saveIds(key, ids) {
+  localStorage.setItem(key, JSON.stringify(ids.slice(0, 100)));
+}
+
+function rememberStyle(groupId) {
+  if (!groupId) return;
+  saveIds(RECENT_KEY, [groupId, ...readIds(RECENT_KEY).filter(id => id !== groupId)]);
+}
+
+function favouriteStyle(groupId) {
+  const ids = readIds(FAVOURITE_KEY);
+  saveIds(FAVOURITE_KEY, ids.includes(groupId) ? ids.filter(id => id !== groupId) : [groupId, ...ids]);
+  renderTiles();
+}
+
+function renderChips() {
+  chipsEl.replaceChildren();
+  const choices = [
+    ["all", "All styles"], ["available", "In stock"],
+    ["recent", "Recent"], ["favourites", "Favourites"],
+    ...categories.map(c => [`category:${c.id}`, c.name]),
+  ];
+  for (const [key, label] of choices) {
+    chipsEl.append(h("button", {
+      class: `chip${activeFilter === key ? " active" : ""}`,
+      onclick: () => {
+        activeFilter = key; browseLimit = 18;
+        renderChips(); renderTiles();
+      },
+    }, label));
   }
 }
 
 function variantText(p) {
-  return p.attributes.map((a) => a.value).join(" · ");
+  return publicVariant(p.attributes || []);
 }
 
 function stockBadge(p) {
-  const threshold = Number(state.settings.low_stock_threshold || 5);
+  const threshold = p.reorder_point === null || p.reorder_point === undefined
+    ? Number(state.settings.low_stock_threshold || 0)
+    : Number(p.reorder_point);
   if (p.quantity <= 0) return h("span", { class: "stock-badge out" }, "Out");
   if (p.quantity <= threshold) return h("span", { class: "stock-badge low" }, `${p.quantity} left`);
-  return h("span", { class: "stock-badge" }, `${p.quantity}`);
+  return h("span", { class: "stock-badge" }, `${p.quantity} in stock`);
+}
+
+function matchingStyles() {
+  const byGroup = new Map();
+  const q = searchTerm.toLocaleLowerCase("en-IN");
+  for (const p of products) {
+    const groupKey = p.group_id ? `g:${p.group_id}` : `p:${p.id}`;
+    const name = p.group_name || p.SKU;
+    const searchable = [name, p.SKU, p.barcode, p.brand_name, p.category_name,
+      ...publicAttributes(p.attributes || []).flatMap(a => [a.name, a.value])].join(" ").toLocaleLowerCase("en-IN");
+    if (q && !searchable.includes(q)) continue;
+    if (activeFilter === "available" && p.quantity <= 0) continue;
+    if (activeFilter === "recent" && !readIds(RECENT_KEY).includes(p.group_id)) continue;
+    if (activeFilter === "favourites" && !readIds(FAVOURITE_KEY).includes(p.group_id)) continue;
+    if (activeFilter.startsWith("category:") &&
+        String(p.category_id) !== activeFilter.slice(9)) continue;
+    if (!byGroup.has(groupKey)) byGroup.set(groupKey, {
+      key: groupKey, id: p.group_id || null, name,
+      brand: p.brand_name || "", category: p.category_name || "",
+      variants: [],
+    });
+    byGroup.get(groupKey).variants.push(p);
+  }
+  const recent = readIds(RECENT_KEY);
+  return [...byGroup.values()].sort((a, b) => {
+    if (activeFilter === "recent") return recent.indexOf(a.id) - recent.indexOf(b.id);
+    return a.name.localeCompare(b.name, "en-IN", { numeric: true });
+  });
 }
 
 function renderTiles() {
-  tilesEl.innerHTML = "";
-
-  let list = products;
-  if (activeGroup !== null) list = list.filter((p) => p.group_id === activeGroup);
-  if (searchTerm) {
-    const q = searchTerm.toLowerCase();
-    list = list.filter((p) =>
-      (p.group_name || "").toLowerCase().includes(q) ||
-      (p.SKU || "").toLowerCase().includes(q) ||
-      (p.barcode || "").toLowerCase().includes(q) ||
-      p.attributes.some((a) =>
-        a.name.toLowerCase().includes(q) || a.value.toLowerCase().includes(q)));
-  }
-
-  if (list.length === 0) {
-    tilesEl.append(h("div", { class: "empty-state", style: "grid-column:1/-1" },
-      icon("i-catalog"),
-      h("h3", {}, products.length ? "Nothing matches that search" : "No products yet"),
-      h("p", {}, products.length
-        ? "Try a different term, or scan a barcode."
-        : "Add products in the Catalog to start selling."),
-      products.length
-        ? null
-        : h("a", { href: "#/catalog", style: "color:var(--accent);font-weight:650" },
-            "Go to Catalog →")));
+  tilesEl.replaceChildren();
+  const styles = matchingStyles();
+  const displayed = styles.slice(0, browseLimit);
+  if (!styles.length) {
+    const emptyCatalog = products.length === 0;
+    tilesEl.append(h("div", { class: "empty-state register-empty" },
+      icon("i-search"),
+      h("h3", {}, emptyCatalog ? "No products in the catalogue" :
+        searchTerm ? "No matching styles" : "No styles in this view"),
+      h("p", {}, emptyCatalog ? "Add or import products in Catalogue to start selling." :
+        searchTerm ? "Search another product name, SKU, barcode or attribute." :
+        "Choose All styles or clear the current filter to see more products."),
+      emptyCatalog ? h("a", { class: "btn primary", href: "#/catalog" },
+        "Open Catalogue / Import") : null));
     return;
   }
-
-  for (const p of list) {
-    const vt = variantText(p);
-    tilesEl.append(
-      h("button", {
-        class: "tile",
-        disabled: p.quantity <= 0,
-        onclick: () => addToCart(p),
-      },
-        h("span", { class: "t-name" }, p.group_name || p.SKU),
-        vt ? h("span", { class: "t-variant" }, vt) : null,
-        h("span", { class: "t-foot" },
-          h("span", { class: "t-price" }, fmt(p.price)),
-          stockBadge(p))),
-    );
+  const favs = readIds(FAVOURITE_KEY);
+  for (const s of displayed) {
+    const available = s.variants.filter(p => p.quantity > 0);
+    const totalStock = s.variants.reduce((sum, p) => sum + p.quantity, 0);
+    const prices = [...new Set(s.variants.map(p => Number(p.price)))].sort((a, b) => a - b);
+    const priceLabel = prices.length === 1 ? fmt(prices[0]) :
+      `${fmt(prices[0])} – ${fmt(prices[prices.length - 1])}`;
+    const open = () => {
+      if (!available.length) { toast("No available stock for this style.", "warn"); return; }
+      // Single-SKU styles are added immediately; multiple variants need an exact choice.
+      if (s.variants.length === 1) addToCart(s.variants[0]);
+      else openVariantPicker(s);
+    };
+    tilesEl.append(h("div", { class: "style-card" },
+      h("button", { class: "style-main", onclick: open, disabled: !available.length },
+        h("div", { class: "style-name" }, s.name),
+        h("div", { class: "style-meta" },
+          [s.brand, s.category, `${s.variants.length} variant${s.variants.length !== 1 ? "s" : ""}`]
+            .filter(Boolean).join(" · ")),
+        h("div", { class: "style-bottom" },
+          h("span", { class: "style-price" }, priceLabel),
+          h("span", { class: `stock-badge${totalStock ? "" : " out"}` },
+            totalStock ? `${totalStock} total` : "Out of stock"))),
+      s.id ? h("button", {
+        class: `style-fav${favs.includes(s.id) ? " selected" : ""}`,
+        title: favs.includes(s.id) ? "Remove favourite" : "Add favourite",
+        "aria-label": favs.includes(s.id) ? "Remove favourite" : "Add favourite",
+        onclick: () => favouriteStyle(s.id),
+      }, favs.includes(s.id) ? "★" : "☆") : null));
   }
+  if (styles.length > browseLimit) {
+    tilesEl.append(h("button", { class: "btn block", onclick: () => {
+      browseLimit += 24; renderTiles();
+    } }, `Show more styles (${browseLimit} of ${styles.length} shown)`));
+  }
+}
+
+function openVariantPicker(style) {
+  const all = style.variants;
+  const common = ["colour", "color", "size", "fit"];
+  const names = [...new Set(all.flatMap(p => publicAttributes(p.attributes || []).map(a => a.name)))];
+  // Receipt-facing attributes only; keep all other attributes editable in Catalog.
+  names.sort((a,b) => {
+    const ai = common.indexOf(a.toLowerCase()); const bi = common.indexOf(b.toLowerCase());
+    return (ai < 0 ? 99 : ai) - (bi < 0 ? 99 : bi) || a.localeCompare(b);
+  });
+  const facets = names.slice(0, 3);
+  const selected = {};
+  const filters = h("div", { class: "variant-facets" });
+  const variants = h("div", { class: "variant-results" });
+  let modal;
+  const render = () => {
+    variants.replaceChildren();
+    const filtered = all.filter(p => facets.every(name => !selected[name] ||
+      (p.attributes || []).some(a => a.name === name && a.value === selected[name])));
+    variants.append(h("p", { class: "form-hint" },
+      `${filtered.length} exact SKU${filtered.length === 1 ? "" : "s"} · Choose one to add`));
+    for (const p of filtered) variants.append(h("button", {
+      class: "variant-row", disabled: p.quantity <= 0,
+      onclick: () => { addToCart(p); modal.close(); },
+    }, h("div", {}, h("div", { class: "variant-sku" }, variantText(p) || p.SKU),
+       h("div", { class: "style-meta" }, `SKU ${p.SKU}${p.barcode ? ` · ${p.barcode}` : ""}`)),
+       h("div", { class: "variant-right" }, h("strong", {}, `MRP ${fmt(p.price)}`), stockBadge(p))));
+    if (!filtered.length) variants.append(h("p", { class: "form-hint" },
+      "No SKU matches those options. Clear a filter."));
+  };
+  for (const name of facets) {
+    const options = [...new Set(all.flatMap(p => (p.attributes || [])
+      .filter(a => a.name === name).map(a => a.value)))].sort((a,b) => a.localeCompare(b, "en-IN"));
+    const select = h("select", { class: "input", onchange: e => {
+      selected[name] = e.target.value; render();
+    } }, h("option", { value: "" }, `All ${name}`),
+      ...options.map(v => h("option", { value: v }, v)));
+    filters.append(h("label", { class: "variant-filter" },
+      h("span", {}, name), select));
+  }
+  const clear = h("button", { class: "btn sm", onclick: () => {
+    for (const key of Object.keys(selected)) delete selected[key];
+    filters.querySelectorAll("select").forEach(s => { s.value = ""; });
+    render();
+  } }, "Clear filters");
+  modal = openModal({ title: style.name, wide: true,
+    body: h("div", {},
+      h("p", { class: "form-hint" },
+        "Select the correct size, colour and MRP. If two stock editions share a barcode, scanning asks you to choose the marked price."),
+      filters, variants),
+    footer: [clear, h("button", { class: "btn", onclick: () => modal.close() }, "Close")],
+  });
+  render();
+}
+
+function choosePriceForBarcode(code, matches) {
+  const variants = matches.map(p => products.find(x => x.id === p.id) || normalizeFetched(p));
+  const available = variants.filter(p => p.quantity > 0);
+  if (!available.length) {
+    toast(`All MRP editions of barcode ${code} are out of stock.`, "warn");
+    return;
+  }
+  const entries = h("div", { class: "variant-results" });
+  let modal;
+  for (const p of variants) {
+    entries.append(h("button", {
+      class: "variant-row", disabled: p.quantity <= 0,
+      onclick: () => {
+        addToCart(p);  // exact SKU with its own price and quantity
+        modal.close();
+        searchInputEl.value = "";
+        searchTerm = "";
+        renderTiles();
+      },
+    }, h("div", {},
+      h("div", { class: "variant-sku" }, `MRP ${fmt(p.price)}`),
+      h("div", { class: "style-meta" },
+        `${p.group_name || p.SKU} · ${variantText(p) || p.SKU}`)),
+      h("div", { class: "variant-right" }, stockBadge(p))));
+  }
+  modal = openModal({
+    title: "Choose marked price",
+    body: h("div", {},
+      h("p", { class: "form-hint" },
+        `EAN ${code} is shared by old/new MRP stock. Check the actual package MRP before selecting.`),
+      entries),
+    footer: [h("button", { class: "btn", onclick: () => modal.close() }, "Cancel")],
+  });
 }
 
 async function handleScan(code) {
   if (!code) return;
   try {
-    const p = await api.lookupCode(code);
-    addToCart(products.find((x) => x.id === p.id) || normalizeFetched(p));
+    const response = await api.lookupCode(code);
+    if (Array.isArray(response.matches)) {
+      choosePriceForBarcode(code, response.matches);
+      return;
+    }
+    const match = products.find(x => x.id === response.id) || normalizeFetched(response);
+    if (match.quantity <= 0) {
+      toast(`SKU ${match.SKU} is out of stock.`, "warn"); return;
+    }
+    addToCart(match);
     searchInputEl.value = "";
     searchTerm = "";
+    browseLimit = 18;
     renderTiles();
   } catch (e) {
     if (e.status === 404) {
-      // Fall back to adding the single visible tile (quick keyboard flow).
-      const visible = tilesEl.querySelectorAll(".tile:not([disabled])");
-      if (visible.length === 1) {
-        visible[0].click();
-        searchInputEl.value = "";
-        searchTerm = "";
-        renderTiles();
-      } else {
-        toast(`No exact match for “${code}”.`, "warn");
-      }
-    } else {
-      toastError(e);
-    }
+      toast(`No exact barcode/SKU match for “${code}”. Select a style manually below.`, "warn");
+    } else toastError(e);
   }
 }
 
 function normalizeFetched(raw) {
   raw.attributes = raw.attributes || [];
-  const existing = products.find((p) => p.id === raw.id);
+  const existing = products.find(p => p.id === raw.id);
   if (existing) Object.assign(existing, raw);
   else products.push(raw);
-  renderChips();
   return raw;
 }
 
@@ -280,6 +447,7 @@ function addToCart(p, qty = 1) {
     if (qty <= 0) return;
   }
   cart.set(p.id, current + qty);
+  rememberStyle(p.group_id);
   selectedLineId = p.id;
   saveCart();
   renderCart();
@@ -307,11 +475,12 @@ function changeQty(id, delta) {
 }
 
 function clearCart() {
-  if (cart.size === 0 && !customer) return;
+  if (cart.size === 0 && !customer && !salesperson) return;
   cart.clear();
   discountValue = 0;
   selectedLineId = null;
   customer = null;
+  salesperson = "";
   useCredit = true;
   saveCart();
   renderCart();
@@ -403,6 +572,16 @@ function renderCart() {
 
   const sumRows = [
     h("div", { class: "sum-row discount-edit" }, customerBox),
+    h("div", { class: "reg-salesperson-field" },
+      h("label", { for: "reg-salesperson" }, "Salesperson ",
+        h("span", { class: "reg-salesperson-optional" }, "(optional · internal only)")),
+      h("input", { id: "reg-salesperson", class: "input", type: "text",
+        maxlength: "80", autocomplete: "off", placeholder: "Name for sales tracking",
+        value: salesperson, oninput: (e) => {
+          salesperson = e.target.value;
+          saveCart();
+        },
+      })),
     h("div", { class: "sum-row discount-edit" },
       h("span", {}, "Discount"),
       h("input", {
@@ -419,7 +598,7 @@ function renderCart() {
         onchange: (e) => { discountMode = e.target.value; renderCart(); },
       },
         h("option", { value: "percent", selected: discountMode === "percent" }, "%"),
-        h("option", { value: "amount", selected: discountMode === "amount" }, "$"))),
+        h("option", { value: "amount", selected: discountMode === "amount" }, state.settings.currency || "₹"))),
     h("div", { class: "sum-row" },
       h("span", {}, `Subtotal (${[...cart.values()].reduce((a, b) => a + b, 0)} items)`),
       h("span", {}, fmt(t.subtotal))),
@@ -456,6 +635,7 @@ function saveCart() {
     discountMode,
     discountValue,
     customerId: customer ? customer.id : null,
+    salesperson,
   }));
 }
 
@@ -469,6 +649,7 @@ async function restoreCart() {
     }
     discountMode = saved.discountMode || "percent";
     discountValue = Math.max(0, Number(saved.discountValue) || 0);
+    salesperson = typeof saved.salesperson === "string" ? saved.salesperson.slice(0, 80) : "";
     if (saved.customerId) {
       try {
         customer = await api.getCustomer(saved.customerId);
@@ -588,17 +769,20 @@ async function parkFlow() {
   okBtn.addEventListener("click", async () => {
     try {
       await api.parkCart({
+        request_id: checkoutRequestId,
         items: [...cart.entries()].map(([product_id, quantity]) =>
           ({ product_id, quantity })),
         label: labelInput.value.trim(),
         discount: discountValue > 0
           ? { mode: discountMode, value: discountValue } : null,
         customer_id: customer ? customer.id : null,
+        salesperson,
       });
       cart.clear();
       discountValue = 0;
       selectedLineId = null;
       customer = null;
+      salesperson = "";
       saveCart();
       renderCart();
       refreshParkedCount();
@@ -711,6 +895,7 @@ async function recallTicket(id) {
     } else {
       customer = null;
     }
+    salesperson = ticket.salesperson || "";
     selectedLineId = null;
     saveCart();
     renderChips();
@@ -737,7 +922,9 @@ async function recallTicket(id) {
 // ================= payment =================
 
 async function refreshCatalog() {
-  [products, groups] = await Promise.all([api.listProducts(), api.listGroups()]);
+  [products, groups, categories] = await Promise.all([
+    api.listProducts(), api.listGroups(), api.listCategories(),
+  ]);
   renderChips();
   renderTiles();
 }
@@ -824,37 +1011,33 @@ function openPayment() {
     })).filter((p) => p.amount > 0);
   }
 
-  const coveredTotal = () =>
-    payments().reduce((a, p) => a + p.amount, 0);
-  const cashTendered = () =>
-    payments().filter((p) => p.method === "CASH").reduce((a, p) => a + p.amount, 0);
-
   function lastCashRow() {
     return [...payRows].reverse().find((r) => r.select.value === "CASH");
   }
 
   function update() {
-    const paid = coveredTotal();
-    const remaining = Math.round((due - paid) * 100) / 100;
-    if (remaining > 0.00001) {
-      remainingEl.textContent = `Remaining due: ${fmt(remaining)}`;
+    const result = tenderPreview(due, payments());
+    if (!result.valid) {
+      remainingEl.textContent = result.error;
+      remainingEl.className = "pay-remaining uncovered";
+    } else if (result.remaining > 0) {
+      remainingEl.textContent = `Remaining due: ${fmt(result.remaining)}`;
       remainingEl.className = "pay-remaining uncovered";
     } else {
       remainingEl.textContent = "Fully covered ✓";
       remainingEl.className = "pay-remaining covered";
     }
-    completeBtn.disabled = remaining > 0.00001 || (paid <= 0 && creditApplied <= 0);
-
-    const changeDue = Math.round((cashTendered() - due) * 100) / 100;
+    completeBtn.disabled = !result.valid || !result.covered ||
+      (payments().length === 0 && creditApplied <= 0);
+    const changeDue = result.valid ? result.change : 0;
     if (changeDue > 0) {
       changeEl.style.display = "";
-      changeEl.innerHTML =
-        `<span>Change to give</span><span class="amt">${fmt(changeDue)}</span>`;
+      changeEl.replaceChildren(h("span", {}, "Change to give"),
+        h("span", { class: "amt" }, fmt(changeDue)));
     } else {
       changeEl.style.display = "none";
     }
-
-    renderQuickButtons(Math.max(0, remaining));
+    renderQuickButtons(result.valid ? Math.max(0, result.remaining) : 0);
   }
 
   function renderQuickButtons(balance) {
@@ -909,12 +1092,16 @@ function openPayment() {
     onclick: () => finishSale(),
   }, icon("i-check"), "Complete sale");
 
+  // A stable key survives a timeout/retry of the same checkout dialog.
+  const checkoutRequestId = (globalThis.crypto?.randomUUID?.() ||
+    `ck_${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/-/g, "_");
   let modal;
   async function finishSale() {
     completeBtn.disabled = true;
     completeBtn.replaceChildren(icon("i-check"), " Saving…");
     try {
       const payload = {
+        request_id: checkoutRequestId,
         items: [...cart.entries()].map(([product_id, quantity]) =>
           ({ product_id, quantity })),
         payments: payRows
@@ -927,6 +1114,7 @@ function openPayment() {
           ? { mode: discountMode, value: discountValue }
           : null,
         customer_id: customer ? customer.id : null,
+        salesperson,
         use_credit: creditApplied > 0,
         supply_type: supplySelect.value,
         place_of_supply: posInput.value.trim(),
@@ -937,6 +1125,7 @@ function openPayment() {
       cart.clear();
       discountValue = 0;
       selectedLineId = null;
+      salesperson = "";
       if (customer) {
         try { customer = await api.getCustomer(customer.id); } catch (_) {}
       } else {
@@ -945,6 +1134,7 @@ function openPayment() {
       saveCart();
       renderCart();
       await refreshCatalog();
+      if (cashStripEl?.isConnected) await renderCashStatusStrip(cashStripEl);
       modal.close();
       showReceiptModal(receipt);
     } catch (e) {

@@ -158,7 +158,11 @@ def migrate(conn):
 
     for table, new_columns in {
         "products": {"hsn_code": "TEXT NOT NULL DEFAULT ''",
-                     "unit_code": "TEXT NOT NULL DEFAULT 'NOS'"},
+                     "unit_code": "TEXT NOT NULL DEFAULT 'NOS'",
+                     "reorder_point": "INTEGER CHECK (reorder_point IS NULL OR reorder_point >= 0)"},
+        "product_groups": {
+            "brand_id": "INTEGER REFERENCES brands(id) ON DELETE SET NULL",
+            "category_id": "INTEGER REFERENCES categories(id) ON DELETE SET NULL"},
         "customers": {"loyalty_points": "INTEGER NOT NULL DEFAULT 0",
                       "gstin": "TEXT NOT NULL DEFAULT ''",
                       "billing_address": "TEXT NOT NULL DEFAULT ''"},
@@ -166,7 +170,10 @@ def migrate(conn):
                        "unit_at_sale": "TEXT NOT NULL DEFAULT 'NOS'",
                        "description_at_sale": "TEXT NOT NULL DEFAULT ''",
                        "sku_at_sale": "TEXT NOT NULL DEFAULT ''"},
-        "sales": {"invoice_number": "TEXT", "invoice_snapshot": "TEXT"},
+        "sales": {"invoice_number": "TEXT", "invoice_snapshot": "TEXT",
+                  "cash_session_id": "INTEGER REFERENCES cash_sessions(id) ON DELETE SET NULL",
+                  "cash_session_explicit": "INTEGER NOT NULL DEFAULT 0",
+                  "salesperson": "TEXT NOT NULL DEFAULT ''"},
     }.items():
         existing = _columns(conn, table)
         for column, sql_type in new_columns.items():
@@ -174,8 +181,31 @@ def migrate(conn):
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
                 changed = True
 
+    if "salesperson" not in _columns(conn, "parked_sales"):
+        conn.execute("ALTER TABLE parked_sales ADD COLUMN salesperson TEXT NOT NULL DEFAULT ''")
+        changed = True
+
     if changed:
         conn.commit()
+
+    # One-time cutover: record the *known current stock*, not invented past
+    # movements. Existing product IDs and sale rows are never modified.
+    if "stock_movements" in {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            done = conn.execute("SELECT 1 FROM settings WHERE key = 'stock_ledger_cutover_v2'").fetchone()
+            if not done:
+                conn.execute("""INSERT INTO stock_movements
+                    (product_id, sku_at_event, delta, balance_after, kind, reason)
+                    SELECT id, SKU, quantity, quantity, 'OPENING',
+                           'Balance at pyPOS 2.0 migration'
+                    FROM products WHERE quantity > 0""")
+                conn.execute("INSERT INTO settings(key, value) VALUES('stock_ledger_cutover_v2','1')")
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def harden_permissions(directory):

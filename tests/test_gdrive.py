@@ -39,6 +39,10 @@ class GDriveUnitTests(unittest.TestCase):
         self.assertIn("access_type=offline", url)
         self.assertIn("drive.file", url)
 
+    def test_auth_url_contains_optional_csrf_state(self):
+        url = gdrive.build_auth_url("client", "http://127.0.0.1/cb", state="valid_csrf123")
+        self.assertIn("state=valid_csrf123", url)
+
     def test_exchange_code_parses_tokens(self):
         with mock.patch.object(gdrive, "urlopen",
                                fake_urlopen({"access_token": "at", "refresh_token": "rt",

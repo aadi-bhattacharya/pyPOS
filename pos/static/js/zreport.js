@@ -39,6 +39,8 @@ export function buildZReceipt(rep) {
       : null,
     h("hr"),
     line("Opening float", fmt(rep.opening_float)),
+    Number(rep.drawer_cash_in) > 0 ? line("Manual cash in", fmt(rep.drawer_cash_in)) : null,
+    Number(rep.drawer_cash_out) > 0 ? line("Cash removed / expenses", "-" + fmt(rep.drawer_cash_out)) : null,
     line("Expected cash in drawer", fmt(rep.expected_cash), "r-bold"),
     rep.counted_cash !== null
       ? line("Counted cash", fmt(rep.counted_cash))

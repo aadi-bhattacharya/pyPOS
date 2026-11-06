@@ -1,126 +1,186 @@
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+"""Shop reporting in India Standard Time, using recorded sale/refund values.
 
-from .sales import get_sale, _d, _money
+Revenue here means sales less recorded refund documents. It is not cash
+collected, profit, bank settlement, or a statutory GST return.
+"""
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+
 from .india import IST
 
 
-def _local_tz():
-    return IST
+def _period_bounds(days, today=None):
+    """Inclusive UTC timestamp bounds for the latest N *local* calendar days."""
+    days = max(1, min(int(days), 365))
+    today = today or datetime.now(IST).date()
+    start = datetime.combine(today - timedelta(days=days - 1), datetime.min.time(), IST)
+    end = datetime.combine(today + timedelta(days=1), datetime.min.time(), IST)
+    fmt = '%Y-%m-%d %H:%M:%S'
+    return (start.astimezone(timezone.utc).strftime(fmt),
+            (end.astimezone(timezone.utc) - timedelta(seconds=1)).strftime(fmt))
 
 
-def _period_bounds(days):
-    """UTC timestamp strings covering the last `days` local days (including today)."""
-    tz = _local_tz()
-    now = datetime.now(tz)
-    start_local = (now - timedelta(days=days - 1)).replace(
-        hour=0, minute=0, second=0, microsecond=0
-    )
-    end_local = now.replace(hour=23, minute=59, second=59, microsecond=0)
-    fmt = "%Y-%m-%d %H:%M:%S"
-    start_utc = start_local.astimezone(timezone.utc).strftime(fmt)
-    end_utc = end_local.astimezone(timezone.utc).strftime(fmt)
-    return start_utc, end_utc
+def _cents(value):
+    return int(round(float(value or 0) * 100))
+
+
+def _money(cents):
+    return round(cents / 100, 2)
+
+
+def _local_day(timestamp):
+    utc = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+    return utc.astimezone(IST).date().isoformat()
+
+
+def _sales_rows(conn, start, end):
+    return [dict(r) for r in conn.execute('''
+        SELECT s.id, s.timestamp, s.status, s.parent_sale_id, s.customer_id,
+               s.total, s.tax_total, s.discount_total,
+               COALESCE(q.units, 0) AS units
+        FROM sales s
+        LEFT JOIN (SELECT sale_id, SUM(quantity) AS units FROM sale_items GROUP BY sale_id) q
+          ON q.sale_id = s.id
+        WHERE s.timestamp BETWEEN ? AND ? ORDER BY s.timestamp, s.id
+    ''', (start, end))]
+
+
+def _totals(rows):
+    out = dict(gross_cents=0, refund_cents=0, tax_cents=0, discount_cents=0,
+               transactions=0, refund_count=0, void_count=0, items=0,
+               customer_ids=set())
+    for r in rows:
+        status = r['status']
+        if status == 'VOID':
+            out['void_count'] += 1
+            continue
+        if status not in ('COMPLETED', 'REFUNDED'):
+            continue
+        sign = 1 if status == 'COMPLETED' else -1
+        if sign == 1:
+            out['transactions'] += 1
+            out['gross_cents'] += _cents(r['total'])
+            out['discount_cents'] += _cents(r['discount_total'])
+            if r['customer_id'] is not None:
+                out['customer_ids'].add(r['customer_id'])
+        else:
+            out['refund_count'] += 1
+            out['refund_cents'] += _cents(r['total'])
+        out['tax_cents'] += sign * _cents(r['tax_total'])
+        out['items'] += sign * int(r['units'])
+    out['net_cents'] = out['gross_cents'] - out['refund_cents']
+    return out
+
+
+def _serialize_totals(t):
+    return {
+        'gross_sales': _money(t['gross_cents']),
+        'refund_total': _money(t['refund_cents']),
+        'net_revenue': _money(t['net_cents']),
+        'net_tax': _money(t['tax_cents']),
+        'discount_total': _money(t['discount_cents']),
+        'transactions': t['transactions'], 'refund_count': t['refund_count'],
+        'void_count': t['void_count'], 'net_items': t['items'],
+        'unique_customers': len(t['customer_ids']),
+        'avg_basket': _money(round(t['gross_cents'] / t['transactions']))
+            if t['transactions'] else 0.0,
+    }
+
+
+def _top_products(conn, start, end):
+    # Amounts use the saved item-level discount and GST values. Refund lines
+    # subtract from the originating item totals, even for partially refunded sales.
+    rows = conn.execute('''
+        SELECT si.product_id, COALESCE(NULLIF(si.description_at_sale, ''), g.name, si.sku_at_sale) AS name,
+               COALESCE(NULLIF(si.sku_at_sale, ''), p.SKU, '') AS sku,
+               si.quantity, si.unit_price, si.discount_cents, si.tax_cents,
+               s.status, s.invoice_snapshot
+        FROM sale_items si JOIN sales s ON s.id = si.sale_id
+        LEFT JOIN products p ON p.id = si.product_id
+        LEFT JOIN product_groups g ON g.id = p.group_id
+        WHERE s.timestamp BETWEEN ? AND ? AND s.status IN ('COMPLETED', 'REFUNDED')
+    ''', (start, end)).fetchall()
+    import json
+    agg = {}
+    for r in rows:
+        sign = 1 if r['status'] == 'COMPLETED' else -1
+        try:
+            snapshot = json.loads(r['invoice_snapshot'] or '{}')
+        except (TypeError, ValueError):
+            snapshot = {}
+        inclusive = snapshot.get('price_tax_mode') == 'inclusive'
+        value = (_cents(r['unit_price'] * r['quantity']) - int(r['discount_cents'] or 0)
+                 + (0 if inclusive else int(r['tax_cents'] or 0)))
+        key = r['product_id']
+        if key not in agg:
+            agg[key] = {'product_id': key, 'group_name': r['name'] or 'Unnamed item',
+                        'SKU': r['sku'], 'qty': 0, 'cents': 0}
+        agg[key]['qty'] += sign * r['quantity']
+        agg[key]['cents'] += sign * value
+    return [{k: v for k, v in {**item, 'revenue': _money(item['cents'])}.items() if k != 'cents'}
+            for item in sorted(agg.values(), key=lambda x: x['cents'], reverse=True)[:10]
+            if item['qty'] or item['cents']]
+
+
+def _payment_mix(conn, start, end):
+    rows = conn.execute('''
+        SELECT p.method, s.status, COUNT(*) AS count, COALESCE(SUM(p.amount),0) AS amount
+        FROM payments p JOIN sales s ON p.sale_id = s.id
+        WHERE s.timestamp BETWEEN ? AND ? AND s.status IN ('COMPLETED', 'REFUNDED')
+        GROUP BY p.method, s.status
+    ''', (start, end)).fetchall()
+    mix = defaultdict(lambda: {'amount_cents': 0, 'count': 0})
+    for r in rows:
+        sign = 1 if r['status'] == 'COMPLETED' else -1
+        mix[r['method']]['amount_cents'] += sign * _cents(r['amount'])
+        if sign == 1:
+            mix[r['method']]['count'] += r['count']
+    return [{'method': method, 'amount': _money(v['amount_cents']), 'count': v['count']}
+            for method, v in sorted(mix.items(), key=lambda kv: kv[1]['amount_cents'], reverse=True)]
 
 
 def summary(conn, days=14, low_stock_threshold=5):
-    start_utc, end_utc = _period_bounds(days)
+    days = max(1, min(int(days), 365))
+    today = datetime.now(IST).date()
+    start, end = _period_bounds(days, today)
+    prev_start, prev_end = _period_bounds(days, today - timedelta(days=days))
+    rows = _sales_rows(conn, start, end)
+    prev = _totals(_sales_rows(conn, prev_start, prev_end))
+    period = _totals(rows)
+    current_day = today.isoformat()
+    today_totals = _totals([r for r in rows if _local_day(r['timestamp']) == current_day])
 
-    cur = conn.cursor()
-    cur.execute(
-        ''' SELECT id, timestamp, subtotal, tax_total, discount_total, total, status,
-                   parent_sale_id
-            FROM sales
-            WHERE timestamp BETWEEN ? AND ?
-            ORDER BY timestamp ''',
-        (start_utc, end_utc),
-    )
-    sales_rows = [dict(r) for r in cur.fetchall()]
-
-    # ---- daily series (completed minus refunds), bucketed by LOCAL date ----
-    tz = _local_tz()
-    by_day = {}
-    for r in sales_rows:
-        day = datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S").replace(
-            tzinfo=timezone.utc
-        ).astimezone(tz).date().isoformat()
-        d = by_day.setdefault(day, {"revenue": 0.0, "refunds": 0.0, "txns": 0, "refund_count": 0})
-        if r["status"] == "COMPLETED":
-            d["revenue"] += r["total"]
-            d["txns"] += 1
-        elif r["status"] == "REFUNDED":
-            d["revenue"] -= r["total"]
-            d["refunds"] += r["total"]
-            d["refund_count"] += 1
-
+    by_day = defaultdict(list)
+    for r in rows:
+        by_day[_local_day(r['timestamp'])].append(r)
     series = []
     for i in range(days):
-        day = (datetime.now(tz) - timedelta(days=days - 1 - i)).date().isoformat()
-        d = by_day.get(day, {"revenue": 0.0, "refunds": 0.0, "txns": 0, "refund_count": 0})
-        series.append({"date": day, **{k: round(v, 2) if isinstance(v, float) else v for k, v in d.items()}})
-
-    # ---- today's headline numbers (completed only) ----
-    today = datetime.now(tz).date().isoformat()
-    today_rows = [
-        r for r in sales_rows
-        if r["status"] == "COMPLETED" and
-        datetime.strptime(r["timestamp"], "%Y-%m-%d %H:%M:%S")
-        .replace(tzinfo=timezone.utc).astimezone(tz).date().isoformat() == today
-    ]
-    today_revenue = round(sum(r["total"] for r in today_rows), 2)
-    cur.execute(
-        ''' SELECT COALESCE(SUM(si.quantity), 0) AS items FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            WHERE s.status = 'COMPLETED' AND s.timestamp BETWEEN ? AND ? ''',
-        (start_utc, end_utc),
-    )
-    period_items_sold = cur.fetchone()["items"]
-
-    # ---- top products in period (completed only) ----
-    cur.execute(
-        ''' SELECT g.name AS group_name, p.SKU, p.id AS product_id,
-                   SUM(si.quantity) AS qty,
-                   ROUND(SUM(si.unit_price * si.quantity), 2) AS revenue
-            FROM sale_items si
-            JOIN sales s ON s.id = si.sale_id
-            JOIN products p ON p.id = si.product_id
-            LEFT JOIN product_groups g ON g.id = p.group_id
-            WHERE s.status = 'COMPLETED' AND s.timestamp BETWEEN ? AND ?
-            GROUP BY p.id ORDER BY revenue DESC LIMIT 10 ''',
-        (start_utc, end_utc),
-    )
-    top_products = [dict(r) for r in cur.fetchall()]
-
-    # ---- payment mix (completed only) ----
-    cur.execute(
-        ''' SELECT method, COUNT(*) AS count, ROUND(SUM(amount), 2) AS amount
-            FROM payments pm JOIN sales s ON s.id = pm.sale_id
-            WHERE s.status = 'COMPLETED' AND s.timestamp BETWEEN ? AND ?
-            GROUP BY method ORDER BY amount DESC ''',
-        (start_utc, end_utc),
-    )
-    payment_mix = [dict(r) for r in cur.fetchall()]
-
-    # ---- low stock ----
-    cur.execute(
-        ''' SELECT p.id, p.SKU, p.quantity, g.name AS group_name
-            FROM products p LEFT JOIN product_groups g ON g.id = p.group_id
-            WHERE p.quantity <= ? ORDER BY p.quantity ASC, g.name LIMIT 50 ''',
-        (low_stock_threshold,),
-    )
-    low_stock = [dict(r) for r in cur.fetchall()]
-
-    refund_rows = [r for r in sales_rows if r["status"] == "REFUNDED"]
+        date = (today - timedelta(days=days - 1 - i)).isoformat()
+        t = _totals(by_day[date])
+        series.append({'date': date, 'revenue': _money(t['net_cents']),
+                       'gross': _money(t['gross_cents']),
+                       'refunds': _money(t['refund_cents']),
+                       'txns': t['transactions'], 'refund_count': t['refund_count'],
+                       'net_items': t['items']})
+    low_stock = [dict(r) for r in conn.execute('''
+        SELECT p.id, p.SKU, p.quantity, g.name AS group_name
+        FROM products p LEFT JOIN product_groups g ON g.id = p.group_id
+        WHERE p.quantity <= ? ORDER BY p.quantity ASC, g.name LIMIT 50
+    ''', (low_stock_threshold,))]
     return {
-        "days": days,
-        "today_revenue": today_revenue,
-        "today_transactions": len(today_rows),
-        "today_avg_basket": round(today_revenue / len(today_rows), 2) if today_rows else 0.0,
-        "series": series,
-        "top_products": top_products,
-        "payment_mix": payment_mix,
-        "low_stock": low_stock,
-        "period_items_sold": period_items_sold,
-        "period_refund_count": len(refund_rows),
-        "period_refund_total": round(sum(r["total"] for r in refund_rows), 2),
+        'days': days,
+        'period': _serialize_totals(period),
+        'previous_period': _serialize_totals(prev),
+        'today': _serialize_totals(today_totals),
+        'series': series,
+        'top_products': _top_products(conn, start, end),
+        'payment_mix': _payment_mix(conn, start, end),
+        'low_stock': low_stock,
+        # Legacy keys retained for integrations that already use this endpoint.
+        'today_revenue': _money(today_totals['net_cents']),
+        'today_transactions': today_totals['transactions'],
+        'today_avg_basket': _serialize_totals(today_totals)['avg_basket'],
+        'period_items_sold': period['items'],
+        'period_refund_count': period['refund_count'],
+        'period_refund_total': _money(period['refund_cents']),
     }

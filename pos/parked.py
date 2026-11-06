@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 from .catalog import InvalidInputError
@@ -23,12 +24,14 @@ def _normalize_items(items):
     order = []
     for it in items:
         try:
-            pid = int(it["product_id"])
-            qty = int(it["quantity"])
+            pid, qty = it["product_id"], it["quantity"]
+            if any(type(v) is not int and not (isinstance(v, str) and re.fullmatch(r"[0-9]+", v)) for v in (pid, qty)):
+                raise ValueError("Non-integer ID or quantity")
+            pid, qty = int(pid), int(qty)
         except (KeyError, TypeError, ValueError):
             raise InvalidInputError("Each item needs product_id and quantity")
-        if qty <= 0:
-            raise InvalidInputError("Item quantity must be at least 1")
+        if qty <= 0 or qty > 1_000_000 or pid <= 0 or pid > 2**63 - 1:
+            raise InvalidInputError("Product IDs and quantities must be positive whole numbers")
         if pid in merged:
             merged[pid] += qty
         else:
@@ -70,7 +73,10 @@ def _resolve_products(conn, items):
 
 
 def park_cart(conn, items, label=None, discount_mode=None, discount_value=0,
-              customer_id=None):
+              customer_id=None, salesperson=""):
+    salesperson = " ".join(str(salesperson or "").strip().split())
+    if len(salesperson) > 80:
+        raise InvalidInputError("Salesperson name is too long")
     items = _normalize_items(items)
     ids = [it["product_id"] for it in items]
     marks = ",".join("?" * len(ids))
@@ -100,9 +106,9 @@ def park_cart(conn, items, label=None, discount_mode=None, discount_value=0,
     cur = conn.cursor()
     cur.execute(
         ''' INSERT INTO parked_sales(label, items_json, discount_mode,
-                                     discount_value, customer_id)
-            VALUES(?, ?, ?, ?, ?) ''',
-        (label, json.dumps(items), discount_mode, discount_value, customer_id),
+                                     discount_value, customer_id, salesperson)
+            VALUES(?, ?, ?, ?, ?, ?) ''',
+        (label, json.dumps(items), discount_mode, discount_value, customer_id, salesperson),
     )
     conn.commit()
     return get_parked(conn, cur.lastrowid)
@@ -124,6 +130,7 @@ def _row_to_dict(conn, r):
         "discount_value": r["discount_value"],
         "customer_id": r["customer_id"],
         "customer_name": customer_name,
+        "salesperson": r["salesperson"],
         "items": items,
         "item_count": sum(i["quantity"] for i in items),
         "est_total": est_total,

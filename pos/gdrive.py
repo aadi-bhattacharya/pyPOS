@@ -31,7 +31,7 @@ class GoogleDriveError(Exception):
 _access_cache = {}
 
 
-def build_auth_url(client_id, redirect_uri):
+def build_auth_url(client_id, redirect_uri, state=None):
     params = urlencode({
         "client_id": client_id,
         "redirect_uri": redirect_uri,
@@ -41,6 +41,7 @@ def build_auth_url(client_id, redirect_uri):
         # consent forces Google to hand out a refresh token even if the user
         # approved this app before.
         "prompt": "consent",
+        **({"state": state} if state else {}),
     })
     return f"{AUTH_URL}?{params}"
 

@@ -1,4 +1,6 @@
 import json
+import hashlib
+import re
 from decimal import Decimal, ROUND_HALF_UP
 from .india import next_invoice_number
 from datetime import datetime, timezone
@@ -12,6 +14,7 @@ from .catalog import (
 from .customers import CustomerNotFoundError, _apply_credit
 from . import settings as settings_mod
 from . import loyalty
+from .product_display import receipt_parts, public_variant, description_from_parts
 
 MONEY_Q = Decimal("0.01")
 PAYMENT_METHODS = ("CASH", "CARD", "UPI")
@@ -42,11 +45,32 @@ class InvalidSaleError(SalesError):
 
 
 def _d(value):
-    return Decimal(str(value))
+    try:
+        if isinstance(value, bool):
+            raise ValueError("Boolean is not an amount")
+        number = Decimal(str(value))
+        if not number.is_finite():
+            raise ValueError("Amount must be finite")
+        return number
+    except (ValueError, TypeError, ArithmeticError) as exc:
+        raise InvalidSaleError("Amount must be a finite number") from exc
 
 
 def _money(value):
     return _d(value).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
+
+
+def _whole_positive(value, label="Quantity", max_value=1_000_000):
+    """Parse API identifiers/counts without truncating fractional or bool values."""
+    if type(value) is int:
+        n = value
+    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+        n = int(value)
+    else:
+        raise InvalidSaleError(f"{label} must be a positive whole number")
+    if n < 1 or n > max_value:
+        raise InvalidSaleError(f"{label} must be a positive whole number")
+    return n
 
 
 def _cents(value):
@@ -66,12 +90,14 @@ def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive
         lines: [{gross_cents, discount_cents, net_cents, tax_cents}]
         subtotal_gross, discount_total, subtotal_net, tax_total, total  (Decimals)
     """
-    if not lines:
+    if not isinstance(lines, list) or not lines:
         raise InvalidSaleError("Sale must contain at least one item")
+    if discount_mode not in (None, "", "percent", "amount"):
+        raise InvalidSaleError("Discount mode must be percent or amount")
 
     prepared = []
     for ln in lines:
-        qty = int(ln["quantity"])
+        qty = _whole_positive(ln["quantity"])
         price = _d(ln["price"])
         rate_pct = _d(ln.get("tax_rate") or 0)
         if qty <= 0:
@@ -89,8 +115,8 @@ def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive
     # Order-level discount -> integer cents, clamped to [0, gross].
     if discount_mode == "percent":
         pct = _d(discount_value or 0)
-        if pct < 0:
-            raise InvalidSaleError("Discount cannot be negative")
+        if pct < 0 or pct > 100:
+            raise InvalidSaleError("Percentage discount must be between 0 and 100")
         disc_cents = _cents(gross_total_cents * pct / Decimal(10000))
     elif discount_mode == "amount":
         disc_cents = _cents(_d(discount_value or 0))
@@ -98,15 +124,26 @@ def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive
         disc_cents = 0
     disc_cents = max(0, min(disc_cents, gross_total_cents))
 
-    # Proportional cent-exact allocation; last line absorbs rounding remainder.
+    # Largest-remainder allocation, bounded by each line's gross amount.
+    # Never assign a 2-paise discount to a 1-paise item.
+    weights = [ln["gross_cents"] for ln in prepared]
+    alloc = [0] * len(weights)
+    if gross_total_cents and disc_cents:
+        alloc = [(disc_cents * gross) // gross_total_cents for gross in weights]
+        unallocated = disc_cents - sum(alloc)
+        # Residual allocation: stable ties by original cart order.
+        by_remainder = sorted(range(len(weights)),
+            key=lambda i: (-(disc_cents * weights[i] % gross_total_cents), i))
+        for i in by_remainder:
+            if unallocated <= 0:
+                break
+            if alloc[i] < weights[i]:
+                alloc[i] += 1
+                unallocated -= 1
+        if unallocated:
+            raise InvalidSaleError("Unable to distribute discount across sale items")
     result_lines = []
-    allocated = 0
-    for i, ln in enumerate(prepared):
-        if i < len(prepared) - 1 and gross_total_cents > 0:
-            share = disc_cents * ln["gross_cents"] // gross_total_cents
-        else:
-            share = disc_cents - allocated
-        allocated += share
+    for ln, share in zip(prepared, alloc):
         net_cents = ln["gross_cents"] - share
         tax_cents = int(_money(
             (Decimal(net_cents) / 100 * ln["rate_fraction"] /
@@ -134,20 +171,22 @@ def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive
 
 def _normalize_items(conn, items):
     """Merge duplicate products, validate shape, fetch live product data."""
-    if not items:
+    if not isinstance(items, list) or not items:
         raise InvalidSaleError("Cart is empty")
     merged = {}
     order = []
     for it in items:
         try:
-            pid = int(it["product_id"])
-            qty = int(it["quantity"])
+            pid = _whole_positive(it["product_id"], "Product ID", 2**63 - 1)
+            qty = _whole_positive(it["quantity"])
         except (KeyError, TypeError, ValueError):
             raise InvalidSaleError("Each item needs product_id and quantity")
         if qty <= 0:
             raise InvalidSaleError("Item quantity must be at least 1")
         if pid in merged:
             merged[pid]["quantity"] += qty
+            if merged[pid]["quantity"] > 1_000_000:
+                raise InvalidSaleError("Quantity exceeds supported limit")
         else:
             merged[pid] = {"product_id": pid, "quantity": qty}
             order.append(pid)
@@ -174,10 +213,13 @@ def _normalize_items(conn, items):
         attributes = cur.execute(
             """SELECT attribute_name, attribute_value FROM product_attributes
                WHERE product_id = ? ORDER BY attribute_name COLLATE NOCASE""", (pid,)).fetchall()
-        variant = ", ".join(f"{a['attribute_name']}: {a['attribute_value']}" for a in attributes)
+        variant = public_variant((a["attribute_name"], a["attribute_value"]) for a in attributes)
+        pending = {a["attribute_name"].casefold() for a in attributes}
         group_name = row["group_name"] or f"Product {pid}"
         normalized.append({**item, **{
-            "description": f"{group_name} ({variant})" if variant else group_name,
+            "description": description_from_parts(group_name, variant),
+            "gst_review_required": "gst review required" in pending,
+            "price_review_required": "price review required" in pending,
             "SKU": row["SKU"],
             "price": row["price"],
             "tax_rate": row["tax_rate"],
@@ -195,16 +237,26 @@ def _normalize_payments(payments, total, currency_note=True):
     """
     if not payments:
         raise InsufficientPaymentError("No payment provided")
+    if not isinstance(payments, list):
+        raise InvalidPaymentError("Payments must be a list")
     total_cents = _cents(total)
     tendered_cents = 0
     clean = []
     for p in payments:
+        if not isinstance(p, dict):
+            raise InvalidPaymentError("Invalid payment entry")
         method = str(p.get("method", "")).upper()
         if method not in PAYMENT_METHODS:
             raise InvalidPaymentError(f"Unsupported payment method: {p.get('method')}")
-        amt = _money(p.get("amount") or 0)
-        if amt < 0:
-            raise InvalidPaymentError("Payment amount cannot be negative")
+        try:
+            raw_amount = _d(p.get("amount") if p.get("amount") is not None else 0)
+        except InvalidSaleError as exc:
+            raise InvalidPaymentError("Payment amount must be finite") from exc
+        if raw_amount < 0 or raw_amount > Decimal("100000000"):
+            raise InvalidPaymentError("Payment amount must be between ₹0 and ₹10 crore")
+        if raw_amount != _money(raw_amount):
+            raise InvalidPaymentError("Payment amount cannot have fractional paise")
+        amt = raw_amount
         if amt == 0:
             continue
         tendered_cents += _cents(amt)
@@ -293,7 +345,8 @@ def _split_refund(total, parts):
 
 
 def checkout(conn, items, payments=None, discount_mode=None, discount_value=None,
-             customer_id=None, use_credit=False, supply_type="intra", place_of_supply=""):
+             customer_id=None, use_credit=False, supply_type="intra", place_of_supply="",
+             request_id=None, salesperson=None):
     """
     Complete a sale atomically: validate stock, recompute all money server-side,
     insert sale + items + payments, decrement inventory (via trigger), commit.
@@ -302,15 +355,56 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
     `use_credit` any available store credit is spent first and the rest of the
     balance due must be covered by `payments`.
     """
+    # Free-text sales attribution is independent of staff login and is never
+    # included in the legal invoice snapshot or customer-facing receipt.
+    if salesperson is None:
+        salesperson = ""
+    if not isinstance(salesperson, str):
+        raise InvalidSaleError("Salesperson name must be text")
+    salesperson = " ".join(salesperson.strip().split())
+    if len(salesperson) > 80 or any(ord(c) < 32 for c in salesperson):
+        raise InvalidSaleError("Salesperson name must be 80 characters or fewer")
     if supply_type not in ("intra", "inter"):
         raise InvalidSaleError("Supply type must be intra or inter-state")
     place_of_supply = str(place_of_supply or "").strip()
     if len(place_of_supply) > 120:
         raise InvalidSaleError("Place of supply is too long")
+    if request_id is not None and not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", str(request_id)):
+        raise InvalidSaleError("Invalid checkout request ID")
+    request_id = str(request_id) if request_id is not None else None
+    fingerprint = hashlib.sha256(json.dumps({"items": items, "payments": payments,
+        "discount_mode": discount_mode, "discount_value": discount_value,
+        "customer_id": customer_id, "use_credit": bool(use_credit),
+        "supply_type": supply_type, "place_of_supply": place_of_supply,
+        "salesperson": salesperson},
+        sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if request_id:
+            existing = conn.execute("SELECT * FROM sale_requests WHERE request_id=?",
+                                    (request_id,)).fetchone()
+            if existing:
+                if existing["fingerprint"] != fingerprint:
+                    raise InvalidSaleError("Checkout request ID reused with different contents")
+                conn.commit()
+                receipt = get_sale_detail(conn, existing["sale_id"])
+                receipt["change"] = existing["change_cents"] / 100
+                if existing["credit_cents"]:
+                    receipt["store_credit_used"] = existing["credit_cents"] / 100
+                return receipt
+        movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         normalized = _normalize_items(conn, items)
         cfg_checkout = settings_mod.get_settings(conn)
+        price_pending = [p["SKU"] for p in normalized if p["price_review_required"]]
+        if price_pending:
+            raise InvalidSaleError("Selling price needs review for SKU(s): " +
+                                   ", ".join(price_pending[:5]) +
+                                   ". Set and confirm the selling price in Catalog first.")
+        pending_gst = [p["SKU"] for p in normalized if p["gst_review_required"]]
+        if pending_gst:
+            raise InvalidSaleError("GST rate unverified for SKU(s): " +
+                                   ", ".join(pending_gst[:5]) +
+                                   ". Confirm the rate in Catalog; 0% import placeholders are not verified.")
         tax_inclusive = cfg_checkout.get("price_tax_mode") == "inclusive"
         totals = compute_totals(normalized, discount_mode, discount_value,
                                 tax_inclusive=tax_inclusive)
@@ -390,12 +484,14 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
         cur = conn.cursor()
         cur.execute(
             ''' INSERT INTO sales(subtotal, tax_total, discount_total, total,
-                                  status, customer_id, invoice_number, invoice_snapshot)
-                VALUES(?, ?, ?, ?, 'COMPLETED', ?, ?, ?) ''',
+                                  status, customer_id, invoice_number, invoice_snapshot, cash_session_id, cash_session_explicit, salesperson)
+                VALUES(?, ?, ?, ?, 'COMPLETED', ?, ?, ?, ?, 1, ?) ''',
             (float(totals["subtotal_gross"]), float(totals["tax_total"]),
              float(totals["discount_total"]), float(totals["total"]),
              customer["id"] if customer else None, invoice_number,
-             json.dumps(invoice_snapshot, ensure_ascii=False)),
+             json.dumps(invoice_snapshot, ensure_ascii=False),
+             (conn.execute("SELECT id FROM cash_sessions WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+              .fetchone() or [None])[0], salesperson),
         )
         sale_id = cur.lastrowid
 
@@ -430,6 +526,13 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
         loyalty.award_on_sale(
             conn, customer["id"] if customer else None, sale_id,
             max(0, _cents(totals["total"]) - credit_cents))
+        conn.execute("""UPDATE stock_movements SET kind='SALE', reference_id=?
+            WHERE id>? AND kind='CHANGE'""", (sale_id, movement_start))
+        if request_id:
+            conn.execute("""INSERT INTO sale_requests
+                (request_id, fingerprint, sale_id, change_cents, credit_cents)
+                VALUES(?, ?, ?, ?, ?)""",
+                (request_id, fingerprint, sale_id, _cents(change), credit_cents))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -544,14 +647,22 @@ def get_sale_detail(conn, sale_id):
 
     items = []
     for r in item_rows:
-        variant = ", ".join(attrs_by_product.get(r["product_id"], []))
         name = r["group_name"] or f"Product {r['product_id']}"
-        display_name = r["description_at_sale"] or (f"{name} ({variant})" if variant else name)
+        saved_description = r["description_at_sale"] or name
+        # Do not mutate the immutable historical sale line: only clean its
+        # customer-facing representation, including old import-heavy receipts.
+        receipt_name, receipt_variant = receipt_parts(saved_description,
+            [tuple(a.split(": ", 1)) for a in attrs_by_product.get(r["product_id"], [])
+             if ": " in a] if not r["description_at_sale"] else None)
+        display_name = description_from_parts(receipt_name, receipt_variant)
         line_gross = _money(_d(r["unit_price"]) * r["quantity"])
         refunded_qty = min(refunded_by_pid.get(r["product_id"], 0), r["quantity"])
         items.append({
             "product_id": r["product_id"],
             "name": display_name,
+            "receipt_name": receipt_name,
+            "receipt_variant": receipt_variant,
+            "gst_review_at_sale": "GST Review Required:" in saved_description,
             "SKU": r["sku_at_sale"] or r["SKU"],
             "hsn_code": r["hsn_at_sale"],
             "unit_code": r["unit_at_sale"],
@@ -598,6 +709,12 @@ def get_sale_detail(conn, sale_id):
     points_earned = sum(r["delta_points"] for r in loyalty_rows if r["event_type"] == "EARN")
     points_reversed = -sum(r["delta_points"] for r in loyalty_rows if r["event_type"] in ("REFUND", "VOID"))
     paid = sum(p["amount"] for p in payments)
+    parent_invoice_number = None
+    if sale["parent_sale_id"]:
+        parent = conn.execute("SELECT invoice_number FROM sales WHERE id=?",
+                              (sale["parent_sale_id"],)).fetchone()
+        if parent:
+            parent_invoice_number = parent["invoice_number"]
     return {
         "id": sale["id"],
         "invoice_number": sale.get("invoice_number"),
@@ -605,6 +722,8 @@ def get_sale_detail(conn, sale_id):
         "timestamp": sale["timestamp"],
         "status": sale["status"],
         "parent_sale_id": sale["parent_sale_id"],
+        "parent_invoice_number": parent_invoice_number,
+        "tax_review_warning": any(i["gst_review_at_sale"] for i in items),
         "subtotal": sale["subtotal"],
         "tax_total": sale["tax_total"],
         "discount_total": sale["discount_total"],
@@ -612,11 +731,14 @@ def get_sale_detail(conn, sale_id):
         "paid": round(paid, 2),
         "customer_id": sale["customer_id"],
         "customer_name": customer_name,
+        "salesperson": sale.get("salesperson", ""),
         "loyalty_points_earned": points_earned,
         "loyalty_points_reversed": points_reversed,
         "store_credit_used": round(credit_used / 100, 2),
         "store_credit_refunded": round(credit_returned / 100, 2),
         "refunded_to_credit": credit_returned > 0,
+        "refund_reason": (json.loads(sale["invoice_snapshot"] or "{}").get("refund_reason", "")
+                          if sale["status"] == "REFUNDED" else ""),
         "items": items,
         "payments": payments,
         "children": children,
@@ -629,7 +751,7 @@ def get_sale_detail(conn, sale_id):
     }
 
 
-def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0):
+def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0, search=None):
     where, params = [], []
     if from_ts:
         where.append("s.timestamp >= ?")
@@ -640,9 +762,20 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0)
     if status:
         where.append("s.status = ?")
         params.append(status)
+    if search and str(search).strip():
+        pattern = "%" + str(search).strip()[:100] + "%"
+        where.append("(" + " OR ".join([
+            "CAST(s.id AS TEXT) LIKE ?",
+            "COALESCE(s.invoice_number, '') LIKE ?",
+            "COALESCE(c.name, '') LIKE ?",
+            "COALESCE(c.phone, '') LIKE ?",
+            "COALESCE(pm.methods, '') LIKE ?",
+            "COALESCE(s.salesperson, '') LIKE ?",
+        ]) + ")")
+        params.extend([pattern] * 6)
     sql = '''
         SELECT s.id, s.invoice_number, s.timestamp, s.subtotal, s.tax_total, s.discount_total,
-               s.total, s.status, s.parent_sale_id, s.customer_id,
+               s.total, s.status, s.parent_sale_id, s.customer_id, s.salesperson,
                c.name AS customer_name,
                COALESCE(i.item_count, 0) AS item_count,
                COALESCE(rq.refunded_qty, 0) AS refunded_qty,
@@ -683,7 +816,180 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0)
     return [dict(r) for r in cur.fetchall()]
 
 
-def refund_sale(conn, sale_id, lines=None, to_credit=False):
+def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore_refund_id=0):
+    '''Preview and commit use one allocation algorithm, always in paise.
+
+    The original non-cash/cash tenders are repaid in their original proportions.
+    Any store credit used to pay the sale is restored as store credit. Refunds
+    explicitly sent to store credit do not consume the original tender budget.
+    This method only records tender flows; the operator must process external
+    card/UPI transfers separately.
+    '''
+    if to_credit:
+        if not sale["customer_id"]:
+            raise SalesError("Refund to store credit requires an attached customer")
+        return [], refund_total_cents
+
+    sale_id = sale["id"]
+    source_payments = [dict(r) for r in conn.execute(
+        "SELECT method, amount FROM payments WHERE sale_id=? ORDER BY id", (sale_id,))]
+    if not source_payments or all(_cents(r["amount"]) == 0 for r in source_payments):
+        raise SalesError("This sale was paid with store credit — refund to store credit instead")
+
+    orig_tender = sum(_cents(p["amount"]) for p in source_payments)
+    orig_total = _cents(sale["total"])
+    orig_credit = max(0, orig_total - orig_tender)
+    previous = conn.execute('''
+        SELECT total, invoice_snapshot FROM sales
+        WHERE parent_sale_id=? AND status='REFUNDED' AND id != ? ''', (sale_id, ignore_refund_id)).fetchall()
+    previous_original = 0
+    for child in previous:
+        snapshot = json.loads(child["invoice_snapshot"] or "{}")
+        if snapshot.get("refund_destination") != "credit":
+            previous_original += _cents(child["total"])
+
+    target_total = _split_refund(
+        min(orig_total, previous_original + refund_total_cents),
+        [orig_tender, orig_credit])[0]
+    by_method = {}
+    for p in source_payments:
+        by_method[p["method"]] = by_method.get(p["method"], 0) + _cents(p["amount"])
+    methods = list(by_method)
+    targets = _split_refund(target_total, [by_method[m] for m in methods])
+    old_rows = conn.execute('''
+        SELECT p.method, COALESCE(SUM(p.amount),0) AS amount
+        FROM payments p JOIN sales rs ON rs.id=p.sale_id
+        WHERE rs.parent_sale_id=? AND rs.status='REFUNDED' AND rs.id != ?
+        GROUP BY p.method''', (sale_id, ignore_refund_id)).fetchall()
+    old = {r["method"]: _cents(r["amount"]) for r in old_rows}
+    refund_tender = []
+    for method, target in zip(methods, targets):
+        now = target - old.get(method, 0)
+        if now < 0:
+            raise SalesError("Previous refunds exceed the original tender allocation")
+        if now:
+            refund_tender.append({"method": method, "amount_cents": now})
+    credit = refund_total_cents - sum(p["amount_cents"] for p in refund_tender)
+    if credit < 0:
+        raise SalesError("Refund exceeds the original tender allocation")
+    if credit and not sale["customer_id"]:
+        raise SalesError("Store credit refund needs an original customer")
+    return refund_tender, credit
+
+
+def _refund_request_fingerprint(sale_id, lines, to_credit, reason):
+    # Semantic request fingerprint. Reordering equivalent line entries does
+    # not change a retry; any changed quantity/destination/reason does.
+    qtys = {}
+    if lines is not None:
+        for item in lines:
+            try:
+                pid = _whole_positive(item["product_id"], "Product ID", 2**63 - 1)
+                qty = _whole_positive(item["quantity"])
+            except (KeyError, TypeError, ValueError):
+                raise InvalidSaleError("Invalid refund request line")
+            qtys[pid] = qtys.get(pid, 0) + qty
+    payload = [sale_id, sorted(qtys.items()) if lines is not None else None,
+               bool(to_credit), reason]
+    return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
+
+
+def refund_export_rows(conn):
+    """All recorded refunds, with original invoice and exact tender allocation.
+
+    Returns operational refund data, not GST statutory credit-note records.
+    """
+    rows = conn.execute('''SELECT r.id, r.timestamp, r.parent_sale_id, p.invoice_number,
+        r.customer_id, r.subtotal, r.discount_total, r.tax_total, r.total,
+        r.invoice_snapshot,
+        COALESCE((SELECT SUM(amount) FROM payments
+                  WHERE sale_id=r.id AND method='CASH'),0) AS cash,
+        COALESCE((SELECT SUM(amount) FROM payments
+                  WHERE sale_id=r.id AND method='CARD'),0) AS card,
+        COALESCE((SELECT SUM(amount) FROM payments
+                  WHERE sale_id=r.id AND method='UPI'),0) AS upi,
+        COALESCE((SELECT SUM(delta_cents) FROM credit_events
+                  WHERE sale_id=r.id AND delta_cents>0),0) AS credit_cents
+        FROM sales r JOIN sales p ON p.id=r.parent_sale_id
+        WHERE r.status='REFUNDED' ORDER BY r.id DESC''').fetchall()
+    exported = []
+    for row in rows:
+        invoice = json.loads(row["invoice_snapshot"] or "{}")
+        exported.append((row["id"], row["timestamp"], row["parent_sale_id"],
+                         row["invoice_number"] or "", row["customer_id"] or "",
+                         invoice.get("refund_reason", ""),
+                         row["subtotal"], row["discount_total"], row["tax_total"],
+                         row["total"], row["cash"], row["card"], row["upi"],
+                         round(row["credit_cents"] / 100, 2)))
+    return exported
+
+
+def preview_refund(conn, sale_id, lines=None, to_credit=False):
+    """Read-only, cent-exact preview using recorded original sale allocations.
+
+    This does not mutate inventory, tender, customer credit or loyalty. The
+    actual refund recalculates under BEGIN IMMEDIATE to prevent stale previews
+    from becoming authoritative payouts.
+    """
+    sale = get_sale(conn, sale_id)
+    if sale is None:
+        raise SaleNotFoundError(f"No sale with id {sale_id}")
+    if sale["status"] != "COMPLETED":
+        raise AlreadyProcessedError(f"Sale {sale_id} cannot be refunded")
+    source = {row["product_id"]: dict(row) for row in conn.execute(
+        "SELECT * FROM sale_items WHERE sale_id=?", (sale_id,))}
+    refunded = {row["product_id"]: int(row["qty"]) for row in conn.execute(
+        """SELECT si.product_id, SUM(si.quantity) qty FROM sale_items si
+           JOIN sales s ON si.sale_id=s.id
+           WHERE s.parent_sale_id=? AND s.status='REFUNDED'
+           GROUP BY si.product_id""", (sale_id,))}
+    if lines is None:
+        requested = {pid: int(row["quantity"]) - refunded.get(pid, 0)
+                     for pid, row in source.items()}
+        requested = {pid: qty for pid, qty in requested.items() if qty > 0}
+    else:
+        if not isinstance(lines, list):
+            raise InvalidSaleError("lines must be a list")
+        requested = {}
+        for line in lines:
+            try:
+                pid = _whole_positive(line["product_id"], "Product ID", 2**63 - 1)
+                qty = _whole_positive(line["quantity"])
+            except (TypeError, ValueError, KeyError):
+                raise InvalidSaleError("Each return needs product_id and quantity")
+            if qty <= 0 or pid not in source:
+                raise InvalidSaleError("Select valid original items and positive return quantities")
+            requested[pid] = requested.get(pid, 0) + qty
+    mode = json.loads(sale["invoice_snapshot"] or "{}").get("price_tax_mode")
+    inclusive = mode == "inclusive"
+    gross = discount = net = tax = 0
+    for pid, qty in requested.items():
+        row = source[pid]
+        if qty > int(row["quantity"]) - refunded.get(pid, 0):
+            raise InvalidSaleError("Refund exceeds remaining quantity for product " + str(pid))
+        g, d, n, t = _refund_line_money(row, qty, int(row["quantity"]),
+                                       inclusive, refunded.get(pid, 0))
+        gross += g
+        discount += d
+        net += n
+        tax += t
+    cents = net if inclusive else net + tax
+    tender, credit = _refund_distribution(conn, sale, cents, to_credit=to_credit) if requested else ([], 0)
+    return {
+        "subtotal": gross / 100,
+        "discount_total": discount / 100,
+        "tax_total": tax / 100,
+        "total": cents / 100,
+        "quantity": sum(requested.values()),
+        "price_tax_mode": mode or "exclusive",
+        "refund_payments": [{"method": p["method"], "amount": p["amount_cents"] / 100}
+                            for p in tender],
+        "refund_store_credit": credit / 100,
+        "refund_destination": "credit" if to_credit else "original",
+    }
+
+
+def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_id=None):
     """
     Refund a completed sale.
 
@@ -696,8 +1002,26 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
     Stock comes back via the inventory trigger as REFUNDED child items are
     inserted.
     """
+    reason = str(reason or "").strip()
+    if len(reason) > 250:
+        raise InvalidSaleError("Refund reason must be 250 characters or fewer")
+    if request_id is not None:
+        request_id = str(request_id)
+        if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
+            raise InvalidSaleError("Invalid refund request ID")
+    fingerprint = _refund_request_fingerprint(sale_id, lines, to_credit, reason) if request_id else None
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if request_id:
+            existing = conn.execute(
+                "SELECT original_sale_id, fingerprint, refund_sale_id FROM refund_requests "
+                "WHERE request_id=?", (request_id,)).fetchone()
+            if existing:
+                if existing["original_sale_id"] != sale_id or existing["fingerprint"] != fingerprint:
+                    raise InvalidSaleError("Refund request ID was reused with different details")
+                conn.commit()
+                return get_sale_detail(conn, existing["refund_sale_id"])
+        movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         sale = get_sale(conn, sale_id)
         if sale is None:
             raise SaleNotFoundError(f"No sale with id {sale_id}")
@@ -732,8 +1056,8 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                 raise InvalidSaleError("lines must be a list of {product_id, quantity}")
             for ln in lines:
                 try:
-                    pid = int(ln["product_id"])
-                    qty = int(ln["quantity"])
+                    pid = _whole_positive(ln["product_id"], "Product ID", 2**63 - 1)
+                    qty = _whole_positive(ln["quantity"])
                 except (KeyError, TypeError, ValueError):
                     raise InvalidSaleError("Each line needs product_id and quantity")
                 if qty <= 0:
@@ -748,8 +1072,11 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                     raise InvalidSaleError(
                         f"Product {pid} is not part of sale {sale_id}")
 
-        # Fall back to "everything remaining" when no explicit lines given.
-        if not requested:
+        # Omission means "everything remaining" for legacy callers. An
+        # explicitly empty list must never silently return the whole sale.
+        if lines is not None and not requested:
+            raise InvalidSaleError("Select at least one item to refund")
+        if lines is None:
             for r in src_rows:
                 rem = r["quantity"] - already.get(r["product_id"], 0)
                 if rem > 0:
@@ -786,20 +1113,21 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
         refund_total_cents = net_c if tax_inclusive else net_c + tax_c
 
         parent_invoice = json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else None
-        refund_invoice = None
-        if parent_invoice:
-            refund_invoice = dict(parent_invoice)
-            refund_invoice["refund_destination"] = "credit" if to_credit else "original"
-            refund_invoice["tax_breakup"] = _tax_breakup(
-                conn, refund_tax_lines,
-                parent_invoice.get("tax_configuration") or settings_mod.get_settings(conn))
+        refund_invoice = dict(parent_invoice or {})
+        refund_invoice["refund_destination"] = "credit" if to_credit else "original"
+        refund_invoice["refund_reason"] = reason
+        refund_invoice["tax_breakup"] = _tax_breakup(
+            conn, refund_tax_lines,
+            refund_invoice.get("tax_configuration") or settings_mod.get_settings(conn))
         cur.execute(
             ''' INSERT INTO sales(subtotal, tax_total, discount_total, total,
-                                  status, parent_sale_id, customer_id, invoice_snapshot)
-                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?) ''',
+                                  status, parent_sale_id, customer_id, invoice_snapshot, cash_session_id, cash_session_explicit)
+                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?, ?, 1) ''',
             (gross_c / 100, tax_c / 100, disc_c / 100, refund_total_cents / 100,
              sale_id, sale["customer_id"],
-             json.dumps(refund_invoice, ensure_ascii=False) if refund_invoice else None),
+             json.dumps(refund_invoice, ensure_ascii=False) if refund_invoice else None,
+             (conn.execute("SELECT id FROM cash_sessions WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
+              .fetchone() or [None])[0]),
         )
         refund_id = cur.lastrowid
 
@@ -819,84 +1147,27 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False):
                  row["description_at_sale"], row["sku_at_sale"]),
             )
 
-        if to_credit:
-            if not sale["customer_id"]:
-                raise SalesError(
-                    "Refunding to store credit needs a customer on the sale")
-            _apply_credit(conn, sale["customer_id"], refund_total_cents,
+        tender_payments, credit_cents = _refund_distribution(
+            conn, sale, refund_total_cents, to_credit=to_credit,
+            ignore_refund_id=refund_id)
+        for pay in tender_payments:
+            cur.execute(''' INSERT INTO payments(sale_id, method, amount, is_partial)
+                VALUES(?, ?, ?, ?) ''',
+                (refund_id, pay["method"], pay["amount_cents"] / 100,
+                 int(refund_total_cents < _cents(sale["total"]))))
+        if credit_cents:
+            _apply_credit(conn, sale["customer_id"], credit_cents,
+                          f"Return credit from sale #{sale_id}" if not to_credit else
                           f"Refund of sale #{sale_id}", sale_id=refund_id)
-        else:
-            cur.execute(
-                ''' SELECT method, amount FROM payments
-                    WHERE sale_id = ? ORDER BY id ''', (sale_id,))
-            original_payments = [dict(r) for r in cur.fetchall()]
-            if not original_payments or all(
-                    _cents(p["amount"] or 0) == 0 for p in original_payments):
-                raise SalesError(
-                    "This sale was paid with store credit — "
-                    "refund to store credit instead")
-
-            original_tender_cents = sum(_cents(p["amount"]) for p in original_payments)
-            original_total_cents = _cents(sale["total"])
-            original_credit_cents = max(0, original_total_cents - original_tender_cents)
-            # Earlier explicit credit refunds must not force later returns to
-            # the original tender. Track only returns choosing 'original'.
-            previous = cur.execute(
-                ''' SELECT total, invoice_snapshot FROM sales
-                    WHERE parent_sale_id = ? AND status = 'REFUNDED' AND id != ? ''',
-                (sale_id, refund_id)).fetchall()
-            previous_original_cents = 0
-            for child in previous:
-                snapshot = json.loads(child["invoice_snapshot"]) if child["invoice_snapshot"] else {}
-                if snapshot.get("refund_destination") != "credit":
-                    previous_original_cents += _cents(child["total"])
-
-            # Use cumulative allocation so many small partial refunds exactly
-            # reconcile to the original tender/credit split at the last refund.
-            accumulated = min(original_total_cents,
-                              previous_original_cents + refund_total_cents)
-            target_tender_total = _split_refund(accumulated,
-                                     [original_tender_cents, original_credit_cents])[0]
-            # Payments can contain repeated methods (two cash entries).
-            # Combine them by method to make cumulative refunds unambiguous.
-            tender_by_method = {}
-            for p in original_payments:
-                method = p["method"]
-                tender_by_method[method] = tender_by_method.get(method, 0) + _cents(p["amount"])
-            methods = list(tender_by_method)
-            target_each_payment = _split_refund(
-                target_tender_total, [tender_by_method[method] for method in methods])
-            already_paid = cur.execute(
-                ''' SELECT p.method, COALESCE(SUM(p.amount), 0) AS amount
-                    FROM payments p JOIN sales rs ON rs.id = p.sale_id
-                    WHERE rs.parent_sale_id = ? AND rs.status = 'REFUNDED'
-                    GROUP BY p.method ''', (sale_id,)).fetchall()
-            paid_by_method = {r["method"]: _cents(r["amount"]) for r in already_paid}
-            is_partial_refund = refund_total_cents < original_total_cents
-            tender_now_cents = 0
-            for method, target in zip(methods, target_each_payment):
-                prior = paid_by_method.get(method, 0)
-                share_cents = target - prior
-                if share_cents < 0:
-                    raise SalesError("Previous refunds exceed the original tender allocation")
-                if share_cents:
-                    cur.execute(
-                        ''' INSERT INTO payments(sale_id, method, amount, is_partial)
-                            VALUES(?, ?, ?, ?) ''',
-                        (refund_id, method, share_cents / 100,
-                         1 if is_partial_refund else 0),
-                    )
-                    tender_now_cents += share_cents
-            credit_now_cents = refund_total_cents - tender_now_cents
-            if credit_now_cents < 0:
-                raise SalesError("Refund would exceed original tender allocation")
-            if credit_now_cents:
-                if not sale["customer_id"]:
-                    raise SalesError("Store credit refund needs an original customer")
-                _apply_credit(conn, sale["customer_id"], credit_now_cents,
-                              f"Return credit from sale #{sale_id}", sale_id=refund_id)
+        if request_id:
+            conn.execute('''INSERT INTO refund_requests(
+                request_id, original_sale_id, fingerprint, refund_sale_id)
+                VALUES(?, ?, ?, ?)''',
+                (request_id, sale_id, fingerprint, refund_id))
         loyalty.reverse_for_return(conn, sale_id, refund_id, refund_total_cents,
                                    _cents(sale["total"]), "REFUND")
+        conn.execute("""UPDATE stock_movements SET kind='REFUND', reference_id=?
+            WHERE id>? AND kind='CHANGE'""", (refund_id, movement_start))
         conn.commit()
     except Exception:
         conn.rollback()
@@ -913,12 +1184,21 @@ def void_sale(conn, sale_id):
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         sale = get_sale(conn, sale_id)
         if sale is None:
             raise SaleNotFoundError(f"No sale with id {sale_id}")
         if sale["status"] != "COMPLETED":
             raise AlreadyProcessedError(
                 f"Sale {sale_id} is {sale['status']} and cannot be voided")
+        # A closed Z report is a historical cash record. Correct an old sale
+        # using the explicit return workflow, never by rewriting a closed day.
+        linked = conn.execute("""SELECT cs.closed_at FROM sales s
+            LEFT JOIN cash_sessions cs ON cs.id=s.cash_session_id
+            WHERE s.id=?""", (sale_id,)).fetchone()
+        if linked and linked["closed_at"] is not None:
+            raise AlreadyProcessedError(
+                "Cannot void an invoice from a closed cash session; use Returns & Refunds")
         cur = conn.cursor()
         if cur.execute(
                 "SELECT 1 FROM sales WHERE parent_sale_id = ? AND status = 'REFUNDED' LIMIT 1",
@@ -936,6 +1216,8 @@ def void_sale(conn, sale_id):
         cur.execute("UPDATE sales SET status='VOID' WHERE id=?", (sale_id,))
         loyalty.reverse_for_return(conn, sale_id, sale_id, _cents(sale["total"]),
                                    _cents(sale["total"]), "VOID")
+        conn.execute("""UPDATE stock_movements SET kind='VOID', reference_id=?
+            WHERE id>? AND kind='CHANGE'""", (sale_id, movement_start))
         conn.commit()
     except Exception:
         conn.rollback()

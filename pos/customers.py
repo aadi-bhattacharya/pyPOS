@@ -114,12 +114,16 @@ def find_by_phone(conn, phone):
     return get_customer(conn, row["id"]) if row else None
 
 
-def list_customers(conn, query=None, limit=500):
+def list_customers(conn, query=None, limit=500, balance_filter="all"):
     where, params = [], []
     if query:
         like = f"%{query.strip()}%"
         where.append("(name LIKE ? OR COALESCE(phone, '') LIKE ? OR COALESCE(email, '') LIKE ?)")
         params += [like, like, like]
+    if balance_filter == "points":
+        where.append("c.loyalty_points > 0")
+    elif balance_filter == "credit":
+        where.append("c.store_credit_cents > 0")
     sql = '''
         SELECT c.id FROM customers c
     '''

@@ -1,4 +1,4 @@
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 
 from .catalog import InvalidInputError
 
@@ -26,6 +26,20 @@ def _money(v):
     return Decimal(str(v)).quantize(MONEY_Q, rounding=ROUND_HALF_UP)
 
 
+def _cash_input(value, field):
+    """Never close a day with NaN, negative cash or silently rounded paise."""
+    if isinstance(value, bool):
+        raise InvalidInputError(f"{field} must be a valid nonnegative amount")
+    try:
+        amount = Decimal(str(value))
+        if (not amount.is_finite() or amount < 0 or amount > 100_000_000 or
+                amount != amount.quantize(MONEY_Q)):
+            raise InvalidInputError(f"{field} must be a nonnegative amount with at most two decimals")
+        return amount
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise InvalidInputError(f"{field} must be a valid nonnegative amount") from exc
+
+
 def _round2(v):
     return float(_money(v))
 
@@ -46,12 +60,7 @@ def current_session(conn):
 
 
 def open_session(conn, opening_float=0.0):
-    try:
-        opening_float = _money(opening_float or 0)
-    except Exception:
-        raise InvalidInputError("Invalid opening float")
-    if opening_float < 0:
-        raise InvalidInputError("Opening float cannot be negative")
+    opening_float = _cash_input(opening_float if opening_float is not None else 0, "Opening float")
 
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -72,10 +81,7 @@ def open_session(conn, opening_float=0.0):
 
 
 def close_session(conn, counted_cash, note=""):
-    try:
-        counted_cash = _money(counted_cash if counted_cash is not None else 0)
-    except Exception:
-        raise InvalidInputError("Invalid counted amount")
+    counted_cash = _cash_input(counted_cash, "Counted cash")
     conn.execute("BEGIN IMMEDIATE")
     try:
         session = current_session(conn)
@@ -132,8 +138,9 @@ def session_report(conn, session_id):
         cur.execute(
             ''' SELECT subtotal, discount_total, tax_total, total
                 FROM sales WHERE status = ?
-                  AND timestamp >= ? AND timestamp <= ?''',
-            (status, lo, hi))
+                  AND (cash_session_id = ? OR (cash_session_explicit = 0 AND cash_session_id IS NULL
+                      AND timestamp >= ? AND timestamp < ?))''',
+            (status, session_id, lo, hi))
         return [dict(r) for r in cur.fetchall()]
 
     completed = sales_in("COMPLETED")
@@ -150,7 +157,8 @@ def session_report(conn, session_id):
         ''' SELECT COALESCE(SUM(si.quantity), 0) AS n FROM sale_items si
             JOIN sales s ON s.id = si.sale_id
             WHERE s.status = 'COMPLETED'
-              AND s.timestamp >= ? AND s.timestamp <= ?''', (lo, hi))
+              AND (s.cash_session_id = ? OR (s.cash_session_explicit = 0 AND s.cash_session_id IS NULL
+                     AND s.timestamp >= ? AND s.timestamp < ?))''', (session_id, lo, hi))
     items_sold = cur.fetchone()["n"]
 
     def tender_sums(status):
@@ -158,8 +166,9 @@ def session_report(conn, session_id):
             ''' SELECT pm.method, COUNT(*) AS count,
                        COALESCE(SUM(pm.amount), 0) AS amount
                 FROM payments pm JOIN sales s ON s.id = pm.sale_id
-                WHERE s.status = ? AND s.timestamp >= ? AND s.timestamp <= ?
-                GROUP BY pm.method''', (status, lo, hi))
+                WHERE s.status = ? AND (s.cash_session_id = ? OR
+                    (s.cash_session_explicit = 0 AND s.cash_session_id IS NULL AND s.timestamp >= ? AND s.timestamp < ?))
+                GROUP BY pm.method''', (status, session_id, lo, hi))
         return {r["method"]: {"count": r["count"], "amount": float(r["amount"])}
                 for r in cur.fetchall()}
 
@@ -180,10 +189,16 @@ def session_report(conn, session_id):
         ''' SELECT COALESCE(SUM(ce.delta_cents), 0) AS c FROM credit_events ce
             JOIN sales s ON s.id = ce.sale_id
             WHERE ce.delta_cents < 0
-              AND s.timestamp >= ? AND s.timestamp <= ?''', (lo, hi))
+              AND (s.cash_session_id = ? OR (s.cash_session_explicit = 0 AND s.cash_session_id IS NULL
+                     AND s.timestamp >= ? AND s.timestamp < ?))''', (session_id, lo, hi))
     credit_spent_cents = -cur.fetchone()["c"]
 
-    expected_cash = float(s["opening_float"]) + cash["in"] - cash["out"]
+    adjustments = [dict(row) for row in conn.execute(
+        "SELECT id, kind, amount_cents, reason, reference, recorded_at FROM cash_movements "
+        "WHERE cash_session_id=? ORDER BY id", (session_id,))]
+    moved_in = sum(row["amount_cents"] for row in adjustments if row["kind"] == "CASH_IN")
+    moved_out = sum(row["amount_cents"] for row in adjustments if row["kind"] != "CASH_IN")
+    expected_cash = float(s["opening_float"]) + cash["in"] - cash["out"] + (moved_in - moved_out) / 100
 
     return {
         "session_id": s["id"],
@@ -205,8 +220,43 @@ def session_report(conn, session_id):
         "card_net": card["net"],
         "upi_net": upi["net"],
         "credit_spent": _round2(Decimal(credit_spent_cents) / 100),
+        "drawer_cash_in": moved_in / 100,
+        "drawer_cash_out": moved_out / 100,
+        "cash_movements": [{**row, "amount": row["amount_cents"] / 100}
+                           for row in adjustments],
         "expected_cash": _round2(expected_cash),
         "counted_cash": _round2(s["counted_cash"]) if s["counted_cash"] is not None else None,
         "difference": _round2(s["drawer_difference"]) if s["drawer_difference"] is not None else None,
         "note": s["note"] or "",
     }
+
+
+def record_cash_movement(conn, kind, amount, reason, reference=""):
+    """Record physical money entering/leaving an open till. Never a sale or refund."""
+    if kind not in ("CASH_IN", "CASH_OUT", "BANK_DEPOSIT", "PETTY_CASH"):
+        raise InvalidInputError("Choose a valid drawer movement type")
+    try:
+        value = _money(amount)
+    except Exception as exc:
+        raise InvalidInputError("Invalid cash movement amount") from exc
+    if not value.is_finite() or value <= 0 or value > 100000000:
+        raise InvalidInputError("Cash movement must be positive and finite")
+    reason = str(reason or "").strip()
+    reference = str(reference or "").strip()
+    if not reason or len(reason) > 250 or len(reference) > 120:
+        raise InvalidInputError("Enter a reason (up to 250 characters) and a short reference")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        session = current_session(conn)
+        if not session:
+            raise NoOpenSessionError("Start Day before recording cash movements")
+        cur = conn.execute("""INSERT INTO cash_movements
+            (cash_session_id, kind, amount_cents, reason, reference)
+            VALUES(?,?,?,?,?)""", (session["id"], kind, int(value*100), reason, reference))
+        movement_id = cur.lastrowid
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return {"id": movement_id, "session_id": session["id"],
+            "report": session_report(conn, session["id"])}

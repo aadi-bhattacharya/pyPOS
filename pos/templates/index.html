@@ -8,7 +8,7 @@
 <link rel="preload" href="/static/fonts/selawk.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/static/fonts/selawksb.woff2" as="font" type="font/woff2" crossorigin>
 <link rel="preload" href="/static/fonts/selawkb.woff2" as="font" type="font/woff2" crossorigin>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='4' fill='%232f66c4'/><path d='M7 8h10l-1 7H8L7 8zm2.5 10.5a1 1 0 100-2 1 1 0 000 2zm5 0a1 1 0 100-2 1 1 0 000 2z' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+<link id="app-favicon" rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'><rect width='24' height='24' rx='4' fill='%232f66c4'/><path d='M7 8h10l-1 7H8L7 8zm2.5 10.5a1 1 0 100-2 1 1 0 000 2zm5 0a1 1 0 100-2 1 1 0 000 2z' stroke='white' stroke-width='1.6' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
 </head>
 <body>
 <a class="skip-link" href="#main">Skip to content</a>
@@ -51,16 +51,22 @@
 <div class="app">
   <aside class="sidebar">
     <div class="brand">
-      <span class="brand-mark">P</span>
-      <span class="brand-name">pyPOS</span>
+      <span class="brand-mark" id="app-brand-mark">P</span>
+      <span class="brand-name" id="app-brand-name">pyPOS</span>
     </div>
     <nav id="nav">
       <a href="#/register" data-view="register"><svg><use href="#i-register"/></svg><span>Register</span></a>
       <a href="#/catalog" data-view="catalog"><svg><use href="#i-catalog"/></svg><span>Catalog</span></a>
+      <a href="#/inventory" data-view="inventory"><svg><use href="#i-catalog"/></svg><span>Inventory</span></a>
+      <a href="#/stocktake" data-view="stocktake"><svg><use href="#i-check"/></svg><span>Stocktake</span></a>
+      <a href="#/purchasing" data-view="purchasing"><svg><use href="#i-sales"/></svg><span>Purchasing</span></a>
       <a href="#/customers" data-view="customers"><svg><use href="#i-users"/></svg><span>Customers</span></a>
       <a href="#/sales" data-view="sales"><svg><use href="#i-sales"/></svg><span>Sales</span></a>
+      <a href="#/refunds" data-view="refunds"><svg><use href="#i-undo"/></svg><span>Returns &amp; Refunds</span></a>
+      <a href="#/cash" data-view="cash"><svg><use href="#i-cash"/></svg><span>Cash Drawer</span></a>
       <a href="#/reports" data-view="reports"><svg><use href="#i-reports"/></svg><span>Reports</span></a>
       <a href="#/settings" data-view="settings"><svg><use href="#i-settings"/></svg><span>Settings</span></a>
+      <a href="#/staff" data-view="staff"><svg><use href="#i-users"/></svg><span>Staff</span></a>
     </nav>
     <div class="sidebar-foot">
       <button id="theme-toggle" class="btn ghost icon-only" title="Toggle theme">

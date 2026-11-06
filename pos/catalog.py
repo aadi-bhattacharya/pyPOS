@@ -96,10 +96,14 @@ def delete_product_group(conn, group_id):
 def list_groups(conn):
     cur = conn.cursor()
     cur.execute(
-        ''' SELECT g.id, g.name, COUNT(p.id) AS product_count,
+        ''' SELECT g.id, g.name, g.brand_id, g.category_id,
+                   b.name AS brand_name, c.name AS category_name,
+                   COUNT(p.id) AS product_count,
                    COALESCE(SUM(p.quantity), 0) AS total_stock
             FROM product_groups g
             LEFT JOIN products p ON p.group_id = g.id
+            LEFT JOIN brands b ON b.id = g.brand_id
+            LEFT JOIN categories c ON c.id = g.category_id
             GROUP BY g.id
             ORDER BY g.name COLLATE NOCASE '''
     )
@@ -112,6 +116,56 @@ def get_group(conn, group_id):
     row = cur.fetchone()
     return dict(row) if row else None
 
+
+
+
+def _barcode_owners(conn, code, *, exclude_id=None):
+    if not code:
+        return []
+    return [dict(r) for r in conn.execute("""
+        SELECT p.id, p.group_id, p.price, p.SKU, g.name AS group_name
+        FROM products p LEFT JOIN product_groups g ON g.id=p.group_id
+        WHERE (p.barcode=? OR EXISTS(
+           SELECT 1 FROM barcode_price_options o
+           WHERE o.product_id=p.id AND o.barcode=?))
+          AND (? IS NULL OR p.id != ?)
+        ORDER BY p.id
+    """, (code, code, exclude_id, exclude_id))]
+
+
+def _safe_barcode_for_new_product(conn, code, group_id, price):
+    """Return (canonical barcode, alias barcode) without weakening UNIQUE.
+
+    A shared EAN may identify different *price editions* of the same style,
+    but never silently a different style or two identical priced SKUs.
+    """
+    code = str(code).strip() if code else None
+    owners = _barcode_owners(conn, code)
+    if not owners:
+        return code, None
+    if group_id is None or any(o["group_id"] != group_id for o in owners):
+        raise DuplicateBarcodeError("EAN already belongs to a different style; review the barcode")
+    if any(round(float(o["price"])*100) == round(float(price)*100) for o in owners):
+        raise DuplicateBarcodeError("This EAN and selling price already exist; adjust its stock instead")
+    return None, code
+
+
+def _assign_barcode_on_update(conn, product_id, code, group_id, price):
+    """Explicit barcode edits also work on secondary-price SKU rows."""
+    code = str(code).strip() if code else None
+    owners = _barcode_owners(conn, code, exclude_id=product_id)
+    if owners:
+        if group_id is None or any(o["group_id"] != group_id for o in owners):
+            raise DuplicateBarcodeError("EAN belongs to a different style")
+        if any(round(float(o["price"])*100) == round(float(price)*100) for o in owners):
+            raise DuplicateBarcodeError("EAN and MRP combination already exists")
+        conn.execute("UPDATE products SET barcode=NULL WHERE id=?", (product_id,))
+        conn.execute("""INSERT INTO barcode_price_options(product_id,barcode)
+            VALUES(?,?) ON CONFLICT(product_id) DO UPDATE SET barcode=excluded.barcode""",
+            (product_id, code))
+    else:
+        conn.execute("DELETE FROM barcode_price_options WHERE product_id=?", (product_id,))
+        conn.execute("UPDATE products SET barcode=? WHERE id=?", (code, product_id))
 
 def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code="", unit_code="NOS"):
     if not SKU or not str(SKU).strip():
@@ -128,18 +182,26 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
     sql = ''' INSERT INTO products(group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code, unit_code)
               VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) '''
     cur = conn.cursor()
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        canonical, secondary = _safe_barcode_for_new_product(conn, barcode, group_id, price)
         cur.execute(sql, (
-            group_id, str(SKU).strip(), barcode, float(price), int(quantity),
+            group_id, str(SKU).strip(), canonical, float(price), int(quantity),
             # column is NOT NULL DEFAULT 0 — never bind an explicit NULL
             float(cost_price) if cost_price is not None else 0.0,
             float(tax_rate) if tax_rate is not None else 0.0,
             hsn(hsn_code), _unit(unit_code),
         ))
+        pid = cur.lastrowid
+        if secondary:
+            conn.execute("INSERT INTO barcode_price_options(product_id, barcode) VALUES(?,?)",
+                         (pid, secondary))
         conn.commit()
-        return cur.lastrowid
-    except sqlite3.IntegrityError as e:
+        return pid
+    except (sqlite3.IntegrityError, DuplicateBarcodeError) as e:
         conn.rollback()
+        if isinstance(e, DuplicateBarcodeError):
+            raise
         message = str(e)
         if "SKU" in message:
             raise DuplicateSKUError(f"SKU '{SKU}' already exists") from e
@@ -148,6 +210,9 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
         if "FOREIGN KEY" in message:
             raise GroupNotFoundError(f"No product group with id {group_id}") from e
         raise CatalogError(message) from e
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def set_product_attribute(conn, product_id, attribute_name, attribute_value):
@@ -185,41 +250,57 @@ def remove_product_attribute(conn, product_id, attribute_name):
     return cur.rowcount
 
 
-def adjust_stock(conn, product_id, amount):
-    """Add (positive) or remove (negative) stock for a product."""
+def adjust_stock(conn, product_id, amount, *, reason="", kind="ADJUSTMENT"):
+    """Atomic stock change; every entry is recorded by the database trigger."""
     try:
+        if isinstance(amount, bool) or not re.fullmatch(r"[+-]?[0-9]+", str(amount)):
+            raise ValueError
         amount = int(amount)
     except (TypeError, ValueError):
-        raise InvalidInputError("Quantity adjustment must be an integer")
+        raise InvalidInputError("Quantity adjustment must be a whole number")
     if amount == 0:
         raise InvalidInputError("Adjustment cannot be zero")
-
-    sql = ''' UPDATE products SET quantity = quantity + ?, updated = CURRENT_TIMESTAMP WHERE id = ? '''
-    cur = conn.cursor()
+    if kind not in ("ADJUSTMENT", "RECEIPT"):
+        raise InvalidInputError("Unknown stock movement type")
+    if kind == "RECEIPT" and amount < 0:
+        raise InvalidInputError("Goods receipt quantities must be positive")
+    reason = str(reason or "").strip()
+    if len(reason) > 300:
+        raise InvalidInputError("Stock adjustment reason is too long")
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        cur.execute(sql, (amount, product_id))
+        cur = conn.execute(
+            "UPDATE products SET quantity=quantity+?, updated=CURRENT_TIMESTAMP WHERE id=?",
+            (amount, product_id))
+        if cur.rowcount == 0:
+            raise ProductNotFoundError(f"No product with id {product_id}")
+        row = conn.execute("SELECT quantity FROM products WHERE id=?", (product_id,)).fetchone()
+        conn.execute("""UPDATE stock_movements SET kind=?, reason=?
+            WHERE id=(SELECT MAX(id) FROM stock_movements WHERE product_id=?)""",
+                     (kind, reason, product_id))
         conn.commit()
+        return row["quantity"]
     except sqlite3.IntegrityError as e:
         conn.rollback()
         if "CHECK" in str(e):
-            raise InvalidInputError(
-                f"Adjusting quantity by {amount} would make stock negative"
-            ) from e
+            raise InvalidInputError("Adjustment would make stock negative") from e
         raise CatalogError(str(e)) from e
-
-    if cur.rowcount == 0:
-        raise ProductNotFoundError(f"No product with id {product_id}")
-
-    cur.execute("SELECT quantity FROM products WHERE id = ?", (product_id,))
-    return cur.fetchone()["quantity"]
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # Kept for compatibility with earlier code.
 add_quantity = adjust_stock
 
 
-def update_product(conn, product_id, **fields):
-    ALLOWED_FIELDS = {"SKU", "barcode", "cost_price", "tax_rate", "price", "group_id", "hsn_code", "unit_code"}
+def update_product(conn, product_id, *, verified_gst=False, verified_price=False, **fields):
+    """Explicit price/tax confirmation clears only the matching import review flag."""
+    if verified_gst and "tax_rate" not in fields:
+        raise InvalidInputError("Supply tax_rate to confirm GST review")
+    if verified_price and "price" not in fields:
+        raise InvalidInputError("Supply price to confirm price review")
+    ALLOWED_FIELDS = {"SKU", "barcode", "cost_price", "tax_rate", "price", "group_id", "hsn_code", "unit_code", "reorder_point"}
     NON_NEGATIVE_FIELDS = {"cost_price", "tax_rate", "price"}
 
     if not fields:
@@ -247,21 +328,54 @@ def update_product(conn, product_id, **fields):
         fields["hsn_code"] = hsn(fields["hsn_code"])
     if "unit_code" in fields:
         fields["unit_code"] = _unit(fields["unit_code"])
+    if "reorder_point" in fields and fields["reorder_point"] not in (None, ""):
+        value = fields["reorder_point"]
+        if isinstance(value, bool) or not re.fullmatch(r"[0-9]+", str(value)):
+            raise InvalidInputError("Reorder point must be a whole number >= 0")
+        fields["reorder_point"] = int(value)
+    elif "reorder_point" in fields:
+        fields["reorder_point"] = None
 
-    values = []
-    assignments = []
-    for column, value in fields.items():
-        assignments.append(f"{column} = ?")
-        values.append(value)
-    values.append(product_id)
-
-    sql = f''' UPDATE products SET {", ".join(assignments)}, updated = CURRENT_TIMESTAMP WHERE id = ? '''
+    code_changed = "barcode" in fields
+    wanted_code = fields.pop("barcode", None)
+    # Edits cannot create two identical MRPs for the same EAN.
+    sql_assignments = [f"{k} = ?" for k in fields]
+    sql_values = list(fields.values())
     cur = conn.cursor()
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        cur.execute(sql, tuple(values))
+        prior = conn.execute("""SELECT p.group_id, p.price, COALESCE(p.barcode,
+                   (SELECT o.barcode FROM barcode_price_options o WHERE o.product_id=p.id)) AS barcode
+                   FROM products p WHERE p.id=?""", (product_id,)).fetchone()
+        if not prior:
+            raise ProductNotFoundError(f"No product with id {product_id}")
+        target_code = wanted_code if code_changed else prior["barcode"]
+        target_group = fields.get("group_id", prior["group_id"])
+        target_price = fields.get("price", prior["price"])
+        if target_code:
+            other = _barcode_owners(conn, str(target_code).strip(), exclude_id=product_id)
+            if other and (any(o["group_id"] != target_group for o in other) or
+                          any(round(float(o["price"])*100) == round(float(target_price)*100) for o in other)):
+                raise DuplicateBarcodeError("EAN conflicts with another style or the same MRP")
+        if sql_assignments:
+            cur.execute(f"UPDATE products SET {', '.join(sql_assignments)}, updated=CURRENT_TIMESTAMP WHERE id=?",
+                        (*sql_values, product_id))
+        else:
+            cur.execute("UPDATE products SET updated=CURRENT_TIMESTAMP WHERE id=?", (product_id,))
+        if code_changed:
+            _assign_barcode_on_update(conn, product_id, wanted_code, target_group, target_price)
+        if cur.rowcount:
+            if verified_gst:
+                conn.execute("DELETE FROM product_attributes WHERE product_id=? AND attribute_name=?",
+                             (product_id, "GST Review Required"))
+            if verified_price:
+                conn.execute("DELETE FROM product_attributes WHERE product_id=? AND attribute_name=?",
+                             (product_id, "Price Review Required"))
         conn.commit()
-    except sqlite3.IntegrityError as e:
+    except (sqlite3.IntegrityError, DuplicateBarcodeError) as e:
         conn.rollback()
+        if isinstance(e, DuplicateBarcodeError):
+            raise
         message = str(e)
         if "SKU" in message and "UNIQUE" in message.upper():
             raise DuplicateSKUError(f"SKU '{fields.get('SKU')}' already exists") from e
@@ -270,6 +384,9 @@ def update_product(conn, product_id, **fields):
         if "FOREIGN KEY" in message:
             raise GroupNotFoundError(f"No product group with id {fields.get('group_id')}") from e
         raise CatalogError(message) from e
+    except Exception:
+        conn.rollback()
+        raise
 
     if cur.rowcount == 0:
         raise ProductNotFoundError(f"No product with id {product_id}")
@@ -299,29 +416,38 @@ def _attach_attributes(conn, products):
     if not products:
         return products
     ids = [p["id"] for p in products]
-    marks = ",".join("?" * len(ids))
-    cur = conn.cursor()
-    cur.execute(
-        f''' SELECT product_id, attribute_name, attribute_value
-             FROM product_attributes WHERE product_id IN ({marks})
-             ORDER BY attribute_name COLLATE NOCASE ''',
-        ids,
-    )
     attrs = {}
-    for r in cur.fetchall():
-        attrs.setdefault(r["product_id"], []).append(
-            {"name": r["attribute_name"], "value": r["attribute_value"]}
+    # Older SQLite builds limit bound variables to 999. Imports can easily
+    # produce 1,000+ SKUs; use small chunks so opening Catalog never breaks.
+    for start in range(0, len(ids), 500):
+        batch = ids[start:start + 500]
+        marks = ",".join("?" * len(batch))
+        cur = conn.execute(
+            f''' SELECT product_id, attribute_name, attribute_value
+                 FROM product_attributes WHERE product_id IN ({marks})
+                 ORDER BY attribute_name COLLATE NOCASE ''',
+            batch,
         )
+        for r in cur.fetchall():
+            attrs.setdefault(r["product_id"], []).append(
+                {"name": r["attribute_name"], "value": r["attribute_value"]}
+            )
     for p in products:
         p["attributes"] = attrs.get(p["id"], [])
     return products
 
 
 PRODUCT_SELECT = '''
-    SELECT p.id, p.group_id, p.SKU, p.barcode, p.price, p.quantity,
-           p.cost_price, p.tax_rate, p.hsn_code, p.unit_code, p.updated, g.name AS group_name
+    SELECT p.id, p.group_id, p.SKU,
+           COALESCE(p.barcode, (SELECT o.barcode FROM barcode_price_options o WHERE o.product_id=p.id)) AS barcode,
+           p.price, p.quantity,
+           p.cost_price, p.tax_rate, p.hsn_code, p.unit_code, p.updated,
+           p.reorder_point, g.name AS group_name, g.brand_id, g.category_id,
+           b.name AS brand_name, c.name AS category_name
     FROM products p
     LEFT JOIN product_groups g ON g.id = p.group_id
+    LEFT JOIN brands b ON b.id = g.brand_id
+    LEFT JOIN categories c ON c.id = g.category_id
 '''
 
 
@@ -332,12 +458,14 @@ def list_products(conn, query=None, group_id=None, low_stock_threshold=None,
         like = f"%{query.strip()}%"
         where.append(
             ''' (p.SKU LIKE ? OR p.barcode LIKE ? OR g.name LIKE ?
+                OR b.name LIKE ? OR c.name LIKE ?
+                OR p.id IN (SELECT o.product_id FROM barcode_price_options o WHERE o.barcode LIKE ?)
                 OR p.id IN (
                     SELECT pa.product_id FROM product_attributes pa
                     WHERE pa.attribute_name LIKE ? OR pa.attribute_value LIKE ?
                 )) '''
         )
-        params += [like, like, like, like, like]
+        params += [like, like, like, like, like, like, like, like]
     if group_id is not None:
         where.append("p.group_id = ?")
         params.append(group_id)
@@ -368,13 +496,20 @@ def get_product(conn, product_id):
 
 
 def find_by_code(conn, code):
-    """Exact match on SKU or barcode (used by barcode scanners at the register)."""
-    cur = conn.cursor()
-    cur.execute(PRODUCT_SELECT + " WHERE p.SKU = ? OR p.barcode = ?", (code, code))
-    row = cur.fetchone()
-    if row is None:
+    """Return one exact SKU or one/multiple price options for a scanned EAN."""
+    # Exact SKU lookup always wins, including for SKUs sharing a barcode.
+    direct = conn.execute(PRODUCT_SELECT + " WHERE p.SKU = ?", (code,)).fetchone()
+    if direct:
+        return _attach_attributes(conn, [dict(direct)])[0]
+    rows = conn.execute(PRODUCT_SELECT + """ WHERE p.barcode = ? OR EXISTS (
+        SELECT 1 FROM barcode_price_options o WHERE o.product_id=p.id AND o.barcode=?)
+        ORDER BY p.price, p.id""", (code, code)).fetchall()
+    if not rows:
         return None
-    return _attach_attributes(conn, [dict(row)])[0]
+    matches = _attach_attributes(conn, [dict(r) for r in rows])
+    if len(matches) == 1:
+        return matches[0]
+    return {"barcode": code, "matches": matches}
 
 
 def cart_adjust_item(conn, cart, product_id, quantity):
@@ -405,3 +540,69 @@ def cart_adjust_item(conn, cart, product_id, quantity):
 
 class InsufficientStockError(CatalogError):
     """Raised when trying to sell more units than are in stock."""
+
+
+def list_brands(conn):
+    return [dict(r) for r in conn.execute("SELECT * FROM brands ORDER BY name COLLATE NOCASE")]
+
+
+def list_categories(conn):
+    return [dict(r) for r in conn.execute("SELECT * FROM categories ORDER BY name COLLATE NOCASE")]
+
+
+def create_label(conn, table, name, parent_id=None):
+    if table not in ("brands", "categories"):
+        raise InvalidInputError("Invalid label table")
+    name = str(name or "").strip()
+    if not name or len(name) > 100:
+        raise InvalidInputError("Name must contain 1–100 characters")
+    if table == "categories" and parent_id is not None:
+        if not conn.execute("SELECT 1 FROM categories WHERE id=?", (parent_id,)).fetchone():
+            raise InvalidInputError("Parent category not found")
+    try:
+        if table == "brands":
+            cur = conn.execute("INSERT INTO brands(name) VALUES(?)", (name,))
+        else:
+            cur = conn.execute("INSERT INTO categories(name, parent_id) VALUES(?,?)",
+                               (name, parent_id))
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError as exc:
+        raise InvalidInputError(f"This {table[:-1]} already exists") from exc
+
+
+def classify_group(conn, group_id, *, brand_id=None, category_id=None):
+    for table, key in (("brands", brand_id), ("categories", category_id)):
+        if key is not None and not conn.execute(
+                f"SELECT 1 FROM {table} WHERE id=?", (key,)).fetchone():
+            raise InvalidInputError(f"Unknown {table[:-1]}")
+    cur = conn.execute("UPDATE product_groups SET brand_id=?, category_id=? WHERE id=?",
+                       (brand_id, category_id, group_id))
+    if not cur.rowcount:
+        raise GroupNotFoundError(f"No product group with id {group_id}")
+    conn.commit()
+
+
+def stock_overview(conn, default_threshold=0):
+    default_threshold = max(0, int(default_threshold))
+    row = conn.execute("""SELECT COUNT(*) sku_count,
+        COALESCE(SUM(quantity),0) units_on_hand,
+        SUM(CASE WHEN quantity=0 THEN 1 ELSE 0 END) out_of_stock,
+        SUM(CASE WHEN quantity>0 AND quantity<=COALESCE(reorder_point, ?)
+            THEN 1 ELSE 0 END) low_stock,
+        SUM(CASE WHEN cost_price=0 THEN 1 ELSE 0 END) missing_cost
+        FROM products""", (default_threshold,)).fetchone()
+    return dict(row)
+
+
+def stock_history(conn, product_id=None, limit=100, offset=0):
+    limit = min(200, max(1, int(limit)))
+    offset = max(0, int(offset))
+    if product_id is None:
+        rows = conn.execute("""SELECT * FROM stock_movements
+            ORDER BY id DESC LIMIT ? OFFSET ?""", (limit, offset)).fetchall()
+    else:
+        rows = conn.execute("""SELECT * FROM stock_movements
+            WHERE product_id=? ORDER BY id DESC LIMIT ? OFFSET ?""",
+            (product_id, limit, offset)).fetchall()
+    return [dict(r) for r in rows]

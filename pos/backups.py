@@ -1,4 +1,5 @@
 import os
+from contextlib import closing
 import re
 import shutil
 import sqlite3
@@ -297,19 +298,30 @@ def _backup_path(name, bdir=None):
 
 
 def _swap_live(new_db, live_path=None):
+    """Restore *into* the existing SQLite database without unlinking its file.
+
+    Replacing the pathname while the web server is running split active SQLite
+    connections across two distinct inodes. The online SQLite backup API
+    coordinates the restore with database locks and preserves a single target
+    identity for existing and future connections (including on Windows).
+    """
     target = Path(live_path) if live_path else default_database_file()
-
-    # Checkpoint the live WAL into the main file so nothing is lost, then swap.
-    conn = sqlite3.connect(str(target))
+    validate_database(new_db)
+    if not target.exists():
+        raise BackupError("Live database is missing; stop pyPOS and recover from a backup")
     try:
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    finally:
-        conn.close()
+        # Keep WAL mode: a connection active at restore time must be able to
+        # read the new content instead of continuing to modify an unlinked DB.
+        with closing(sqlite3.connect(f"file:{Path(new_db).resolve()}?mode=ro", uri=True,
+                                     timeout=10)) as source:
+            with closing(sqlite3.connect(str(target), timeout=10)) as dest:
+                source.backup(dest, pages=128, sleep=0.05)
+                check = dest.execute("PRAGMA integrity_check").fetchone()
+                if not check or check[0] != "ok":
+                    raise BackupError("Restored database failed integrity check")
+    except sqlite3.Error as exc:
+        raise BackupError("Could not safely restore the live database; original backup remains available") from exc
 
-    for suffix in ("-wal", "-shm"):
-        stale = Path(str(target) + suffix)
-        stale.unlink(missing_ok=True)
-    os.replace(new_db, target)
 
 
 def cleanup_debris(max_age_hours=24, bdir=None):

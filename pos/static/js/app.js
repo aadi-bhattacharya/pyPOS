@@ -1,17 +1,29 @@
-import { refreshSettings } from "./api.js";
+import { api, refreshSettings, state } from "./api.js";
+import { applyBranding } from "./branding.js";
 import { h, icon, openModal, toastError } from "./ui.js";
 import { renderRegister } from "./views/register.js";
 import { renderCatalog } from "./views/catalog.js";
+import { renderInventory } from "./views/inventory.js";
+import { renderPurchasing } from "./views/purchasing.js";
+import { renderStocktake } from "./views/stocktake.js";
+import { renderStaff } from "./views/staffview.js";
 import { renderCustomers } from "./views/customers.js";
 import { renderSales } from "./views/salesview.js";
-import { renderReports } from "./views/reports.js";
+import { renderRefunds } from "./views/refunds.js";
+import { renderReports, renderCashDrawerPage } from "./views/reports.js";
 import { renderSettingsView } from "./views/settingsview.js";
 
 const routes = {
   register: renderRegister,
   catalog: renderCatalog,
+  inventory: renderInventory,
+  purchasing: renderPurchasing,
+  stocktake: renderStocktake,
+  staff: renderStaff,
   customers: renderCustomers,
   sales: renderSales,
+  refunds: renderRefunds,
+  cash: renderCashDrawerPage,
   reports: renderReports,
   settings: renderSettingsView,
 };
@@ -65,6 +77,7 @@ function initTheme() {
     const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
     document.documentElement.dataset.theme = next;
     localStorage.setItem("pypos.theme", next);
+    applyBranding(state.settings, next);
   });
 }
 
@@ -116,9 +129,20 @@ function globalKeys(e) {
 window.addEventListener("hashchange", router);
 document.addEventListener("keydown", globalKeys);
 
+async function apiStaffBoot() {
+  try { return await api.staffStatus(); }
+  catch (_) { return null; }
+}
+
 (async function boot() {
   initTheme();
   document.getElementById("help-btn").addEventListener("click", showShortcuts);
+  const staffStatus = await apiStaffBoot();
+  state.staff = staffStatus;
+  if (staffStatus?.enabled && !staffStatus.operator) {
+    window.location.replace("/staff-login"); return;
+  }
   await refreshSettings();
+  applyBranding(state.settings);
   await router();
 })();

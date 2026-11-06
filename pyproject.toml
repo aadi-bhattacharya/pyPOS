@@ -40,4 +40,5 @@ pos = [
     "static/js/*",
     "static/js/views/*",
     "static/fonts/*",
+    "static/templates/*",
 ]

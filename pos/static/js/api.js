@@ -37,7 +37,32 @@ async function request(path, options = {}) {
   return res.json();
 }
 
+async function importUpload(endpoint, file, mode, allowZeroPrices, forceRepeat = false, repeatReason = "") {
+  const data = new FormData();
+  data.append("file", file);
+  data.append("mode", mode);
+  data.append("allow_zero_prices", String(Boolean(allowZeroPrices)));
+  data.append("force_repeat", String(Boolean(forceRepeat)));
+  data.append("repeat_reason", repeatReason);
+  let response;
+  try {
+    response = await fetch(`/api/catalog/import/${endpoint}`, { method: "POST", body: data });
+  } catch (_) {
+    throw new Error("Cannot reach the POS server.");
+  }
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(body.error || `Import failed (${response.status})`);
+  return body;
+}
+
 export const api = {
+  // optional staff PINs
+  staffStatus: () => request("/staff/status"),
+  staffUsers: () => request("/staff/users"),
+  createStaff: (payload) => request("/staff/users", { method: "POST", body: payload }),
+  setStaffActive: (id, active) => request(`/staff/users/${id}`, { method: "PATCH", body: { active } }),
+  staffAudit: () => request("/staff/audit"),
+
   // settings
   getSettings: () => request("/settings"),
   saveSettings: (values) => request("/settings", { method: "PUT", body: values }),
@@ -53,6 +78,22 @@ export const api = {
   createGroup: (name) => request("/groups", { method: "POST", body: { name } }),
   renameGroup: (id, name) => request(`/groups/${id}`, { method: "PATCH", body: { name } }),
   deleteGroup: (id) => request(`/groups/${id}`, { method: "DELETE" }),
+
+  listBrands: () => request("/brands"),
+  listCategories: () => request("/categories"),
+  createBrand: (name) => request("/brands", { method: "POST", body: { name } }),
+  createCategory: (name, parent_id = null) =>
+    request("/categories", { method: "POST", body: { name, parent_id } }),
+  classifyGroup: (id, data) => request(`/groups/${id}/classification`,
+    { method: "PATCH", body: data }),
+  inventoryOverview: () => request("/inventory/overview"),
+  stockMovements: (params = {}) => request(`/inventory/movements?${new URLSearchParams(params)}`),
+
+  // preview and apply the same XLSX/CSV file, without replacing existing inventory
+  previewCatalogImport: (file, mode, allowZeroPrices) =>
+    importUpload("preview", file, mode, allowZeroPrices),
+  applyCatalogImport: (file, mode, allowZeroPrices, forceRepeat = false, repeatReason = "") =>
+    importUpload("apply", file, mode, allowZeroPrices, forceRepeat, repeatReason),
 
   // products
   listProducts: (params = {}) => {
@@ -72,8 +113,22 @@ export const api = {
     request(`/products/${pid}/attributes`, { method: "POST", body: { name, value } }),
   removeAttribute: (pid, name) =>
     request(`/products/${pid}/attributes/${encodeURIComponent(name)}`, { method: "DELETE" }),
-  adjustStock: (pid, delta) =>
-    request(`/products/${pid}/stock`, { method: "POST", body: { delta } }),
+  adjustStock: (pid, delta, reason = "", kind = "ADJUSTMENT") =>
+    request(`/products/${pid}/stock`, { method: "POST", body: { delta, reason, kind } }),
+
+  // purchasing and physical inventory counts
+  suppliers: () => request("/suppliers"),
+  createSupplier: (payload) => request("/suppliers", { method: "POST", body: payload }),
+  purchases: () => request("/purchases"),
+  receivePurchase: (payload) => request("/purchases", { method: "POST", body: payload }),
+  purchaseDetail: (id) => request(`/purchases/${id}`),
+  paySupplier: (id, payload) => request(`/purchases/${id}/payments`, { method: "POST", body: payload }),
+  stocktakes: () => request("/stocktakes"),
+  startStocktake: (note) => request("/stocktakes", { method: "POST", body: { note } }),
+  stocktakeDetail: (id) => request(`/stocktakes/${id}`),
+  countStock: (id, productId, counted) => request(`/stocktakes/${id}/count/${productId}`,
+    { method: "PUT", body: { counted } }),
+  postStocktake: (id) => request(`/stocktakes/${id}/post`, { method: "POST" }),
 
   // sales
   checkout: (payload) => request("/sales", { method: "POST", body: payload }),
@@ -84,11 +139,19 @@ export const api = {
   getSale: (id) => request(`/sales/${id}`),
   refundSale: (id, payload = {}) =>
     request(`/sales/${id}/refund`, { method: "POST", body: payload }),
+  previewRefund: (id, lines, toCredit = false) =>
+    request(`/sales/${id}/refund/preview`,
+      { method: "POST", body: { lines, to_credit: toCredit } }),
   voidSale: (id) => request(`/sales/${id}/void`, { method: "POST" }),
 
   // customers & store credit
-  listCustomers: (q = "") =>
-    request(`/customers${q ? "?q=" + encodeURIComponent(q) : ""}`),
+  listCustomers: (q = "", filter = "all") => {
+    const params = new URLSearchParams();
+    if (q) params.set("q", q);
+    if (filter !== "all") params.set("filter", filter);
+    return request(`/customers${params.size ? "?" + params : ""}`);
+  },
+  customerOverview: () => request("/customers/overview"),
   getCustomer: (id) => request(`/customers/${id}`),
   createCustomer: (data) => request("/customers", { method: "POST", body: data }),
   updateCustomer: (id, data) =>
@@ -111,6 +174,7 @@ export const api = {
 
   // cash sessions (X / Z reports)
   currentSession: () => request("/cash-sessions/current"),
+  addCashMovement: (payload) => request("/cash-sessions/movements", { method: "POST", body: payload }),
   openSession: (openingFloat) =>
     request("/cash-sessions/open", { method: "POST", body: { opening_float: openingFloat } }),
   closeSession: (countedCash, note = "") =>

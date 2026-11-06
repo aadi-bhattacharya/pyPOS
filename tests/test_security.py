@@ -53,7 +53,7 @@ class SecurityIsolationTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 201)
 
     def test_post_from_same_origin_allowed(self):
-        resp = self.post("/api/groups", origin="http://127.0.0.1:8420",
+        resp = self.post("/api/groups", host="127.0.0.1:8420", origin="http://127.0.0.1:8420",
                          json={"name": "same-origin"})
         self.assertEqual(resp.status_code, 201)
 
@@ -66,6 +66,11 @@ class SecurityIsolationTests(unittest.TestCase):
         # and nothing was written
         listing = self.client.get("/api/groups", headers={"Host": "127.0.0.1"})
         self.assertNotIn(b"csrf", listing.data)
+
+    def test_foreign_localhost_port_is_not_same_origin(self):
+        r = self.post("/api/groups", host="127.0.0.1:8420",
+                      origin="http://127.0.0.1:9898", json={"name":"bad-port"})
+        self.assertEqual(r.status_code, 403)
 
     def test_referer_fallback_checked_on_mutations(self):
         resp = self.client.post(
@@ -141,9 +146,7 @@ class LanModeTests(unittest.TestCase):
 
 
 class NullOriginTests(unittest.TestCase):
-    """Privacy browsers and extensions (Brave strict mode, uBlock-style)
-    send 'Origin: null' on mutations. It names no site, so it must not be
-    treated as a cross-site attack."""
+    """Opaque origins may come from sandboxed cross-site pages; reject them."""
 
     @classmethod
     def setUpClass(cls):
@@ -158,21 +161,21 @@ class NullOriginTests(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
-    def test_null_origin_mutation_allowed(self):
+    def test_null_origin_mutation_blocked(self):
         r = self.client.post("/api/customers",
                              data='{"name":"Privacy User"}',
                              headers={"Host": "127.0.0.1:8420",
                                       "Origin": "null",
                                       "Content-Type": "application/json"})
-        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.status_code, 403)
 
-    def test_null_origin_case_insensitive(self):
+    def test_null_origin_case_insensitive_blocked(self):
         r = self.client.post("/api/customers",
                              data='{"name":"Null NUL"}',
                              headers={"Host": "127.0.0.1:8420",
                                       "Origin": "NULL",
                                       "Content-Type": "application/json"})
-        self.assertEqual(r.status_code, 201)
+        self.assertEqual(r.status_code, 403)
 
     def test_foreign_origin_still_blocked(self):
         r = self.client.post("/api/customers",

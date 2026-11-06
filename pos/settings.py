@@ -12,6 +12,13 @@ SETTING_KEYS = {
     "store_fssai": "",
     "store_upi_id": "",
     "store_logo": "",
+    # Appearance on POS screens (independent of the GST invoice seller name).
+    "pos_display_name": "pyPOS",
+    "pos_accent_color": "#1B6BB5",
+    "pos_logo_mode": "default",  # default mark, receipt, custom, or none
+    "pos_logo_size": "28",  # square icon width in POS sidebar, pixels
+    "pos_logo": "",
+    "show_staff_menu": "true",  # Navigation only: never disables staff access control.
     "show_receipt_logo": "true",
     "receipt_logo_width": "32",
     "receipt_paper": "80mm",
@@ -87,8 +94,24 @@ def save_settings(conn, values):
         value = "" if value is None else str(value)
         if key == "store_gstin":
             value = gstin(value)
-        elif key == "store_logo":
+        elif key in ("store_logo", "pos_logo"):
             value = logo_data(value)
+        elif key == "show_staff_menu" and value not in ("true", "false"):
+            raise ValueError("Staff menu visibility must be true or false")
+        elif key == "pos_display_name":
+            value = " ".join(value.split())
+            if not 1 <= len(value) <= 48 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError("POS display name must be 1 to 48 characters without control characters")
+        elif key == "pos_accent_color":
+            import re
+            if not re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
+                raise ValueError("Accent colour must be a six-digit hexadecimal colour (#RRGGBB)")
+            value = value.upper()
+        elif key == "pos_logo_size":
+            if not value.isascii() or not value.isdecimal() or not 24 <= int(value) <= 48:
+                raise ValueError("POS logo size must be 24 to 48 pixels")
+        elif key == "pos_logo_mode" and value not in ("default", "receipt", "custom", "none"):
+            raise ValueError("POS logo must be default, receipt, custom or none")
         elif key == "store_state_code":
             value = value.strip()
             if value and (not value.isdigit() or len(value) != 2 or
@@ -125,6 +148,8 @@ def save_settings(conn, values):
             continue  # blank field on a form should not erase stored secrets
         normalized[key] = value
     combined = {**get_settings(conn), **normalized}
+    if combined["pos_logo_mode"] == "custom" and not combined["pos_logo"]:
+        raise ValueError("Upload a custom POS logo before selecting custom logo mode")
     if (combined["store_gstin"] and combined["store_state_code"] and
             combined["store_gstin"][:2] != combined["store_state_code"]):
         raise ValueError("GSTIN State/UT code must match the supplier State/UT code")

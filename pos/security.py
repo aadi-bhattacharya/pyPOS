@@ -38,16 +38,23 @@ def _is_allowed_host(host_header, extra_hosts=()):
         _hostname(host_header) in set(extra_hosts)
 
 
-def _origin_allowed(value, allowed_hosts):
+def _origin_allowed(value, allowed_hosts=None, target_origin=None):
+    """Allow only the exact origin serving this POS, including its TCP port.
+
+    A foreign localhost port and an opaque ``Origin: null`` are *not* trusted.
+    LAN access is permitted by Host policy, but cross-origin mutations remain
+    disallowed even when ``--lan`` is enabled.
+    """
     try:
         parsed = urlparse(value)
+        current = urlparse(target_origin or "")
     except ValueError:
         return False
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if (parsed.scheme not in ("http", "https") or not parsed.netloc or
+            parsed.username is not None or parsed.password is not None):
         return False
-    if "*" in allowed_hosts:
-        return True
-    return _hostname(parsed.netloc) in allowed_hosts
+    return (parsed.scheme == current.scheme and
+            parsed.netloc.lower() == current.netloc.lower())
 
 
 def install_security(app, extra_hosts=()):
@@ -72,12 +79,9 @@ def install_security(app, extra_hosts=()):
             origin = request.headers.get("Origin") or ""
             referer = request.headers.get("Referer") or ""
             source = origin or referer
-            # 'null' = opaque origin: privacy browsers/extensions strip the
-            # value, and it names no site we could distrust. The JSON-only
-            # APIs (preflight kills cross-site JSON) and the Host guard
-            # above already cover the real threats, so treat it as absent.
-            if source and source.lower() != "null" \
-                    and not _origin_allowed(source, allowed):
+            # An opaque ("null") Origin is *not* proof of a same-origin
+            # request. Sandboxed iframes and file: pages can create one.
+            if source and not _origin_allowed(source, allowed, request.host_url):
                 return jsonify({
                     "error": "Forbidden — mutating requests from another "
                              "site are blocked (cross-site request shield).",

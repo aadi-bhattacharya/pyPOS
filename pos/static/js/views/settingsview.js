@@ -1,6 +1,8 @@
 import { api, state, refreshSettings, fmt } from "../api.js";
 import { h, icon, toast, toastError, confirmDialog, printReceipt } from "../ui.js";
 import { fmtDate } from "../api.js";
+import { DEFAULT_ACCENT, applyBranding, brandingPalette, normalizeAccent } from "../branding.js";
+import { optimizeImage, asDataUrl, readableBytes, optimizedFilename, downloadOptimized } from "../imageOptimizer.js";
 
 const FIELDS = [
   ["store_name", "Store name", "text", "My Store"],
@@ -9,6 +11,249 @@ const FIELDS = [
   ["tax_label", "Tax label on receipts", "text", "Tax"],
   ["low_stock_threshold", "Low-stock alert threshold (units)", "number", "5"],
 ];
+
+const BRAND_PRESETS = [
+  ["Classic blue", "#1B6BB5"], ["Indigo", "#5546C9"],
+  ["Emerald", "#176B52"], ["Rose", "#A52A4A"],
+  ["Amber", "#975A16"], ["Slate", "#455A64"],
+];
+
+function imageQualitySelect(initial = "0.86") {
+  return h("select", { class: "input", "aria-label": "Image compression quality" },
+    ...[["0.94", "High quality"], ["0.86", "Balanced"],
+      ["0.72", "Smaller file"]].map(([v, label]) =>
+      h("option", { value: v, selected: v === initial }, label)));
+}
+
+function imageSizeSelect(initial = "900") {
+  return h("select", { class: "input", "aria-label": "Maximum image dimension" },
+    ...[["256", "256 px"], ["384", "384 px"], ["512", "512 px"],
+      ["900", "900 px"], ["1200", "1200 px"], ["1600", "1600 px"]]
+      .map(([v, label]) => h("option", { value: v, selected: v === initial }, label)));
+}
+
+function imageCompressionSettings(maxEdge, quality, hint = "Optimisation runs in your browser; original files are untouched.") {
+  return h("div", { class: "image-opt-controls" },
+    h("div", { class: "field" }, h("label", {}, "Maximum dimension"), maxEdge),
+    h("div", { class: "field" }, h("label", {}, "Image quality"), quality),
+    h("p", { class: "form-hint" }, hint));
+}
+
+function imageOptimizerCard() {
+  const fileInput = h("input", { class: "input", type: "file", multiple: true,
+    accept: "image/png,image/jpeg,image/webp", "aria-label": "Choose images to optimise" });
+  const maxEdge = imageSizeSelect("900");
+  const quality = imageQualitySelect();
+  const format = h("select", { class: "input", "aria-label": "Output image format" },
+    ...[["auto", "Automatic (preserve transparency)"], ["image/webp", "WebP"],
+      ["image/png", "PNG"], ["image/jpeg", "JPEG (white background)"],
+    ].map(([value, label]) => h("option", { value }, label)));
+  const results = h("div", { class: "image-opt-results", "aria-live": "polite" });
+  const run = h("button", { class: "btn primary" }, "Optimise selected images");
+  run.addEventListener("click", async () => {
+    const files = Array.from(fileInput.files || []);
+    if (!files.length) return toast("Choose at least one image.", "warn");
+    if (files.length > 20) return toast("Optimise up to 20 images at once.", "warn");
+    run.disabled = true;
+    results.replaceChildren();
+    try {
+      for (const file of files) {
+        try {
+          const result = await optimizeImage(file, {
+            maxEdge: Number(maxEdge.value), quality: Number(quality.value),
+            maxBytes: 24 * 1024 * 1024, format: format.value,
+            keepSmallOriginal: false,
+          });
+          // Auto mode may keep an already-small image; never undo a requested
+          // dimension cap or an explicit output-format conversion.
+          const keepOriginal = format.value === "auto" && result.blob.size >= file.size &&
+            Math.max(result.inputWidth, result.inputHeight) <= Number(maxEdge.value);
+          const output = keepOriginal ? file : result.blob;
+          const outputName = keepOriginal ? file.name : optimizedFilename(file.name, output.type);
+          const outWidth = keepOriginal ? result.inputWidth : result.width;
+          const outHeight = keepOriginal ? result.inputHeight : result.height;
+          results.append(h("div", { class: "image-opt-result" },
+            h("div", {}, h("b", {}, file.name), h("div", { class: "form-hint" },
+              `${readableBytes(file.size)} → ${readableBytes(output.size)} · ${outWidth}×${outHeight}`)),
+            h("button", { class: "btn", onclick: () => downloadOptimized(output, outputName) },
+              "Download")));
+        } catch (e) {
+          results.append(h("p", { class: "image-opt-error" }, `${file.name}: ${e.message}`));
+        }
+      }
+    } finally { run.disabled = false; }
+  });
+  return h("div", { class: "card card-pad", style: "margin-top:16px" },
+    h("h3", { style: "margin-bottom:6px" }, "Image downscaler & compressor"),
+    h("p", { class: "form-hint", style: "margin-bottom:12px" },
+      "Prepare logos and future catalogue photos without uploading them anywhere. " +
+      "Images are processed entirely on this device. The POS currently stores receipt/menu logos, not product photos."),
+    h("div", { class: "field" }, h("label", {}, "Images (PNG, JPEG or WebP; max 24 MiB each)"), fileInput),
+    h("div", { class: "image-opt-controls" },
+      h("div", { class: "field" }, h("label", {}, "Longest side"), maxEdge),
+      h("div", { class: "field" }, h("label", {}, "Quality"), quality),
+      h("div", { class: "field" }, h("label", {}, "Format"), format)),
+    h("p", { class: "form-hint", style: "margin-bottom:12px" },
+      "Original images stay unchanged. Transparent images stay transparent in Auto/WebP/PNG; " +
+      "JPEG replaces transparency with white. Image metadata may be removed when recompressing."),
+    run, results);
+}
+
+function brandingSettingsCard(main, saved) {
+  const displayName = h("input", { class: "input", type: "text", maxlength: "48",
+    value: saved.pos_display_name || "pyPOS", placeholder: "Your store name" });
+  const picker = h("input", { type: "color", value: normalizeAccent(saved.pos_accent_color),
+    "aria-label": "Choose accent colour" });
+  const hex = h("input", { class: "input mono", type: "text", maxlength: "7",
+    value: normalizeAccent(saved.pos_accent_color), placeholder: "#1B6BB5",
+    "aria-label": "Accent colour hex value" });
+  const mode = h("select", { class: "input", "aria-label": "Logo displayed in POS menu" },
+    ...[["default", "Simple coloured initial"], ["receipt", "Use existing receipt logo"],
+      ["custom", "Upload separate POS logo"], ["none", "No menu logo"]].map(([value, name]) =>
+      h("option", { value, selected: (saved.pos_logo_mode || "default") === value }, name)));
+  const logoSize = h("input", { type: "number", class: "input num", min: "24", max: "48", step: "1",
+    value: saved.pos_logo_size || "28", "aria-label": "Menu logo width in pixels" });
+  const logoFile = h("input", { class: "input", type: "file",
+    accept: "image/png,image/jpeg,image/webp", "aria-label": "Upload separate POS logo" });
+  const logoHint = h("p", { class: "form-hint" },
+    "The separate logo is for the menu and browser tab. Your receipt logo and tax invoice details are unchanged.");
+  const previewMark = h("div", { class: "branding-preview-mark" }, "P");
+  const previewName = h("div", { class: "branding-preview-title" }, "pyPOS");
+  const previewAction = h("div", { class: "branding-preview-cta" }, "Register");
+  const preview = h("div", { class: "branding-settings-preview" },
+    previewMark, h("div", { style: "min-width:0;flex:1" },
+      previewName, h("div", { class: "form-hint" }, "Store menu preview")), previewAction);
+  let pendingLogoTask = null;
+  let temporaryUrl = null;
+  const menuMaxEdge = imageSizeSelect("384");
+  const menuQuality = imageQualitySelect();
+  const logoCompressionInfo = h("p", { class: "form-hint", "aria-live": "polite" },
+    "Large images are automatically compressed to fit the 200 KiB logo limit.");
+
+  function updatePreview() {
+    const name = displayName.value.trim() || "pyPOS";
+    const palette = brandingPalette(hex.value);
+    preview.style.setProperty("--preview-accent", palette["--brand-color"]);
+    preview.style.setProperty("--preview-text", palette["--cta-text"]);
+    previewName.textContent = name;
+    const size = Math.max(24, Math.min(48, Number(logoSize.value) || 28));
+    previewMark.style.width = previewMark.style.height = `${size}px`;
+    previewMark.classList.remove("has-image");
+    previewMark.replaceChildren();
+    previewMark.hidden = mode.value === "none";
+    const chosen = mode.value === "custom" ? (temporaryUrl || saved.pos_logo) :
+      mode.value === "receipt" ? saved.store_logo : "";
+    if (chosen && mode.value !== "none") {
+      previewMark.classList.add("has-image");
+      previewMark.append(h("img", { src: chosen, alt: "" }));
+    } else previewMark.textContent = Array.from(name)[0]?.toUpperCase() || "P";
+    logoHint.textContent = mode.value === "receipt" && !saved.store_logo
+      ? "No receipt logo is saved yet. Upload it in Receipt printing & logo below, or choose a separate POS logo."
+      : "The menu logo and receipt logo can be chosen independently. No change to past invoices.";
+  }
+  picker.addEventListener("input", () => { hex.value = picker.value.toUpperCase(); updatePreview(); });
+  hex.addEventListener("input", () => {
+    if (/^#[0-9a-fA-F]{6}$/.test(hex.value)) picker.value = hex.value;
+    updatePreview();
+  });
+  displayName.addEventListener("input", updatePreview);
+  mode.addEventListener("change", updatePreview);
+  logoSize.addEventListener("input", updatePreview);
+  logoFile.addEventListener("change", () => {
+    const file = logoFile.files?.[0];
+    if (!file) { pendingLogoTask = null; return; }
+    pendingLogoTask = optimizeImage(file, { maxEdge: Number(menuMaxEdge.value),
+      quality: Number(menuQuality.value), maxBytes: 200 * 1024 });
+    logoCompressionInfo.textContent = "Optimising logo…";
+    pendingLogoTask.then(async (result) => {
+      if (logoFile.files?.[0] !== file) return;
+      const nextUrl = URL.createObjectURL(result.blob);
+      if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+      temporaryUrl = nextUrl;
+      mode.value = "custom";
+      logoCompressionInfo.textContent = `${readableBytes(file.size)} → ${readableBytes(result.blob.size)} · ${result.width} × ${result.height}`;
+      updatePreview();
+    }).catch((err) => {
+      if (logoFile.files?.[0] !== file) return;
+      pendingLogoTask = null;
+      logoFile.value = "";
+      logoCompressionInfo.textContent = err.message;
+      toastError(err, "Could not optimise menu logo");
+    });
+  });
+
+  const presets = h("div", { class: "branding-presets" },
+    ...BRAND_PRESETS.map(([label, value]) => h("button", {
+      class: "branding-swatch", style: `background:${value}`,
+      type: "button", title: label, "aria-label": `Select ${label} accent`,
+      onclick: () => { picker.value = value; hex.value = value; updatePreview(); },
+    })));
+  updatePreview();
+  return h("div", { class: "card card-pad", style: "margin-bottom:16px", id: "store-branding" },
+    h("h3", { style: "margin-bottom:4px" }, "POS appearance & branding"),
+    h("p", { class: "form-hint", style: "margin-bottom:14px" },
+      "Personalise the menu, logo, browser tab and accent across light and dark mode. " +
+      "These are display settings; the store name and GST details printed on invoices are set below."),
+    preview,
+    h("div", { class: "form-grid", style: "margin-top:16px" },
+      h("div", { class: "field" }, h("label", {}, "Name in sidebar and browser tab"), displayName),
+      h("div", { class: "field" }, h("label", {}, "Menu logo size (24–48 px)"), logoSize)),
+    h("div", { class: "field" }, h("label", {}, "Accent colour"),
+      h("div", { class: "branding-accent-row" }, picker, hex),
+      h("p", { class: "form-hint" }, "Choose a preset or enter a #RRGGBB colour. Very pale or dark hues are adjusted where needed for readable interface text.")),
+    presets,
+    h("div", { class: "form-grid" },
+      h("div", { class: "field" }, h("label", {}, "Menu logo source"), mode),
+      h("div", { class: "field" }, h("label", {}, "Upload menu logo (auto-compressed to 200 KiB)"), logoFile)),
+    imageCompressionSettings(menuMaxEdge, menuQuality,
+      "Choose settings before selecting the file; select it again to recompress."),
+    logoCompressionInfo, logoHint,
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" },
+      h("button", { class: "btn primary", onclick: async () => {
+        try {
+          const values = {
+            pos_display_name: displayName.value.trim(),
+            pos_accent_color: hex.value.trim(),
+            pos_logo_mode: mode.value,
+            pos_logo_size: logoSize.value.trim(),
+          };
+          if (pendingLogoTask && logoFile.files?.length) {
+            const processed = await pendingLogoTask;
+            values.pos_logo = await asDataUrl(processed.blob);
+          }
+          state.settings = await api.saveSettings(values);
+          applyBranding(state.settings);
+          toast("Store appearance saved and applied.", "success");
+          if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+          renderSettingsView(main);
+        } catch (e) { toastError(e); }
+      } }, icon("i-check"), "Save POS branding"),
+      h("button", { class: "btn", onclick: async () => {
+        try {
+          state.settings = await api.saveSettings({
+            pos_display_name: "pyPOS", pos_accent_color: DEFAULT_ACCENT,
+            pos_logo_mode: "default", pos_logo_size: "28",
+          });
+          applyBranding(state.settings);
+          toast("Default appearance restored. Uploaded logos were retained.", "success");
+          if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+          renderSettingsView(main);
+        } catch (e) { toastError(e); }
+      } }, "Reset appearance"),
+      h("button", { class: "btn subtle-danger", onclick: async () => {
+        if (!saved.pos_logo) return toast("No separate POS logo is saved.", "warn");
+        if (!(await confirmDialog({ title: "Remove separate POS logo?",
+          message: "Receipt logo and historical invoices will not change.",
+          confirmLabel: "Remove logo", danger: true }))) return;
+        try {
+          state.settings = await api.saveSettings({ pos_logo: "", pos_logo_mode: "default" });
+          applyBranding(state.settings);
+          toast("Separate POS logo removed.", "success");
+          if (temporaryUrl) URL.revokeObjectURL(temporaryUrl);
+          renderSettingsView(main);
+        } catch (e) { toastError(e); }
+      } }, "Remove uploaded POS logo")));
+}
 
 export async function renderSettingsView(main) {
   const authState = await api.settingsAuth();
@@ -77,24 +322,38 @@ export async function renderSettingsView(main) {
   const showLogo = h("input", { type: "checkbox", checked: s.show_receipt_logo === "true" });
   const logoWidth = h("input", { class: "input num", type: "number", min: "12",
     max: "65", value: s.receipt_logo_width || "32", step: "1" });
-  const logoInput = h("input", { class: "input", type: "file", accept: "image/png,image/jpeg,image/webp" });
+  const logoInput = h("input", { class: "input", type: "file",
+    accept: "image/png,image/jpeg,image/webp", "aria-label": "Upload receipt logo" });
   const logoPreview = h("div", { style: "margin:10px 0;min-height:20px" },
     s.store_logo ? h("img", { src: s.store_logo, alt: "Saved receipt logo",
       style: "max-width:240px;max-height:100px;object-fit:contain" }) :
       h("span", { class: "form-hint" }, "No logo saved"));
+  const receiptMaxEdge = imageSizeSelect("900");
+  const receiptQuality = imageQualitySelect();
+  const receiptImageInfo = h("p", { class: "form-hint", "aria-live": "polite" },
+    "Large images are automatically resized/compressed to fit 200 KiB.");
+  let receiptLogoTask = null;
+  let receiptPreviewUrl = null;
   logoInput.addEventListener("change", () => {
     const file = logoInput.files?.[0];
-    if (!file) return;
-    if (file.size > 200 * 1024 || !["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+    if (!file) { receiptLogoTask = null; return; }
+    receiptLogoTask = optimizeImage(file, { maxEdge: Number(receiptMaxEdge.value),
+      quality: Number(receiptQuality.value), maxBytes: 200 * 1024 });
+    receiptImageInfo.textContent = "Optimising logo…";
+    receiptLogoTask.then((result) => {
+      if (logoInput.files?.[0] !== file) return;
+      if (receiptPreviewUrl) URL.revokeObjectURL(receiptPreviewUrl);
+      receiptPreviewUrl = URL.createObjectURL(result.blob);
+      logoPreview.replaceChildren(h("img", { src: receiptPreviewUrl,
+        alt: "Optimised receipt logo preview", style: "max-width:240px;max-height:100px;object-fit:contain" }));
+      receiptImageInfo.textContent = `${readableBytes(file.size)} → ${readableBytes(result.blob.size)} · ${result.width} × ${result.height}`;
+    }).catch((err) => {
+      if (logoInput.files?.[0] !== file) return;
+      receiptLogoTask = null;
       logoInput.value = "";
-      return toast("Use a PNG, JPEG or WebP logo up to 200 KiB.", "warn");
-    }
-    const previewUrl = URL.createObjectURL(file);
-    logoPreview.replaceChildren(h("img", {
-      src: previewUrl, alt: "Selected logo preview",
-      style: "max-width:240px;max-height:100px;object-fit:contain",
-      onload: () => URL.revokeObjectURL(previewUrl),
-    }));
+      receiptImageInfo.textContent = err.message;
+      toastError(err, "Could not optimise receipt logo");
+    });
   });
   const brandingCard = h("div", { class: "card card-pad", style: "margin-top:16px" },
     h("h3", { style: "margin-bottom:6px" }, "Receipt printing & logo"),
@@ -110,8 +369,10 @@ export async function renderSettingsView(main) {
     h("div", { class: "field" }, h("label", {}, "Paper / print layout"), paperSelect),
     h("div", { class: "field" }, h("label", {}, "Receipt heading"), titleSelect),
     h("div", { class: "field" }, h("label", {}, "Local tax component"), localTaxSelect),
-    h("div", { class: "field" }, h("label", {}, "Upload shop logo (PNG/JPEG/WebP, maximum 200 KiB)"), logoInput),
-    logoPreview,
+    h("div", { class: "field" }, h("label", {}, "Upload receipt logo (auto-compressed to 200 KiB)"), logoInput),
+    imageCompressionSettings(receiptMaxEdge, receiptQuality,
+      "Choose settings before selecting the file; select it again to recompress."),
+    receiptImageInfo, logoPreview,
     h("label", { class: "credit-toggle" }, showLogo, h("span", {}, "Print logo on receipts")),
     h("div", { class: "field" }, h("label", {}, "Logo width in mm (12–65)"), logoWidth),
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
@@ -125,13 +386,9 @@ export async function renderSettingsView(main) {
             show_receipt_logo: showLogo.checked ? "true" : "false",
             store_local_tax: localTaxSelect.value,
           };
-          if (logoInput.files?.length) {
-            values.store_logo = await new Promise((resolve, reject) => {
-              const reader = new FileReader();
-              reader.onload = () => resolve(reader.result);
-              reader.onerror = () => reject(new Error("Could not read the selected logo"));
-              reader.readAsDataURL(logoInput.files[0]);
-            });
+          if (receiptLogoTask && logoInput.files?.length) {
+            const processed = await receiptLogoTask;
+            values.store_logo = await asDataUrl(processed.blob);
           }
           state.settings = await api.saveSettings(values);
           toast("Receipt printing preferences saved.", "success");
@@ -345,7 +602,8 @@ export async function renderSettingsView(main) {
         h("h2", {}, "Settings"),
         h("div", { class: "sub" }, "Store details and receipt preferences"))),
 
-    h("div", { style: "max-width:680px" },
+    h("div", { style: "max-width:780px" },
+      brandingSettingsCard(main, s),
       h("div", { class: "card card-pad" },
         h("h3", { style: "margin-bottom:14px" }, "Store"),
         form,
@@ -373,8 +631,28 @@ export async function renderSettingsView(main) {
         }, icon("i-check"), "Save settings")),
 
       brandingCard,
+      imageOptimizerCard(),
       taxCard,
       loyaltyCard,
+      h("div", { class: "card card-pad", style: "margin-top:16px" },
+        h("h3", { style: "margin-bottom:8px" }, "Staff menu visibility"),
+        h("p", { class: "form-hint", style: "margin-bottom:12px" },
+          "Choose whether Staff appears in the sidebar. Staff PIN login, permissions and activity logging continue working when hidden."),
+        (() => {
+          const toggle = h("input", { type: "checkbox", checked: s.show_staff_menu !== "false" });
+          return h("div", {},
+            h("label", { class: "credit-toggle" }, toggle, h("span", {}, "Show Staff in main menu")),
+            h("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" },
+              h("button", { class: "btn primary", onclick: async () => {
+                try {
+                  state.settings = await api.saveSettings({ show_staff_menu: toggle.checked ? "true" : "false" });
+                  applyBranding(state.settings);
+                  toast("Staff menu visibility saved.", "success");
+                } catch (e) { toastError(e); }
+              } }, icon("i-check"), "Save menu preference"),
+              h("button", { class: "btn", onclick: () => { location.hash = "#/staff"; } },
+                "Open Staff management")));
+        })()),
 
       h("div", { class: "card card-pad", style: "margin-top:16px" },
         h("h3", { style: "margin-bottom:8px" }, "Sample data"),

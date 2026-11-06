@@ -1,28 +1,38 @@
 import { api, fmt, state } from "../api.js";
 import { h, icon, openModal, toast, toastError, confirmDialog } from "../ui.js";
+import { publicVariant, needsBillingReview, billingReviewLabel } from "../productLabels.js";
 
 let products = [];
 let groups = [];
 let searchTerm = "";
+let reviewOnly = false;
+let reviewBtn = null;
 let filterGroup = null;
+let catalogPage = 0;
+const CATALOG_PAGE_SIZE = 100;
 let groupsListEl = null;
 let tableWrapEl = null;
 
 export async function renderCatalog(main) {
   await load();
   searchTerm = "";
+  reviewOnly = false;
   filterGroup = null;
+  catalogPage = 0;
 
   main.innerHTML = "";
 
   const searchInput = h("input", {
     class: "input",
     placeholder: "Search SKU / barcode / name…",
-    oninput: () => { searchTerm = searchInput.value.trim(); renderTable(); },
+    oninput: () => { searchTerm = searchInput.value.trim(); catalogPage = 0; renderTable(); },
   });
 
-  groupsListEl = h("div", { style: "display:flex;flex-direction:column;gap:2px" });
+  groupsListEl = h("div", { style: "display:flex;flex-direction:column;gap:2px;max-height:65vh;overflow-y:auto" });
   tableWrapEl = h("div", {});
+  reviewBtn = h("button", { class: "btn sm", onclick: () => {
+    reviewOnly = !reviewOnly; catalogPage = 0; renderSub(); renderTable();
+  } }, "Billing review");
 
   const grid = h("div", {
     style: "display:grid;grid-template-columns:minmax(200px,250px) 1fr;gap:16px;align-items:start",
@@ -39,6 +49,7 @@ export async function renderCatalog(main) {
     h("div", {},
       h("div", { class: "search-wrap", style: "margin-bottom:12px;max-width:340px" },
         icon("i-search"), searchInput),
+      h("div", { style: "margin-bottom:10px" }, reviewBtn),
       tableWrapEl));
 
   main.append(
@@ -52,6 +63,9 @@ export async function renderCatalog(main) {
           href: "/api/export/inventory.csv",
           title: "Download inventory as CSV (opens in Excel/Sheets)",
         }, icon("i-sales"), "Export CSV"),
+        h("button", {
+          class: "btn", onclick: importCatalogModal,
+        }, icon("i-plus"), "Import stock"),
         h("button", {
           class: "btn primary",
           onclick: () => productModal(),
@@ -76,10 +90,128 @@ function rerenderAll() {
 
 function renderSub() {
   const el = document.getElementById("cat-sub");
+  const count = products.filter(p => needsBillingReview(p.attributes || [])).length;
   if (el) {
-    el.textContent =
-      `${products.length} product${products.length === 1 ? "" : "s"} across ${groups.length} group${groups.length === 1 ? "" : "s"}`;
+    el.textContent = `${products.length} SKU(s) across ${groups.length} groups · ${count} need billing review`;
   }
+  if (reviewBtn) {
+    reviewBtn.textContent = `Billing review (${count})${reviewOnly ? " · showing only" : ""}`;
+    reviewBtn.className = `btn sm${reviewOnly ? " primary" : ""}`;
+  }
+}
+
+// ================= additive CSV/XLSX import =================
+
+function importCatalogModal() {
+  const fileInput = h("input", { class: "input", type: "file", accept: ".xlsx,.csv" });
+  const mode = h("select", { class: "input" },
+    h("option", { value: "skip" }, "Create new products, skip existing SKUs (safest)"),
+    h("option", { value: "add_stock" }, "Create new + add stock on existing SKUs"),
+    h("option", { value: "merge" }, "Create new + add stock + update supplied fields/attributes"));
+  const allowZero = h("input", { type: "checkbox" });
+  const forceRepeat = h("input", { type: "checkbox" });
+  const repeatReason = h("input", { class: "input", maxlength: "250",
+    placeholder: "Why is this an additional delivery of identical stock?" });
+  const previewArea = h("div", { style: "margin-top:14px" },
+    h("p", { class: "form-hint" }, "Select a file and click Preview. No records change until you import."));
+  const previewBtn = h("button", { class: "btn" }, "Preview import");
+  const applyBtn = h("button", { class: "btn primary", disabled: true }, "Import now");
+  let previewResult = null;
+  let busy = false;
+  let m;
+  const invalidate = () => {
+    previewResult = null;
+    applyBtn.disabled = true;
+    previewArea.replaceChildren(h("p", { class: "form-hint" },
+      "Options changed. Preview again before importing."));
+  };
+  for (const ctl of [fileInput, mode, allowZero]) ctl.addEventListener("change", invalidate);
+  const setBusy = (value) => {
+    busy = value;
+    previewBtn.disabled = value;
+    applyBtn.disabled = value || !previewResult?.can_import;
+  };
+  previewBtn.addEventListener("click", async () => {
+    if (busy) return;
+    if (!fileInput.files?.length) { toast("Choose an XLSX or CSV first.", "warn"); return; }
+    previewResult = null;
+    setBusy(true);
+    previewArea.replaceChildren(h("p", { class: "form-hint" }, "Checking rows and existing SKUs…"));
+    try {
+      const r = await api.previewCatalogImport(fileInput.files[0], mode.value, allowZero.checked);
+      previewResult = r;
+      const stat = (value, name) => h("div", { class: "card", style: "padding:12px;flex:1;min-width:110px" },
+        h("div", { style: "font-size:22px;font-weight:750" }, String(value)),
+        h("div", { class: "form-hint" }, name));
+      const boxes = h("div", { style: "display:flex;flex-wrap:wrap;gap:8px;margin-bottom:10px" },
+        stat(r.total_rows, "Valid rows"), stat(r.new, "New products"),
+        stat(r.existing, "Matching SKUs"), stat(r.skipped, "Skipped"));
+      const warnings = h("div", { style: "font-size:13px;line-height:1.65;margin-bottom:10px" },
+        h("div", {}, `${r.missing_prices} new product(s) lack selling prices.`),
+        h("div", {}, `${r.missing_gst} new product(s) lack GST rates (0 is a database placeholder, NOT a verified zero GST rate).`),
+        h("div", {}, `${r.stock_to_add} units would be added to existing stock using this mode.`),
+        h("div", {}, "All imported attributes remain editable under Catalog → Edit product."));
+      const sampleRows = r.sample.map((x) => h("tr", {},
+        h("td", {}, String(x.row)), h("td", {}, x.sku), h("td", {}, x.name),
+        h("td", { class: "num" }, String(x.quantity)),
+        h("td", { class: "num" }, x.price === null ? "Missing" : fmt(x.price)),
+        h("td", {}, x.action)));
+      const sample = h("div", { class: "table-wrap", style: "max-height:230px;overflow:auto" },
+        h("table", { class: "table" },
+          h("thead", {}, h("tr", {}, ...["Row", "SKU", "Product", "Qty", "Price", "Action"]
+            .map((x) => h("th", {}, x)))), h("tbody", {}, ...sampleRows)));
+      previewArea.replaceChildren(boxes, warnings);
+      if (r.error_count) previewArea.append(h("div", {
+        style: "color:var(--danger);margin:8px 0;white-space:pre-wrap;font-size:12px",
+      }, `${r.error_count} error(s):\n${r.errors.join("\n")}`));
+      if (!r.can_import && !r.error_count) previewArea.append(h("p", {
+        style: "color:var(--danger);font-weight:650",
+      }, "New products without prices are blocked. Fill the spreadsheet or explicitly allow ₹0 draft products."));
+      previewArea.append(h("p", { class: "form-hint" }, "Sample rows (first 15):"), sample);
+    } catch (e) {
+      previewArea.replaceChildren();
+      toastError(e, "Import preview failed");
+    } finally { setBusy(false); }
+  });
+  applyBtn.addEventListener("click", async () => {
+    if (busy || !previewResult?.can_import) return;
+    if (mode.value !== "skip" || allowZero.checked) {
+      const caution = mode.value !== "skip"
+        ? "Existing SKUs will receive additional stock every time this import runs. Do NOT use this for an old stock snapshot unless the quantities are genuine additions."
+        : "Products missing selling prices will be created at ₹0 and flagged for review. You must set their prices before selling.";
+      if (!await confirmDialog({ title: "Confirm catalogue import", message: caution,
+                                  confirmLabel: "I understand, import" })) return;
+    }
+    setBusy(true);
+    try {
+      const r = await api.applyCatalogImport(fileInput.files[0], mode.value, allowZero.checked,
+        forceRepeat.checked, repeatReason.value.trim());
+      toast(`Imported ${r.created} new products; ${r.skipped} existing skipped; ${r.stock_added} units added to existing stock.`, "success", {duration:6500});
+      m.close();
+      await load(); rerenderAll();
+    } catch (e) { toastError(e, "Import failed"); }
+    finally { setBusy(false); }
+  });
+  m = openModal({
+    title: "Import stock (additive)", wide: true,
+    body: h("div", {},
+      h("p", { class: "form-hint", style: "margin-bottom:12px" },
+        "CSV UTF-8 or XLSX with an Import sheet. Nothing is deleted or locked; SKU matches control duplicates."),
+      h("a", { class: "btn sm", href: "/static/templates/pyPOS_Import_Template.xlsx", download: "pyPOS_Import_Template.xlsx",
+        style: "margin-bottom:14px" }, icon("i-sales"), "Download editable Excel template"),
+      h("div", { class: "field" }, h("label", {}, "Import file"), fileInput),
+      h("div", { class: "field" }, h("label", {}, "What to do if a SKU already exists"), mode),
+      h("label", { style: "display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-top:9px" },
+        allowZero, "Allow new products without a price at ₹0 (mark Price Review Required; review before selling)"),
+      h("label", { style: "display:flex;gap:8px;align-items:center;font-size:13px;margin-top:12px" },
+        forceRepeat, "Authorised repeat delivery (same file was already imported)"),
+      h("div", { class: "field" }, h("label", {}, "Reason for repeating the same stock file"), repeatReason),
+      h("p", { class: "form-hint", style: "margin-top:9px" },
+        "GST/HSN and costs are never inferred. Blank GST is flagged UNVERIFIED (0 is only a storage placeholder). Unverified GST prevents checkout until an operator confirms the rate. Source snapshots are not automatically added together."),
+      previewArea),
+    footer: [h("button", { class: "btn", onclick: () => m.close() }, "Cancel"),
+             previewBtn, applyBtn],
+  });
 }
 
 // ================= groups =================
@@ -92,7 +224,7 @@ function renderGroups() {
       tabindex: "0",
       style: `display:flex;align-items:center;justify-content:space-between;padding:8px 10px;border-radius:9px;cursor:pointer;
               ${filterGroup === value ? "background:var(--accent-soft);color:var(--accent);font-weight:650" : ""}`,
-      onclick: () => { filterGroup = value; renderGroups(); renderTable(); },
+      onclick: () => { filterGroup = value; catalogPage = 0; renderGroups(); renderTable(); },
     },
       h("span", { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap" }, label),
       h("span", { style: "color:var(--muted);font-size:12px;font-weight:600" }, String(count)));
@@ -178,12 +310,14 @@ function editGroupModal(g) {
 function renderTable() {
   let list = products;
   if (filterGroup !== null) list = list.filter((p) => p.group_id === filterGroup);
+  if (reviewOnly) list = list.filter(p => needsBillingReview(p.attributes || []));
   if (searchTerm) {
     const q = searchTerm.toLowerCase();
     list = list.filter((p) =>
       (p.SKU || "").toLowerCase().includes(q) ||
       (p.barcode || "").toLowerCase().includes(q) ||
-      (p.group_name || "").toLowerCase().includes(q));
+      (p.group_name || "").toLowerCase().includes(q) ||
+      (p.attributes || []).some((a) => `${a.name} ${a.value}`.toLowerCase().includes(q)));
   }
 
   tableWrapEl.innerHTML = "";
@@ -203,14 +337,19 @@ function renderTable() {
     return;
   }
 
-  const tbody = h("tbody", {}, list.map((p) =>
+  const totalPages = Math.ceil(list.length / CATALOG_PAGE_SIZE);
+  catalogPage = Math.max(0, Math.min(catalogPage, totalPages - 1));
+  const pageRows = list.slice(catalogPage * CATALOG_PAGE_SIZE,
+                              (catalogPage + 1) * CATALOG_PAGE_SIZE);
+  const tbody = h("tbody", {}, pageRows.map((p) =>
     h("tr", {},
       h("td", {},
         h("div", { class: "cell-main" }, p.group_name || "—"),
-        p.attributes && p.attributes.length
-          ? h("div", { class: "cell-sub" },
-              p.attributes.map((a) => `${a.name}: ${a.value}`).join(", "))
-          : null),
+        publicVariant(p.attributes || [])
+          ? h("div", { class: "cell-sub" }, publicVariant(p.attributes || [])) : null,
+        billingReviewLabel(p.attributes || [])
+          ? h("div", { class: "cell-sub", style: "color:var(--danger);font-weight:650" },
+              billingReviewLabel(p.attributes || [])) : null),
       h("td", {},
         h("div", { class: "cell-main" }, p.SKU),
         p.barcode ? h("div", { class: "cell-sub" }, p.barcode) : null,
@@ -235,6 +374,18 @@ function renderTable() {
         h("th", { class: "num" }, "Price"), h("th", { class: "num" }, "Cost"),
         h("th", { class: "num" }, "Tax %"), h("th", {}, "Stock"), h("th", {}))),
       tbody)));
+  if (totalPages > 1) {
+    const start = catalogPage * CATALOG_PAGE_SIZE + 1;
+    const end = Math.min(list.length, (catalogPage + 1) * CATALOG_PAGE_SIZE);
+    tableWrapEl.append(h("div", { style: "display:flex;justify-content:space-between;align-items:center;gap:10px;padding:12px 4px" },
+      h("span", { class: "form-hint" }, `Showing ${start}–${end} of ${list.length} matching products`),
+      h("div", { style: "display:flex;align-items:center;gap:7px" },
+        h("button", { class: "btn sm", disabled: catalogPage === 0,
+          onclick: () => { catalogPage--; renderTable(); } }, "Previous"),
+        h("span", { class: "form-hint" }, `${catalogPage + 1} / ${totalPages}`),
+        h("button", { class: "btn sm", disabled: catalogPage >= totalPages - 1,
+          onclick: () => { catalogPage++; renderTable(); } }, "Next"))));
+  }
 }
 
 async function deleteProduct(p) {
@@ -328,6 +479,10 @@ function productModal(existing = null) {
   const fTax = fieldInput("GST rate %", existing != null ? trimRate(existing.tax_rate) : "0",
     "number", "0.01");
   const fQty = fieldInput("Opening stock", "0", "number", "1");
+  const hasGstReview = !!existing?.attributes?.some(a => a.name === "GST Review Required");
+  const hasPriceReview = !!existing?.attributes?.some(a => a.name === "Price Review Required");
+  const verifyGst = h("input", { type: "checkbox" });
+  const verifyPrice = h("input", { type: "checkbox" });
 
   const attrRows = [];
   const attrWrap = h("div", { class: "attr-editor" });
@@ -360,7 +515,11 @@ function productModal(existing = null) {
       h("div", { class: "form-row" }, fSKU.wrap, fBarcode.wrap),
       h("div", { class: "form-row" }, fPrice.wrap, fCost.wrap, fTax.wrap),
       h("div", { class: "form-row" }, fHsn.wrap, fUnit.wrap),
-      h("p", { class: "form-hint" }, "Enter the correct applicable GST rate and HSN/SAC for the product. Rates are not inferred automatically."),
+      h("p", { class: "form-hint" }, "Enter the correct applicable GST rate and HSN/SAC for the product. A 0% GST rate must be explicitly verified when appropriate; no rates are inferred."),
+      hasGstReview ? h("label", { class: "form-hint", style: "display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--danger)" },
+        verifyGst, "I verified the GST rate above, including 0% if applicable (clear import review flag)") : null,
+      hasPriceReview ? h("label", { class: "form-hint", style: "display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--danger)" },
+        verifyPrice, "I verified the actual selling price above (clear import review flag)") : null,
       isEdit
         ? h("p", { class: "form-hint", style: "margin-bottom:13px" },
             `Stock (${existing.quantity}) is adjusted from the catalog table.`)
@@ -389,6 +548,8 @@ function productModal(existing = null) {
       hsn_code: fHsn.input.value.trim(),
       unit_code: fUnit.input.value.trim().toUpperCase() || "NOS",
       group_id: groupSel.value ? Number(groupSel.value) : null,
+      verified_gst: !!(hasGstReview && verifyGst.checked),
+      verified_price: !!(hasPriceReview && verifyPrice.checked),
     };
 
     // inline validation — mark fields in place instead of only toasting
@@ -425,6 +586,8 @@ function productModal(existing = null) {
         const n = nameIn.value.trim(), v = valIn.value.trim();
         if (n && v) desired[n] = v;
       }
+      if (verifyGst.checked) delete desired["GST Review Required"];
+      if (verifyPrice.checked) delete desired["Price Review Required"];
       const current = isEdit
         ? Object.fromEntries((existing.attributes || []).map((a) => [a.name, a.value]))
         : {};
@@ -432,7 +595,10 @@ function productModal(existing = null) {
         if (current[n] !== v) await api.setAttribute(pid, n, v);
       }
       for (const n of Object.keys(current)) {
-        if (!(n in desired)) await api.removeAttribute(pid, n);
+        if (!(n in desired) && !(n === "GST Review Required" && verifyGst.checked)
+            && !(n === "Price Review Required" && verifyPrice.checked)) {
+          await api.removeAttribute(pid, n);
+        }
       }
 
       toast(isEdit ? "Product updated." : "Product created.", "success");
