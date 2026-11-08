@@ -170,6 +170,12 @@ CREATE TABLE IF NOT EXISTS staff_users (
   active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+-- Capability flags for each operator. Legacy cashier/manager rows remain valid;
+-- their previous access is mapped to a safe preset until explicitly customized.
+CREATE TABLE IF NOT EXISTS staff_permissions (
+  staff_id INTEGER PRIMARY KEY REFERENCES staff_users(id) ON DELETE CASCADE,
+  permissions_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS staff_audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   staff_id INTEGER REFERENCES staff_users(id) ON DELETE SET NULL,
@@ -228,6 +234,8 @@ CREATE TABLE IF NOT EXISTS sales (
   parent_sale_id INTEGER REFERENCES sales(id) ON DELETE SET NULL,
   customer_id INTEGER REFERENCES customers(id) ON DELETE SET NULL,
   invoice_number TEXT UNIQUE,
+  -- Operational refund reference, distinct from sales invoice and GST credit note.
+  refund_number TEXT,
   salesperson TEXT NOT NULL DEFAULT '',
   invoice_snapshot TEXT,
   cash_session_id INTEGER REFERENCES cash_sessions(id) ON DELETE SET NULL,
@@ -306,6 +314,12 @@ CREATE TABLE IF NOT EXISTS invoice_sequences (
   last_number INTEGER NOT NULL CHECK (last_number >= 0)
 );
 
+-- Refund codes have their own fiscal-year sequence and never consume an invoice number.
+CREATE TABLE IF NOT EXISTS refund_sequences (
+  financial_year TEXT PRIMARY KEY,
+  last_number INTEGER NOT NULL CHECK (last_number >= 0)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -325,6 +339,7 @@ CREATE INDEX IF NOT EXISTS idx_sale_items_sale ON sale_items(sale_id);
 CREATE INDEX IF NOT EXISTS idx_sale_items_product ON sale_items(product_id);
 CREATE INDEX IF NOT EXISTS idx_payments_sale ON payments(sale_id);
 CREATE INDEX IF NOT EXISTS idx_quantity_history_product ON quantity_history(product_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sales_refund_number ON sales(refund_number);
 CREATE INDEX IF NOT EXISTS idx_sales_timestamp ON sales(timestamp);
 CREATE INDEX IF NOT EXISTS idx_sales_customer ON sales(customer_id);
 CREATE INDEX IF NOT EXISTS idx_sales_cash_session ON sales(cash_session_id);

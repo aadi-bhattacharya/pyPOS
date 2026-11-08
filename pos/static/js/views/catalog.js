@@ -1,4 +1,4 @@
-import { api, fmt, state } from "../api.js";
+import { api, can, fmt, state } from "../api.js";
 import { h, icon, openModal, toast, toastError, confirmDialog } from "../ui.js";
 import { publicVariant, needsBillingReview, billingReviewLabel } from "../productLabels.js";
 
@@ -34,7 +34,6 @@ export async function renderCatalog(main) {
     reviewOnly = !reviewOnly; catalogPage = 0; renderSub(); renderTable();
   } }, "Billing review");
 
-  const cashier = roleIsCashier();
   const grid = h("div", {
     style: "display:grid;grid-template-columns:minmax(200px,250px) 1fr;gap:16px;align-items:start",
   },
@@ -42,10 +41,10 @@ export async function renderCatalog(main) {
       h("div", { class: "card" },
         h("div", { class: "panel-head" }, h("h3", {}, "Groups")),
         h("div", { style: "padding:8px" },
-          h("button", {
+          can("add_products") ? h("button", {
             class: "btn sm block", style: "margin-bottom:8px",
             onclick: newGroupModal,
-          }, icon("i-plus"), "New group"),
+          }, icon("i-plus"), "New group") : null,
           groupsListEl))),
     h("div", {},
       h("div", { class: "search-wrap", style: "margin-bottom:12px;max-width:340px" },
@@ -59,18 +58,18 @@ export async function renderCatalog(main) {
         h("h2", {}, "Catalog"),
         h("div", { class: "sub", id: "cat-sub" })),
       h("div", { class: "view-actions" },
-        cashier ? null : h("a", {
+        !can("export_data") ? null : h("a", {
           class: "btn",
           href: "/api/export/inventory.csv",
           title: "Download inventory as CSV (opens in Excel/Sheets)",
         }, icon("i-sales"), "Export CSV"),
-        cashier && state.settings.cashier_allow_stock_import !== "true" ? null : h("button", {
+        !can("import_stock") ? null : h("button", {
           class: "btn", onclick: importCatalogModal,
         }, icon("i-plus"), "Import / Receive stock"),
-        h("button", {
+        can("add_products") ? h("button", {
           class: "btn primary",
           onclick: () => productModal(),
-        }, icon("i-plus"), "Add product"))),
+        }, icon("i-plus"), "Add product") : null)),
     grid,
   );
 
@@ -102,11 +101,11 @@ function renderSub() {
 }
 
 // ================= additive CSV/XLSX import =================
-function roleIsCashier() { return !["manager", "admin"].includes(state.staff?.operator?.role); }
+function roleIsCashier() { return !can("edit_products"); }
 
 function importCatalogModal() {
   const fileInput = h("input", { class: "input", type: "file", accept: ".xlsx,.csv" });
-  const cashier = (roleIsCashier());
+  const cashier = !can("import_merge");
   const mode = h("select", { class: "input" },
     h("option", { value: "skip" }, "Create new products, skip existing SKUs (safest)"),
     h("option", { value: "add_stock" }, "Create new products + receive stock into existing SKUs"),
@@ -362,15 +361,15 @@ function renderTable() {
         p.hsn_code ? h("div", { class: "cell-sub" }, `HSN/SAC ${p.hsn_code}`) : null),
       h("td", { class: "num" }, fmt(p.price)),
       h("td", { class: "num cell-sub" },
-        roleIsCashier() ? "—" : (Number(p.cost_price) > 0 ? fmt(p.cost_price) : "—")),
+        !can("view_cost") ? "—" : (Number(p.cost_price) > 0 ? fmt(p.cost_price) : "—")),
       h("td", { class: "num" }, trimRate(p.tax_rate) + "%"),
       h("td", {}, stockStepper(p)),
       h("td", { class: "actions-cell" },
-        h("button", { class: "btn ghost icon-only sm", title: "Adjust stock",
-          onclick: () => stockModal(p) }, icon("i-plus")),
+        (can("receive_stock") || can("reduce_stock")) ? h("button", { class: "btn ghost icon-only sm", title: "Update stock",
+          onclick: () => stockModal(p) }, icon("i-plus")) : null,
         roleIsCashier() ? null : h("button", { class: "btn ghost icon-only sm", title: "Edit",
           onclick: () => productModal(p) }, icon("i-edit")),
-        roleIsCashier() ? null : h("button", { class: "btn ghost icon-only sm", title: "Delete",
+        !can("delete_products") ? null : h("button", { class: "btn ghost icon-only sm", title: "Delete",
           onclick: () => deleteProduct(p) }, icon("i-trash"))))));
 
   tableWrapEl.append(h("div", { class: "table-wrap" },
@@ -415,8 +414,7 @@ async function deleteProduct(p) {
 // ================= stock modal =================
 
 function stockModal(p) {
-  const cashier = roleIsCashier();
-  const canReduce = !cashier || state.settings.cashier_allow_stock_reduction === "true";
+  const canReduce = can("reduce_stock");
   const operation = h("select", { class: "input", onchange: updatePreview },
     h("option", { value: "RECEIPT" }, "Receive goods (add stock)"),
     canReduce ? h("option", { value: "ADJUSTMENT" }, "Documented damage / shortage correction") : null);
@@ -493,7 +491,7 @@ function productModal(existing = null) {
   const fBarcode = fieldInput("Barcode", existing?.barcode || "");
   const fPrice = fieldInput("Price *", existing != null ? String(existing.price) : "",
     "number", "0.01");
-  const fCost = roleIsCashier() && !isEdit ? null : fieldInput("Cost",
+  const fCost = !(can("view_cost") && (isEdit || can("edit_products"))) ? null : fieldInput("Cost",
     existing?.cost_price ? String(existing.cost_price) : "", "number", "0.01");
   const fHsn = fieldInput("HSN / SAC (optional)", existing?.hsn_code || "");
   const fUnit = fieldInput("Quantity unit (UQC, e.g. NOS / PCS)", existing?.unit_code || "NOS");
@@ -674,8 +672,9 @@ function stockStepper(p) {
     h("span", { class: "stock-badge" +
       (p.quantity <= 0 ? " out" : p.quantity <= threshold ? " low" : "") },
       String(p.quantity)),
-    h("button", { class: "spin-btn", title: "Record a stock receipt / correction",
-      onclick: () => stockModal(p) }, icon("i-plus")));
+    can("receive_stock") || can("reduce_stock") ? h("button", {
+      class: "spin-btn", title: "Record a stock receipt / correction",
+      onclick: () => stockModal(p) }, icon("i-plus")) : null);
 }
 
 function trimRate(rate) {

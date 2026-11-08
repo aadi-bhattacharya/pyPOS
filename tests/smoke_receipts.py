@@ -52,6 +52,7 @@ with sync_playwright() as pw:
     assert '₹1,424.05' in rendered
     assert 'unverified GST rate' in rendered
     refund = dict(receipt, status='REFUNDED', id=4, parent_sale_id=3,
+                  refund_number='26-27/R000001-000003',
                   parent_invoice_number='26-27/000003', tax_review_warning=False,
                   payments=[{'method':'CASH','amount':1424.05}], loyalty_points_earned=0,
                   loyalty_points_reversed=14)
@@ -62,6 +63,7 @@ with sync_playwright() as pw:
     rendered = page.locator('.receipt').inner_text()
     assert 'TOTAL REFUNDED' in rendered
     assert '26-27/000003' in rendered
+    assert 'Refund: 26-27/R000001-000003' in rendered
     assert 'Refund via Cash' in rendered
     assert 'Loyalty points reversed' in rendered
     assert not errors, errors

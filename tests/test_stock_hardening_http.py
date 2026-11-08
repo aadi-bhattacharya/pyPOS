@@ -69,7 +69,7 @@ class CashierShrinkageHTTPTests(unittest.TestCase):
         try:
             self.assertEqual(db.execute("SELECT quantity FROM products WHERE id=1").fetchone()[0], 7)
             movement = db.execute("SELECT reason FROM stock_movements WHERE product_id=1 ORDER BY id DESC LIMIT 1").fetchone()
-            self.assertIn("operator=counter1 role=cashier", movement[0])
+            self.assertIn("operator=counter1 role=staff", movement[0])
         finally:
             db.close()
         self.client.get("/staff-logout")
@@ -120,11 +120,15 @@ class CashierShrinkageHTTPTests(unittest.TestCase):
         self.assertEqual(self.client.patch(f"/api/products/{new_id}",json={"price":1}).status_code,403)
         self.assertEqual(self.client.post(f"/api/products/{new_id}/attributes",json={"name":"Size","value":"XL"}).status_code,403)
         self.assertEqual(self.client.delete(f"/api/products/{new_id}").status_code,403)
-        self.assertEqual(self.client.post("/api/products",json={
-            "group_id":1,"SKU":"FAKE-MRP","barcode":"8901112223334","price":1,
-            "quantity":3,"tax_rate":0}).status_code,400)
+        # A cashier cannot create a cheap shadow-SKU sharing an existing
+        # barcode. An identity collision is HTTP 409 Conflict (not 400).
+        collision = self.client.post("/api/products", json={
+            "group_id": 1, "SKU": "FAKE-MRP", "barcode": "8901112223334",
+            "price": 1, "quantity": 3, "tax_rate": 0})
+        self.assertEqual(collision.status_code, 409, collision.get_data(as_text=True))
         db=connect(self.dbpath)
         try:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM products WHERE SKU='FAKE-MRP'").fetchone()[0], 0)
             row=db.execute("SELECT kind,reason FROM stock_movements WHERE product_id=?",(new_id,)).fetchone()
             self.assertIn("operator=counter1",row["reason"])
             self.assertEqual(row["kind"],"INITIAL_STOCK")

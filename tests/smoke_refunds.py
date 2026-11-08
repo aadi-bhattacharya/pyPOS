@@ -56,7 +56,8 @@ def main():
             const method = options.method || 'GET';
             const body = options.body ? JSON.parse(options.body) : {};
             let data;
-            if (u.startsWith('/api/settings')) data = {
+            if (u === '/api/staff/status') data = {enabled:true,operator:{id:1,role:'admin',permissions:{}}};
+            else if (u.startsWith('/api/settings')) data = {
               store_name:'Cotton Curves', currency:'₹', receipt_paper:'80mm',
               price_tax_mode:'exclusive', show_receipt_logo:'false'};
             else if (u.startsWith('/api/sales?')) {
@@ -75,7 +76,7 @@ def main():
                 refund_store_credit: body.to_credit ? qty*105 : 0};
             } else if (u === '/api/sales/83/refund' && method === 'POST') {
               window.__submitted.push(body);
-              refund = {...sale, id:84, invoice_number:null, status:'REFUNDED',
+              refund = {...sale, id:84, invoice_number:null, refund_number:'26-27/R000001-000083', status:'REFUNDED',
                  parent_sale_id:83, parent_invoice_number:sale.invoice_number,
                  total:105, subtotal:100, tax_total:5,
                  items:[{...sale.items[0], quantity:1, line_total:100}],
@@ -123,6 +124,7 @@ def main():
         page.get_by_text('Confirm return', exact=False).wait_for()
         page.locator('.modal-overlay').last.get_by_role('button', name='Record refund').click()
         page.get_by_text('TOTAL REFUNDED').wait_for()
+        page.get_by_text('Refund: 26-27/R000001-000083').wait_for()
         submitted = page.evaluate('window.__submitted')
         assert len(submitted) == 1
         assert submitted[0]['request_id'] and submitted[0]['lines'] == [{'product_id':7,'quantity':1}]

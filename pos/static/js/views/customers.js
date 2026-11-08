@@ -1,4 +1,4 @@
-import { api, fmt, fmtDate, state } from "../api.js";
+import { api, can, fmt, fmtDate, state } from "../api.js";
 import { h, icon, openModal, closeModalAll, toast, toastError, confirmDialog } from "../ui.js";
 
 let customers = [];
@@ -64,11 +64,10 @@ export async function renderCustomers(main) {
         h("h2", {}, "Customers"),
         h("div", { class: "sub", id: "cust-sub" })),
       h("div", { class: "view-actions" },
-        h("a", { class: "btn", href: "/api/export/loyalty.csv",
-          title: "Download the loyalty adjustment, earning and redemption audit ledger (admin login required)" },
-          "Loyalty CSV"),
-        h("button", { class: "btn primary", onclick: () => customerModal() },
-          icon("i-plus"), "New customer"))),
+        can("export_data") ? h("a", { class: "btn", href: "/api/export/loyalty.csv",
+          title: "Download loyalty events as CSV" }, "Loyalty CSV") : null,
+        can("manage_customers") ? h("button", { class: "btn primary", onclick: () => customerModal() },
+          icon("i-plus"), "New customer") : null)),
     customerStatsEl,
     h("div", { class: "customer-toolbar" },
       h("div", { class: "search-wrap" }, icon("i-search"), searchInput),
@@ -187,35 +186,38 @@ function rowHtml(c) {
         : h("span", { style: "color:var(--muted)" }, fmt(0))),
     h("td", { class: "num cell-main mono" },
       h("button", { class: "customer-points-btn",
-        title: `Edit ${c.name}'s loyalty points (admin)`,
+        title: `View / manage ${c.name}'s loyalty points`,
         onclick: () => loyaltyModal(c) },
         `${Number(c.loyalty_points || 0).toLocaleString("en-IN")} pts`)),
     h("td", { class: "num" }, String(c.orders)),
     h("td", { class: "num" }, fmt(c.total_spent)),
     h("td", { class: "actions-cell" },
-      h("button", {
-        class: "btn ghost sm", title: "Manage loyalty points (admin)",
+      can("manage_loyalty") ? h("button", {
+        class: "btn ghost sm", title: "Manage loyalty points",
         onclick: () => loyaltyModal(c),
-      }, "Points"),
-      h("button", {
+      }, "Points") : null,
+      can("manage_credit") ? h("button", {
         class: "btn ghost icon-only sm", title: "Adjust credit",
         onclick: () => creditModal(c),
-      }, icon("i-cash")),
-      h("button", {
+      }, icon("i-cash")) : null,
+      can("manage_customers") ? h("button", {
         class: "btn ghost icon-only sm", title: "Edit",
         onclick: () => customerModal(c),
-      }, icon("i-edit")),
-      h("button", {
+      }, icon("i-edit")) : null,
+      can("delete_customers") ? h("button", {
         class: "btn ghost icon-only sm", title: "Delete",
         onclick: () => deleteFlow(c),
-      }, icon("i-trash"))));
+      }, icon("i-trash")) : null));
 }
 
 // ================= modals =================
 
 async function loyaltyModal(c) {
-  let auth;
-  try { auth = await api.settingsAuth(); } catch (e) { return toastError(e); }
+  let auth = { configured: true, authenticated: true };
+  if (state.staff?.operator?.role === "admin") {
+    try { auth = await api.settingsAuth(); } catch (e) { return toastError(e); }
+  }
+  if (!can("manage_loyalty")) return toast("Your account cannot manage loyalty points.", "warn");
   if (!auth.configured) {
     return toast("Set an admin password in Settings before managing loyalty points.", "warn");
   }

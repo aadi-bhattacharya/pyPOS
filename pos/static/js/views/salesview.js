@@ -192,7 +192,7 @@ function rowHtml(r) {
   return h("tr", {},
     h("td", {},
       h("button", { class: "sales-invoice-button", onclick: () => detailModal(r.id) },
-        r.invoice_number || `#${String(r.id).padStart(5, "0")}`),
+        r.refund_number || r.invoice_number || `#${String(r.id).padStart(5, "0")}`),
       r.parent_sale_id ? h("div", { class: "cell-sub" }, `Return against sale #${r.parent_sale_id}`) : null,
       r.customer_name ? h("div", { class: "cell-sub" }, r.customer_name) : null),
     h("td", {}, fmtDate(r.timestamp)),
@@ -236,7 +236,8 @@ export async function detailModal(id) {
     : null;
 
   openModal({
-    title: sale.invoice_number ? `Invoice ${sale.invoice_number}` : `Sale #${String(sale.id).padStart(5, "0")}`,
+    title: sale.refund_number ? `Refund ${sale.refund_number}` :
+      sale.invoice_number ? `Invoice ${sale.invoice_number}` : `Sale #${String(sale.id).padStart(5, "0")}`,
     narrow: true,
     body: h("div", {},
       receiptEl,
@@ -432,7 +433,7 @@ export async function refundDialog(saleId, done) {
       const refund = await api.refundSale(saleId, {
         lines, to_credit, reason, request_id: pendingKey,
       });
-      toast(`Refund #${refund.id} · ${fmt(refund.total)} recorded.`, "success",
+      toast(`Refund ${refund.refund_number || `#${refund.id}`} · ${fmt(refund.total)} recorded.`, "success",
         { title: "Return recorded" });
       closeModalAll();
       if (done) await done(refund);

@@ -66,7 +66,11 @@ def main() -> int:
         #    chmod +x pypos.pyz work directly on unix.
         (staging / "__main__.py").write_text(
             "#!/usr/bin/env python3\n"
-            "import sys\n"
+            "import os, sys\n"
+            "from pathlib import Path\n"
+            "portable_data = Path(sys.argv[0]).resolve().parent / 'pypos-data'\n"
+            "if portable_data.is_dir():\n"
+            "    os.environ.setdefault('PYPOS_HOME', str(portable_data))\n"
             "from pos.cli import main\n"
             "sys.exit(main())\n",
             encoding="utf-8")
@@ -86,36 +90,29 @@ def main() -> int:
         size_mb = target.stat().st_size / (1024 * 1024)
         print(f"Built {target} ({size_mb:.1f} MB)")
 
-        # 5. Windows double-click launcher for people without a Python file
-        #    association for .pyz. Prefers the `py` launcher, then `python`.
-        bat = out_dir / "Start pyPOS.bat"
-        bat.write_text(
-            "@echo off\r\n"
-            "title pyPOS\r\n"
-            "setlocal\r\n"
-            "cd /d \"%~dp0\"\r\n"
-            "set ARG=\"" + target.name + "\"\r\n"
-            "where py >nul 2>nul\r\n"
-            "if not errorlevel 1 (\r\n"
-            "  py -3 %ARG% %*\r\n"
-            "  if errorlevel 1 goto :missing\r\n"
-            ") else (\r\n"
-            "  where python >nul 2>nul\r\n"
-            "  if errorlevel 1 goto :missing\r\n"
-            "  python %ARG% %*\r\n"
-            "  if errorlevel 1 goto :missing\r\n"
-            ")\r\n"
-            "goto :eof\r\n"
-            ":missing\r\n"
-            "echo.\r\n"
-            "echo  pyPOS needs Python 3.10+, but none was found on this PC.\r\n"
-            "echo  Install it from https://www.python.org/downloads/  then\r\n"
-            "echo  double-click this file again.\r\n"
-            "echo.\r\n"
-            "pause\r\n",
-            encoding="utf-8")
-        print(f"Also wrote {bat} — double-click it on Windows to start pyPOS.")
-        print("Store data appears in ./pypos-data (or set PYPOS_HOME).")
+        # 5. GUI-mode Windows launcher: WScript + pyw/pythonw, no cmd.exe.
+        #    Zipapps bundle dependencies, so no pip/venv install is necessary.
+        vbs = out_dir / "Start pyPOS.vbs"
+        vbs.write_text(
+            "Option Explicit\n"
+            "Dim shell, fso, folder, cmd, rc\n"
+            "Set shell = CreateObject(\"WScript.Shell\")\n"
+            "Set fso = CreateObject(\"Scripting.FileSystemObject\")\n"
+            "folder = fso.GetParentFolderName(WScript.ScriptFullName)\n"
+            + ('cmd = "pyw -3 """ & folder & "\\' + target.name + '"""\n')
+            + "On Error Resume Next\n"
+            + "rc = shell.Run(cmd, 0, False)\n"
+            + "If Err.Number <> 0 Then\n"
+            + "  Err.Clear\n"
+            + ('  cmd = "pythonw """ & folder & "\\' + target.name + '"""\n')
+            + "  rc = shell.Run(cmd, 0, False)\n"
+            + "  If Err.Number <> 0 Then\n"
+            + "    MsgBox \"Python 3.10+ was not found. Install Python and try again.\", 16, \"pyPOS\"\n"
+            + "  End If\n"
+            + "End If\n", encoding="utf-8")
+        print(f"Also wrote {vbs} — double-click to run without a command prompt.")
+        print("Portable data: create a pypos-data folder beside the .pyz. "
+              "Otherwise the standard OS data location is used.")
         return 0
     finally:
         shutil.rmtree(staging, ignore_errors=True)

@@ -1,7 +1,6 @@
 """Isolated Chromium layout checks; no network, Flask or live database required."""
 from pathlib import Path
 import re
-from playwright.sync_api import sync_playwright
 
 ROOT=Path(__file__).resolve().parents[1]
 INDEX=(ROOT/'pos/templates/index.html').read_text()
@@ -36,16 +35,16 @@ RUN_JS=r'''async ({view, source, withProducts}) => {
     listProducts:async()=>products, listGroups:async()=>withProducts?[{id:1,name:'Test apparel'}]:[],
     listCategories:async()=>[],listParked:async()=>[],
   };
-  const state={settings:{currency:'₹',price_tax_mode:'inclusive',tax_label:'GST',low_stock_threshold:2}};
+  const state={settings:{currency:'₹',price_tax_mode:'inclusive',tax_label:'GST',low_stock_threshold:2},staff:{operator:{role:'staff',display_name:'Test operator'}}};
   const computeTotals=()=>({subtotal:0, discount:0, tax:0, total:0});
   const noop=()=>{};
   const renderCashStatusStrip=async target=>target.replaceChildren(h('div',{},'Day closed · No active cash session'));
   source=source.replace(/^import .*;\s*$/gm,'').replace(/\bexport (async function|function) /g,'$1 ');
   const argNames=['api','fmt','fmtDate','h','icon','openModal','toast','toastError',
     'confirmDialog','printReceipt','buildReceipt','methodLabel','publicVariant','publicAttributes',
-    'renderCashStatusStrip','tenderPreview','state','computeTotals'];
+    'renderCashStatusStrip','tenderPreview','state','computeTotals','can'];
   const values=[api,fmt,fmtDate,h,icon,noop,noop,noop,noop,noop,noop,noop,noop,()=>[],renderCashStatusStrip,
-    noop,state,computeTotals];
+    noop,state,computeTotals,()=>true];
   const exportName=view==='register'?'renderRegister':view==='purchasing'?'renderPurchasing':'renderStocktake';
   const fn=new Function(...argNames,source+';return '+exportName)(...values);
   await fn(document.getElementById('main'));
@@ -54,6 +53,10 @@ RUN_JS=r'''async ({view, source, withProducts}) => {
 
 
 def run():
+    # Import only when running this standalone visual smoke test. The
+    # regular unittest discovery and native release builds do not need
+    # Playwright or a downloaded browser.
+    from playwright.sync_api import sync_playwright
     with sync_playwright() as pw:
         browser=pw.chromium.launch(executable_path='/usr/bin/chromium',headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
         for width in (1440, 760, 430):

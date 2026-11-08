@@ -66,6 +66,11 @@ async function importUpload(endpoint, file, mode, allowZeroPrices, forceRepeat =
   return body;
 }
 
+export function can(permission) {
+  const user = state.staff?.operator;
+  return Boolean(user && (user.role === "admin" || user.permissions?.[permission] === true));
+}
+
 export const api = {
   // UPI reference is local POS-generated, not a verified bank UTR.
   upiReference: () => request("/upi/reference"),
@@ -76,6 +81,9 @@ export const api = {
   createStaff: (payload) => request("/staff/users", { method: "POST", body: payload }),
   setStaffActive: (id, active) => request(`/staff/users/${id}`, { method: "PATCH", body: { active } }),
   staffAudit: () => request("/staff/audit"),
+  staffPermissionSchema: () => request("/staff/permissions"),
+  setStaffPermissions: (id, permissions) =>
+    request(`/staff/users/${id}/permissions`, { method: "PUT", body: { permissions } }),
 
   // settings
   getSettings: () => request("/settings"),

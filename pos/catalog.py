@@ -205,7 +205,7 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
     try:
         if conn.execute("SELECT 1 FROM products WHERE SKU = ? COLLATE NOCASE", (str(SKU).strip(),)).fetchone():
             raise DuplicateSKUError(f"SKU '{SKU}' already exists (case-insensitive match)")
-        if audit_actor and audit_actor.get("role") == "cashier" and _barcode_owners(conn, str(barcode).strip() if barcode else None):
+        if audit_actor and audit_actor.get("role") in ("cashier", "staff") and not audit_actor.get("permissions", {}).get("edit_products") and _barcode_owners(conn, str(barcode).strip() if barcode else None):
             raise DuplicateBarcodeError("EAN already exists; a manager must approve an additional MRP edition")
         canonical, secondary = _safe_barcode_for_new_product(conn, barcode, group_id, price)
         cur.execute(sql, (
@@ -219,7 +219,7 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
         if secondary:
             conn.execute("INSERT INTO barcode_price_options(product_id, barcode) VALUES(?,?)",
                          (pid, secondary))
-        if audit_actor and audit_actor.get("role") == "cashier":
+        if audit_actor and audit_actor.get("role") in ("cashier", "staff") and not audit_actor.get("permissions", {}).get("edit_products"):
             username = str(audit_actor.get("username") or "unknown")[:60]
             validated_attrs["Manager Review Required"] = f"New SKU created by operator={username}; verify MRP, tax and identity"
             validated_attrs["Cost Review Required"] = "Purchase cost not entered; manager review required"

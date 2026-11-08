@@ -1,4 +1,4 @@
-import { api, fmt, state, computeTotals } from "../api.js";
+import { api, can, fmt, state, computeTotals } from "../api.js";
 import { h, icon, openModal, toast, toastError, printReceipt } from "../ui.js";
 import { buildReceipt, methodLabel } from "../receipt.js";
 import { publicVariant, publicAttributes } from "../productLabels.js";
@@ -498,7 +498,7 @@ function cartTotals() {
 function renderCart() {
   // A saved or recalled manager cart may contain an old discount.  Do not
   // keep a hidden discount active when a cashier takes over the register.
-  if (state.staff?.operator?.role === "cashier" &&
+  if (!can("discount_override") &&
       Number(state.settings.cashier_max_discount_percent || 0) === 0 && discountValue !== 0) {
     discountValue = 0;
     saveCart();
@@ -579,7 +579,7 @@ function renderCart() {
 
   const sumRows = [
     h("div", { class: "sum-row discount-edit" }, customerBox),
-    state.staff?.operator?.role === "cashier"
+    state.staff?.operator?.role !== "admin"
       ? h("div", { class: "reg-salesperson-field" },
           h("label", {}, "Salesperson"),
           h("div", { class: "form-hint" },
@@ -594,7 +594,7 @@ function renderCart() {
               saveCart();
             },
           })),
-    (state.staff?.operator?.role === "cashier" && Number(state.settings.cashier_max_discount_percent || 0) === 0)
+    (!can("discount_override") && Number(state.settings.cashier_max_discount_percent || 0) === 0)
       ? h("div", { class: "sum-row discount-edit" },
           h("span", {}, "Discount"), h("span", { class: "form-hint" }, "Manager approval required"))
       : h("div", { class: "sum-row discount-edit" },

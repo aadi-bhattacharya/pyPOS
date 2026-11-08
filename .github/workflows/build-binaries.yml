@@ -1,10 +1,5 @@
-# Builds native single-file pyPOS binaries for Windows, macOS and Linux.
-#
-# PyInstaller cannot cross-compile: each OS builds its own binary, so this
-# workflow runs the same steps on three runners. Trigger it from the Actions
-# tab (Run workflow) or by pushing a tag like v1.0.1. Binaries appear under
-# the run's Artifacts.
-
+# Tag a stable release (v1.2.3) to produce self-installing, versioned artifacts.
+# Checksums are uploaded next to each archive; only tagged releases enable updates.
 name: build-binaries
 
 on:
@@ -12,72 +7,81 @@ on:
   push:
     tags: ["v*"]
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            artifact: pypos-linux
-          - os: windows-latest
-            artifact: pypos-windows
-          - os: macos-latest
-            artifact: pypos-macos
+          - os: ubuntu-24.04
+            label: linux-x86_64
+          - os: windows-2022
+            label: windows-x86_64
+          - os: macos-15-intel
+            label: macos-x86_64
+          - os: macos-15
+            label: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install build deps
-        run: pip install "Flask>=3.0" "waitress>=3.0" "qrcode>=7.4" pyinstaller
-
-      # UPX compresses the frozen binary; PyInstaller no-ops safely if it's
-      # absent, but installing it shrinks Linux/Windows builds noticeably.
-      # Skipped on macOS: UPX-compressed Mach-O binaries can trip codesign
-      # and Gatekeeper on Apple Silicon.
-      - name: Install UPX (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y upx-ucl
-
-      - name: Install UPX (Windows)
-        if: matrix.os == 'windows-latest'
-        run: choco install upx -y
-
-      - name: Build single-file binary
-        run: pyinstaller --noconfirm --clean pypos.spec
-
-      - name: Rename artifact (windows adds .exe automatically)
+      - name: Install build and test dependencies
+        run: python -m pip install -r requirements.txt "Flask>=3.0" "waitress>=3.0" "qrcode>=7.4" pyinstaller
+      - name: Stamp trusted release identity and version
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REPOSITORY: ${{ github.repository }}
         run: |
-          cd dist
-          for f in pypos pypos.exe; do
-            [ -f "$f" ] && mv "$f" "${{ matrix.artifact }}${f##pypos}"
-          done
-          ls -lh
-
+          python - <<'PY'
+          import os, pathlib, re
+          root = pathlib.Path('pos')
+          tag = os.environ['TAG']
+          if os.environ['REF_TYPE'] == 'tag':
+              if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag):
+                  raise SystemExit('Release tags must use vMAJOR.MINOR.PATCH')
+              (root / '__init__.py').write_text('__version__ = ' + repr(tag[1:]) + '\n')
+              (root / 'release_build.py').write_text(
+                  'REPOSITORY = ' + repr(os.environ['REPOSITORY']) + '\nENABLED = True\n')
+          PY
+      - name: Run regression tests before packaging
+        run: python -m unittest discover -s tests
+      - name: Validate frontend modules
+        run: node tests/check_frontend_modules.mjs
+      - name: Build native app and graphical launcher
+        run: |
+          pyinstaller --noconfirm --clean pypos.spec
+          pyinstaller --noconfirm --clean launcher.spec
+      - name: Package with platform-specific names and checksums
+        run: python package_native.py
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: dist/pypos-*
+          name: pypos-${{ matrix.label }}
+          path: |
+            dist/pypos-${{ matrix.label }}.zip
+            dist/pypos-${{ matrix.label }}.zip.sha256
           if-no-files-found: error
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
-
-      - name: Create/update release with binaries attached
+      - name: Publish release assets
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*/pypos-*
+          files: |
+            artifacts/*/*.zip
+            artifacts/*/*.sha256
           generate_release_notes: true

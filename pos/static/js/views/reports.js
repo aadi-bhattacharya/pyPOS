@@ -1,4 +1,4 @@
-import { api, fmt, fmtDate, state } from "../api.js";
+import { api, can, fmt, fmtDate, state } from "../api.js";
 import { h, icon, openModal, closeModalAll, toast, toastError, printReceipt } from "../ui.js";
 import { methodLabel } from "../receipt.js";
 import { buildZReceipt } from "../zreport.js";
@@ -72,9 +72,9 @@ export async function renderReports(main) {
       h("div", { class: "view-title" }, h("h2", {}, "Reports"),
         h("div", { class: "sub" }, `Business performance · ${periodLabel}`)),
       h("div", { class: "view-actions" },
-        state.staff?.operator?.role === "cashier" ? null : h("a", { class: "btn", href: `/api/export/sales.csv?${qs}`,
+        !can("export_data") ? null : h("a", { class: "btn", href: `/api/export/sales.csv?${qs}`,
           title: "Sales and refund records for the selected date range" }, icon("i-sales"), "Sales CSV"),
-        state.staff?.operator?.role === "cashier" ? null : h("a", { class: "btn", href: `/api/export/sale-lines.csv?${qs}`,
+        !can("export_data") ? null : h("a", { class: "btn", href: `/api/export/sale-lines.csv?${qs}`,
           title: "Invoice item and HSN/SAC detail for the selected range" }, "GST line CSV"),
         h("button", { class: "btn ghost icon-only", title: "Refresh figures", onclick: refresh }, icon("i-refresh")))),
     h("div", { class: "report-toolbar" }, dayList,
@@ -140,7 +140,8 @@ export async function renderCashDrawerPage(main) {
   main.replaceChildren(h("div", { class: "skeleton" }));
   let session, history;
   try {
-    [session, history] = await Promise.all([api.currentSession(), api.listSessions()]);
+    session = await api.currentSession();
+    history = can("view_reports") ? await api.listSessions() : [];
   } catch (e) {
     main.replaceChildren(h("div", { class: "empty-state" },
       h("h3", {}, "Cash drawer unavailable"),
@@ -166,7 +167,7 @@ export async function renderCashDrawerPage(main) {
       statCard("Cash refunded", report ? fmt(report.cash_out) : "—",
         "Cash returned during the open session")),
     endOfDayCard(session, history, refresh),
-    session ? cashMovementPanel(session.report, refresh) : null,
+    session && can("cash_movements") ? cashMovementPanel(session.report, refresh) : null,
     h("p", { class: "report-note" },
       "Cash in hand is the system's EXPECTED drawer balance, not a physical cash count. " +
       "Count the actual cash when ending the day. Transactions can still be " +
@@ -190,11 +191,10 @@ export async function renderCashStatusStrip(target) {
   if (!target.isConnected) return;
   const refresh = () => renderCashStatusStrip(target);
   if (!session) {
-    const cashier = state.staff?.operator?.role === "cashier";
-    if (cashier) {
-      target.replaceChildren(h("span", {class:"reg-cash-note"},
-        "Day closed · Ask a manager to Start Day"),
-        h("a",{class:"btn sm",href:"#/cash"},"Cash Drawer"));
+    if (!can("open_day")) {
+      target.replaceChildren(h("span", { class: "reg-cash-note" },
+        "Day closed · Your account cannot start the day"),
+        h("a", { class: "btn sm", href: "#/cash" }, "Cash Drawer"));
       return;
     }
     target.replaceChildren(
@@ -208,7 +208,6 @@ export async function renderCashStatusStrip(target) {
     return;
   }
   const report = session.report;
-  const cashier = state.staff?.operator?.role === "cashier";
   target.replaceChildren(
     h("div", { class: "reg-cash-ident" },
       h("span", { class: "pill ok" }, "Day open"),
@@ -221,7 +220,7 @@ export async function renderCashStatusStrip(target) {
         try { showZModal((await api.currentSession()).report); }
         catch (e) { toastError(e); }
       } }, icon("i-eye"), "X Report"),
-      cashier ? null : h("button", { class: "btn sm primary", onclick: () => closeDayModal(session, refresh) },
+      !can("close_day") ? null : h("button", { class: "btn sm primary", onclick: () => closeDayModal(session, refresh) },
         icon("i-check"), "End Day"),
       h("a", { href: "#/cash", class: "btn sm" }, "Details")));
 }
@@ -387,10 +386,10 @@ function endOfDayCard(session, sessions, refresh) {
             },
             title: "Live read-out — does not close the day",
           }, icon("i-eye"), "X read-out"),
-          h("button", {
+          can("close_day") ? h("button", {
             class: "btn sm primary",
             onclick: () => closeDayModal(session, refresh),
-          }, icon("i-check"), "End day (Z report)")))
+          }, icon("i-check"), "End day (Z report)") : null))
     : h("div", { class: "eod-body" },
         h("div", { class: "eod-hint" },
           icon("i-clock"),
@@ -399,10 +398,10 @@ function endOfDayCard(session, sessions, refresh) {
             " open with your drawer float. ",
             h("strong", {}, "End of day:"),
             " count the cash and file the printable Z report.")),
-        h("button", {
+        can("open_day") ? h("button", {
           class: "btn sm primary",
           onclick: () => openDayModal(refresh),
-        }, icon("i-play"), "Open day"));
+        }, icon("i-play"), "Open day") : null);
 
   const historyEl = history.length
     ? h("table", { class: "table" },

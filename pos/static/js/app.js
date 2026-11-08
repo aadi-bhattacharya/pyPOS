@@ -1,4 +1,4 @@
-import { api, refreshSettings, state } from "./api.js";
+import { api, can, refreshSettings, state } from "./api.js";
 import { applyBranding } from "./branding.js";
 import { h, icon, openModal, toastError } from "./ui.js";
 import { renderRegister } from "./views/register.js";
@@ -28,6 +28,22 @@ const routes = {
   settings: renderSettingsView,
 };
 
+// Navigation is cosmetic. Every sensitive API is separately authorised.
+const routePermissions = {
+  register: "checkout", stocktake: "stocktakes", purchasing: "manage_purchases",
+  refunds: "refund_sales", reports: "view_reports", settings: "owner",
+};
+function allowedRoute(view) {
+  const permission = routePermissions[view];
+  return !permission || (permission === "owner" ? state.staff?.operator?.role === "admin" : can(permission));
+}
+function syncNavigation() {
+  document.querySelectorAll("#nav a").forEach(link => {
+    link.hidden = !allowedRoute(link.dataset.view) ||
+      (link.dataset.view === "staff" && state.settings?.show_staff_menu === "false");
+  });
+}
+
 let currentView = null;
 
 export function navigate(view) {
@@ -40,7 +56,8 @@ export function navigate(view) {
 
 async function router() {
   const name = (location.hash.replace(/^#\//, "") || "register").split("?")[0];
-  const view = routes[name] ? name : "register";
+  const desired = routes[name] ? name : "register";
+  const view = allowedRoute(desired) ? desired : "catalog";
   const main = document.getElementById("main");
 
   document.querySelectorAll("#nav a").forEach((a) => {
@@ -144,5 +161,6 @@ async function apiStaffBoot() {
   }
   await refreshSettings();
   applyBranding(state.settings);
+  syncNavigation();
   await router();
 })();

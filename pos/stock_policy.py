@@ -31,10 +31,10 @@ def authorize_adjustment(delta, reason, requested_kind, actor, *, cashier_can_re
     Keep the operator identity in the movement reason without a schema change.
     """
     delta = parse_delta(delta)
-    if not actor or actor.get("role") not in ("cashier", "manager", "admin"):
+    if not actor or actor.get("role") not in ("staff", "cashier", "manager", "admin"):
         raise InventoryForbidden("A signed-in operator is required")
-    if actor["role"] == "cashier" and delta < 0 and not cashier_can_reduce:
-        raise InventoryForbidden("Cashiers cannot reduce stock; request a manager correction")
+    if actor["role"] in ("cashier", "staff") and delta < 0 and not cashier_can_reduce:
+        raise InventoryForbidden("Stock reductions require an explicit permission")
     if requested_kind not in (None, "RECEIPT", "ADJUSTMENT"):
         raise InvalidInputError("Invalid manual stock movement type")
     if requested_kind == "RECEIPT" and delta < 0:

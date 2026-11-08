@@ -5,7 +5,7 @@ import unittest
 
 from pos.app import create_app
 from pos.db import connect, init_db
-from pos import settings as settings_mod
+from pos import settings as settings_mod, staff
 
 
 class SecurityIsolationTests(unittest.TestCase):
@@ -14,13 +14,26 @@ class SecurityIsolationTests(unittest.TestCase):
         cls.tmpdir = tempfile.mkdtemp(prefix="posec-")
         cls.db_path = os.path.join(cls.tmpdir, "security-test.db")
         init_db(cls.db_path)
+        db = connect(cls.db_path)
+        try:
+            staff.add_user(db, "owner1", "Owner", "admin", "12345678")
+        finally:
+            db.close()
         cls.app = create_app(cls.db_path)
         cls.app.config["TESTING"] = True
-        cls.client = cls.app.test_client()
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
+
+    def setUp(self):
+        self.client = self.app.test_client()
+        self._login("127.0.0.1")
+
+    def _login(self, host):
+        r = self.client.post("/staff-login", headers={"Host": host},
+            data={"username": "owner1", "pin": "12345678"})
+        self.assertEqual(r.status_code, 302, r.get_data(as_text=True))
 
     def get(self, path, host="127.0.0.1", **kw):
         return self.client.get(path, headers={"Host": host}, **kw)
@@ -34,6 +47,8 @@ class SecurityIsolationTests(unittest.TestCase):
     # ---------- Host allow-list (DNS rebinding shield) ----------
     def test_loopback_hosts_allowed(self):
         for host in ("127.0.0.1:8420", "localhost:8420", "127.0.0.1"):
+            # Authentication is scoped to the host serving the application.
+            self._login(host)
             resp = self.get("/api/settings", host=host)
             self.assertEqual(resp.status_code, 200, f"host {host} rejected")
 
@@ -48,7 +63,8 @@ class SecurityIsolationTests(unittest.TestCase):
 
     # ---------- Origin checks on mutating requests ----------
     def test_post_without_origin_allowed(self):
-        # curl / scripts / local tooling send no Origin — must keep working.
+        # Missing Origin is not a substitute for a staff session, which was
+        # established in setUp. Authenticated same-host tooling stays usable.
         resp = self.post("/api/groups", json={"name": "curl-made"})
         self.assertEqual(resp.status_code, 201)
 
@@ -84,7 +100,7 @@ class SecurityIsolationTests(unittest.TestCase):
         resp = self.client.get(
             "/api/settings",
             headers={"Host": "127.0.0.1", "Origin": "http://evil.example"})
-        self.assertEqual(resp.status_code, 200)  # reads are same-data-local anyway
+        self.assertEqual(resp.status_code, 200)  # Authenticated reads are not CSRF mutations.
 
     # ---------- security headers ----------
     def test_security_headers_present(self):
@@ -116,23 +132,38 @@ if __name__ == "__main__":
 
 
 class LanModeTests(unittest.TestCase):
-    """--lan must actually serve LAN clients: any Host/Origin is accepted
-    when the operator opts in, while the default stays loopback-only."""
+    """LAN mode permits remote Host headers, not foreign browser origins.
+
+    Staff authentication and same-origin checks remain required on LAN.
+    """
 
     @classmethod
     def setUpClass(cls):
         cls.tmpdir = tempfile.mkdtemp(prefix="poslan-")
         cls.db_path = os.path.join(cls.tmpdir, "lan-test.db")
         init_db(cls.db_path)
+        db = connect(cls.db_path)
+        try:
+            staff.add_user(db, "owner1", "Owner", "admin", "12345678")
+        finally:
+            db.close()
         cls.app = create_app(cls.db_path, extra_hosts=("*",))
         cls.app.config["TESTING"] = True
-        cls.client = cls.app.test_client()
+
+    def setUp(self):
+        self.client = self.app.test_client()
+
+    def _login(self, host):
+        r = self.client.post("/staff-login", headers={"Host": host},
+            data={"username": "owner1", "pin": "12345678"})
+        self.assertEqual(r.status_code, 302, r.get_data(as_text=True))
 
     @classmethod
     def tearDownClass(cls):
         shutil.rmtree(cls.tmpdir, ignore_errors=True)
 
     def test_lan_host_and_origin_allowed(self):
+        self._login("192.168.1.50:8420")
         r = self.client.get("/", headers={"Host": "192.168.1.50:8420"})
         self.assertEqual(r.status_code, 200)
         r = self.client.post("/api/backups",
@@ -141,8 +172,24 @@ class LanModeTests(unittest.TestCase):
         self.assertIn(r.status_code, (200, 201))
 
     def test_loopback_still_allowed(self):
+        self._login("127.0.0.1:8420")
         r = self.client.get("/", headers={"Host": "127.0.0.1:8420"})
         self.assertEqual(r.status_code, 200)
+
+    def test_lan_does_not_disable_cross_origin_protection(self):
+        self._login("192.168.1.50:8420")
+        resp = self.client.post("/api/groups", json={"name": "Evil LAN"},
+            headers={"Host": "192.168.1.50:8420",
+                     "Origin": "https://attacker.example"})
+        self.assertEqual(resp.status_code, 403)
+        listing = self.client.get("/api/groups", headers={"Host": "192.168.1.50:8420"})
+        self.assertEqual(listing.status_code, 200)
+        self.assertNotIn(b"Evil LAN", listing.data)
+
+    def test_lan_requires_staff_login(self):
+        r = self.client.get("/api/settings", headers={"Host": "192.168.1.50:8420"})
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(r.json["code"], "staff_login_required")
 
 
 class NullOriginTests(unittest.TestCase):

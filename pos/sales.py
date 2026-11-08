@@ -2,7 +2,7 @@ import json
 import hashlib
 import re
 from decimal import Decimal, ROUND_HALF_UP
-from .india import next_invoice_number
+from .india import next_invoice_number, next_refund_number
 from datetime import datetime, timezone
 from .india import IST
 
@@ -761,6 +761,7 @@ def get_sale_detail(conn, sale_id):
     return {
         "id": sale["id"],
         "invoice_number": sale.get("invoice_number"),
+        "refund_number": sale.get("refund_number"),
         "invoice": json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else None,
         "timestamp": sale["timestamp"],
         "status": sale["status"],
@@ -810,14 +811,15 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0,
         where.append("(" + " OR ".join([
             "CAST(s.id AS TEXT) LIKE ?",
             "COALESCE(s.invoice_number, '') LIKE ?",
+            "COALESCE(s.refund_number, '') LIKE ?",
             "COALESCE(c.name, '') LIKE ?",
             "COALESCE(c.phone, '') LIKE ?",
             "COALESCE(pm.methods, '') LIKE ?",
             "COALESCE(s.salesperson, '') LIKE ?",
         ]) + ")")
-        params.extend([pattern] * 6)
+        params.extend([pattern] * 7)
     sql = '''
-        SELECT s.id, s.invoice_number, s.timestamp, s.subtotal, s.tax_total, s.discount_total,
+        SELECT s.id, s.invoice_number, s.refund_number, s.timestamp, s.subtotal, s.tax_total, s.discount_total,
                s.total, s.status, s.parent_sale_id, s.customer_id, s.salesperson,
                c.name AS customer_name,
                COALESCE(i.item_count, 0) AS item_count,
@@ -943,6 +945,7 @@ def refund_export_rows(conn):
     Returns operational refund data, not GST statutory credit-note records.
     """
     rows = conn.execute('''SELECT r.id, r.timestamp, r.parent_sale_id, p.invoice_number,
+        r.refund_number,
         r.customer_id, r.subtotal, r.discount_total, r.tax_total, r.total,
         r.invoice_snapshot,
         COALESCE((SELECT SUM(amount) FROM payments
@@ -963,7 +966,8 @@ def refund_export_rows(conn):
                          invoice.get("refund_reason", ""),
                          row["subtotal"], row["discount_total"], row["tax_total"],
                          row["total"], row["cash"], row["card"], row["upi"],
-                         round(row["credit_cents"] / 100, 2)))
+                         round(row["credit_cents"] / 100, 2),
+                         row["refund_number"] or ""))
     return exported
 
 
@@ -1165,13 +1169,19 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
         refund_invoice["tax_breakup"] = _tax_breakup(
             conn, refund_tax_lines,
             refund_invoice.get("tax_configuration") or settings_mod.get_settings(conn))
+        # Capture one UTC instant for both the recorded timestamp and the
+        # Indian fiscal-year reference (important across 31 March midnight).
+        recorded_at = datetime.now(timezone.utc)
+        refund_number = next_refund_number(conn, sale_id, when=recorded_at)
         cur.execute(
             ''' INSERT INTO sales(subtotal, tax_total, discount_total, total,
-                                  status, parent_sale_id, customer_id, invoice_snapshot, cash_session_id, cash_session_explicit)
-                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?, ?, 1) ''',
+                                  status, parent_sale_id, customer_id, invoice_snapshot,
+                                  refund_number, timestamp, cash_session_id, cash_session_explicit)
+                VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?, ?, ?, ?, 1) ''',
             (gross_c / 100, tax_c / 100, disc_c / 100, refund_total_cents / 100,
              sale_id, sale["customer_id"],
              json.dumps(refund_invoice, ensure_ascii=False) if refund_invoice else None,
+             refund_number, recorded_at.strftime("%Y-%m-%d %H:%M:%S"),
              (conn.execute("SELECT id FROM cash_sessions WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
               .fetchone() or [None])[0]),
         )

@@ -92,7 +92,20 @@ class TillHTTPTests(unittest.TestCase):
         db = connect(self.path)
         try:
             self.assertEqual(db.execute('SELECT quantity FROM products WHERE id=1').fetchone()[0], 7)
+            # A global legacy setting must NOT silently grant a sensitive
+            # permission to every staff member.
             settings.save_settings(db, {'cashier_allow_stock_reduction': 'true'})
+        finally:
+            db.close()
+        self.assertEqual(self.client.post(url, json={'delta': -1, 'reason': 'approved correction'}).status_code, 403)
+        db = connect(self.path)
+        try:
+            operator = db.execute("SELECT id FROM staff_users WHERE username='cashier1'").fetchone()
+            if operator is None:
+                operator = db.execute("SELECT id FROM staff_users WHERE role='cashier' LIMIT 1").fetchone()
+            user = staff.get_user(db, operator[0])
+            grant = dict(user['permissions'], reduce_stock=True)
+            staff.set_permissions(db, operator[0], grant)
         finally:
             db.close()
         self.assertEqual(self.client.post(url, json={'delta': -1, 'reason': 'approved correction'}).status_code, 200)

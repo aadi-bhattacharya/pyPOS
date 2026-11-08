@@ -32,6 +32,6 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     name="pypos",
-    console=True,
+    console=False,
     upx=False,
 )

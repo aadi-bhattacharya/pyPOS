@@ -171,7 +171,7 @@ def migrate(conn):
                        "description_at_sale": "TEXT NOT NULL DEFAULT ''",
                        "sku_at_sale": "TEXT NOT NULL DEFAULT ''"},
         "payments": {"reference": "TEXT NOT NULL DEFAULT ''", "upi_utr": "TEXT NOT NULL DEFAULT ''"},
-        "sales": {"invoice_number": "TEXT", "invoice_snapshot": "TEXT",
+        "sales": {"invoice_number": "TEXT", "refund_number": "TEXT", "invoice_snapshot": "TEXT",
                   "cash_session_id": "INTEGER REFERENCES cash_sessions(id) ON DELETE SET NULL",
                   "cash_session_explicit": "INTEGER NOT NULL DEFAULT 0",
                   "salesperson": "TEXT NOT NULL DEFAULT ''"},

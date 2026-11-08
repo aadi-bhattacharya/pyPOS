@@ -56,9 +56,11 @@ export function buildReceipt(receipt, { store = null } = {}) {
     s.store_fssai ? h("div", { class: "r-center r-muted-line" }, `FSSAI: ${esc(s.store_fssai)}`) : null,
     h("div", { class: "r-center r-heading" }, receiptHeading),
     h("hr"),
-    h("div", { class: "r-invoice-id" }, receipt.invoice_number && !isRefund
-      ? `Invoice: ${receipt.invoice_number}`
-      : `Receipt: #${String(receipt.id).padStart(5, "0")}`),
+    h("div", { class: "r-invoice-id" }, isRefund
+      ? `Refund: ${receipt.refund_number || `#${String(receipt.id).padStart(5, "0")}`}`
+      : receipt.invoice_number
+        ? `Invoice: ${receipt.invoice_number}`
+        : `Receipt: #${String(receipt.id).padStart(5, "0")}`),
     h("div", { class: "r-datetime" }, fmtTs(receipt.timestamp)),
     receipt.parent_sale_id
       ? h("div", { class: "r-row" }, h("span", {}, "For sale"),

@@ -72,3 +72,24 @@ def next_invoice_number(conn, when=None):
     if n > 9999999999:
         raise ValueError("Invoice serial limit reached for this financial year")
     return f"{year}/{n:06d}"
+
+
+def next_refund_number(conn, original_sale_id, when=None):
+    """Issue a unique operational refund reference under BEGIN IMMEDIATE.
+
+    Format: FY/R<6+ digit per-FY sequence>-<6+ digit original sale ID>.
+    Example: 26-27/R000001-000123. Unlike a GST credit note, this is only
+    an internal refund receipt identifier. No original invoice is renumbered.
+    Both sequence increment and refund insertion must commit atomically.
+    """
+    sale_id = int(original_sale_id)
+    if sale_id <= 0:
+        raise ValueError("Original transaction ID must be positive")
+    year = financial_year(when)
+    conn.execute("""INSERT INTO refund_sequences(financial_year, last_number)
+                    VALUES (?, 0) ON CONFLICT(financial_year) DO NOTHING""", (year,))
+    conn.execute("UPDATE refund_sequences SET last_number=last_number+1 WHERE financial_year=?", (year,))
+    serial = conn.execute(
+        "SELECT last_number FROM refund_sequences WHERE financial_year=?", (year,)
+    ).fetchone()[0]
+    return f"{year}/R{serial:06d}-{sale_id:06d}"

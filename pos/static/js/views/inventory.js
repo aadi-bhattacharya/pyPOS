@@ -1,4 +1,4 @@
-import { api, fmt, state } from "../api.js";
+import { api, can, fmt, state } from "../api.js";
 import { h, icon, openModal, toast, toastError, confirmDialog } from "../ui.js";
 import { publicVariant, billingReviewLabel } from "../productLabels.js";
 import { printProductLabels } from "../labels.js";
@@ -31,18 +31,18 @@ export async function renderInventory(main) {
     filter = e.target.value; page = 0; paint();
   } },
     ...[["all", "All SKUs"], ["low", "At/below reorder point"], ["out", "Out of stock"],
-      ...(state.staff?.operator?.role === "cashier" ? [] : [["uncosted", "Missing purchase cost"]])]
+      ...(!can("view_cost") ? [] : [["uncosted", "Missing purchase cost"]])]
       .map(([value, name]) => h("option", { value }, name)));
   main.append(totalsEl,
     h("div", { class: "inventory-toolbar" },
       h("div", { class: "search-wrap" }, icon("i-search"), search),
       select,
       h("button", { class: "btn", onclick: showMovements }, "Stock history"),
-      state.staff?.operator?.role === "cashier" ? null :
+      !can("stocktakes") ? null :
         h("a", { class: "btn", href: "#/stocktake" }, "Physical count"),
-      state.staff?.operator?.role === "cashier" ? null :
+      !can("manage_purchases") ? null :
         h("a", { class: "btn", href: "#/purchasing" }, "Supplier receipts"),
-      state.staff?.operator?.role === "cashier" ? null :
+      !can("export_data") ? null :
         h("a", { class: "btn", href: "/api/export/inventory.csv" }, "Export CSV"),
       h("a", { class: "btn", href: "#/catalog" }, "Edit catalogue / Import")),
     h("p", { class: "form-hint inventory-intro" },
@@ -107,12 +107,12 @@ function paint() {
           ? `${threshold(p)} (default)` : `${p.reorder_point}`),
         h("td", { class: "num" }, fmt(p.price)),
         h("td", {}, h("div", { class: "inventory-actions" },
-          h("button", { class: "btn sm", onclick: () => stockModal(p) },
-            state.staff?.operator?.role === "cashier" && state.settings.cashier_allow_stock_reduction !== "true"
-              ? "Receive stock" : "Receive / Correct"),
-          state.staff?.operator?.role === "cashier" ? null :
+          (can("receive_stock") || can("reduce_stock")) ? h("button", {
+            class: "btn sm", onclick: () => stockModal(p) },
+            can("reduce_stock") ? "Receive / Correct" : "Receive stock") : null,
+          !can("edit_products") ? null :
             h("button", { class: "btn sm", onclick: () => reorderModal(p) }, "Reorder"),
-          p.group_id && state.staff?.operator?.role !== "cashier" ?
+          p.group_id && can("edit_products") ?
             h("button", { class: "btn sm", onclick: () => classifyModal(p) }, "Classify") : null,
           h("button", { class: "btn ghost sm", onclick: () => showMovements(p) }, "History"),
           h("button", { class: "btn ghost sm", onclick: () => labelModal(p) }, "Label"))));
@@ -134,8 +134,7 @@ async function refresh() {
 }
 
 function stockModal(p) {
-  const cashier = state.staff?.operator?.role === "cashier";
-  const canReduce = !cashier || state.settings.cashier_allow_stock_reduction === "true";
+  const canReduce = can("reduce_stock");
   const type = h("select", { class: "input" },
     h("option", { value: "RECEIPT" }, "Receive delivery"),
     canReduce ? h("option", { value: "ADJUSTMENT" }, "Record documented shortage / damage") : null);

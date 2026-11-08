@@ -78,7 +78,7 @@ _SETUP_INTRO = """
   <span class="auth-intro-tag">FIRST-TIME SETUP</span>
   <h2>Make this register yours.</h2>
   <p>Create the first administrator account on this computer. You can add
-     cashier accounts and set their permissions later.</p>
+     staff accounts and configure their individual permissions later.</p>
   <ol class="auth-steps">
     <li><span class="auth-step-num">1</span><div><strong>Create your account</strong>
         <span>Choose a name, username and secure login details</span></div></li>
@@ -187,7 +187,7 @@ def _staff_setup_form(existing_password=False, username="", display_name=""):
             <button class="auth-reveal" type="button" data-reveal="setup-pin"
               aria-controls="setup-pin" aria-pressed="false" aria-label="Show register PIN">Show</button>
           </div>
-          <p class="auth-field-help">Use this PIN when opening the register each shift. Do not share it with cashiers.</p>
+          <p class="auth-field-help">Your personal sign-in PIN. You do not need to open the till every day; authorised staff can open and close it using their own PINs.</p>
         </div>
         <div class="field">
           <label for="setup-admin-password">{password_label}</label>
@@ -200,8 +200,8 @@ def _staff_setup_form(existing_password=False, username="", display_name=""):
           <p class="auth-field-help">{password_help}</p>
         </div>
       </section>
-      <button class="btn primary block auth-submit" type="submit">Create administrator &amp; open register</button>
-      <p class="auth-footnote">This is the first administrator account. Add individual cashier accounts in Settings afterward.</p>
+      <button class="btn primary block auth-submit" type="submit">Create owner account &amp; continue</button>
+      <p class="auth-footnote">This is the first administrator account. Add staff accounts and choose their permissions in Staff &amp; permissions. Staff can start and close the till without the owner.</p>
     </form>"""
 
 
@@ -325,54 +325,82 @@ def create_app(db_path=None, extra_hosts=()):
             return None
         if not g.staff_actor:
             return jsonify({"error":"Staff sign-in required", "code":"staff_login_required"}),401
-        path = request.path
-        # Staff identities are separate from the legacy Settings password.
-        # A manager with Settings authentication must still not gain access to
-        # the operator database or private backup downloads.
-        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
-            if g.staff_actor["role"] == "cashier" and (
-                    path.startswith(("/api/backups", "/api/staff/", "/api/export/"))):
-                return jsonify({"error":"Manager access required", "code":"staff_forbidden"}),403
-            if path.startswith(("/api/backups", "/api/staff/")) and g.staff_actor["role"] != "admin":
-                return jsonify({"error":"Administrator access required", "code":"staff_forbidden"}),403
+        # All owner/security endpoints stay owner-only. A staff capability
+        # toggle cannot grant Settings auth, backups, staff editing or demo reset.
+        endpoint = request.endpoint or ""
+        owner_only = (endpoint.startswith(("api_staff_", "api_backup_", "api_backups_", "api_gdrive_"))
+                      or endpoint in ("api_settings_put", "api_settings_password", "api_demo"))
+        if owner_only and g.staff_actor["role"] != "admin":
+            return jsonify({"error": "Owner/administrator access required",
+                            "code": "staff_forbidden"}), 403
+
+        # Read gates protect financial exports and reports even when someone
+        # calls the HTTP API directly instead of clicking a hidden control.
+        if request.method in ("GET", "HEAD"):
+            read_permission = None
+            if endpoint.startswith("api_export_"):
+                read_permission = "export_data"
+            elif endpoint == "api_reports":
+                read_permission = "view_reports"
+            elif endpoint in ("api_sessions_list", "api_session_report"):
+                read_permission = "view_reports"
+            elif endpoint in ("api_purchase_detail", "api_purchases", "api_suppliers"):
+                read_permission = "manage_purchases"
+            elif endpoint in ("api_stocktakes", "api_stocktake_detail"):
+                read_permission = "stocktakes"
+            if read_permission and not staff.can(g.staff_actor, read_permission):
+                return jsonify({"error": "Permission required: " + read_permission,
+                                "code": "staff_forbidden"}), 403
             return None
-        admin = (path.startswith("/api/staff/") or path == "/api/staff" or
-                 path.startswith("/api/backups") or path.startswith("/api/demo-data") or
-                 path.startswith("/api/settings"))
-        manager = (path.startswith(("/api/products", "/api/groups", "/api/brands",
-                    "/api/categories", "/api/catalog/import", "/api/suppliers",
-                    "/api/purchases", "/api/stocktakes", "/api/cash-sessions")) or
-                   (path.startswith("/api/sales/") and
-                    (path.endswith("/refund") or path.endswith("/refund/preview") or path.endswith("/void"))) or
-                   (path.startswith("/api/customers/") and
-                    any(x in path for x in ("/credit", "/loyalty/"))))
-        role=g.staff_actor["role"]
-        if role == "cashier":
-            flags = settings_mod.get_all_settings(get_db())
-            if path.startswith("/api/products/") and path.endswith("/stock") and request.method == "POST":
-                # Full sign/range/reason validation also occurs in api_stock.
-                manager = False
-            # Creating new catalogue records is normal counter work. Mutating an
-            # existing record (price, barcode, variant, deletion) remains restricted.
-            if request.method == "POST" and path in ("/api/products", "/api/groups"):
-                manager = False
-            if path.startswith("/api/catalog/import/"):
-                if flags.get("cashier_allow_stock_import") != "true":
-                    return jsonify({"error":"Sales staff stock importing is disabled by the administrator"}), 403
+
+        if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            return None
+        # Each mutating endpoint is mapped explicitly; any newly added API
+        # starts denied for non-admins until it is reviewed and mapped.
+        grants = {
+            "api_groups_create": "add_products", "api_brands_create": "add_products",
+            "api_categories_create": "add_products", "api_products_create": "add_products",
+            "api_groups_update": "edit_products", "api_group_classification": "edit_products",
+            "api_products_update": "edit_products", "api_attr_set": "edit_products",
+            "api_attr_del": "edit_products",
+            "api_groups_delete": "delete_products", "api_products_delete": "delete_products",
+            "api_supplier_create": "manage_purchases", "api_purchases_receive": "manage_purchases",
+            "api_supplier_payment": "manage_purchases", "api_stocktake_start": "stocktakes",
+            "api_stocktake_count": "stocktakes", "api_stocktake_post": "stocktakes",
+            "api_checkout": "checkout", "api_parked_create": "checkout",
+            "api_parked_delete": "checkout", "api_sale_refund_preview": "refund_sales",
+            "api_sale_refund": "refund_sales", "api_sale_void": "void_sales",
+            "api_customers_create": "manage_customers", "api_customer_update": "manage_customers",
+            "api_customer_delete": "delete_customers", "api_customer_credit": "manage_credit",
+            "api_loyalty_adjust": "manage_loyalty", "api_loyalty_redeem": "manage_loyalty",
+            "api_session_open": "open_day", "api_session_close": "close_day",
+            "api_cash_movement": "cash_movements",
+            "api_catalog_import_preview": "import_stock",
+            "api_catalog_import_apply": "import_stock",
+        }
+        if endpoint == "api_stock":
+            # Safe integer parsing and reason validation are also enforced in
+            # api_stock. Reject malformed deltas there, never default to +.
+            raw = (request.get_json(silent=True) or {}).get("delta")
+            try:
+                delta = stock_policy.parse_delta(raw)
+            except catalog.InvalidInputError:
+                delta = None  # api_stock will respond HTTP 400
+            required = "reduce_stock" if delta is not None and delta < 0 else "receive_stock"
+        else:
+            required = grants.get(endpoint)
+        if not (required and staff.can(g.staff_actor, required)) and g.staff_actor["role"] != "admin":
+            return jsonify({"error": "Permission required: " + (required or "owner-only operation"),
+                            "code": "staff_forbidden"}), 403
+        if endpoint in ("api_catalog_import_preview", "api_catalog_import_apply"):
+            if not staff.can(g.staff_actor, "import_merge"):
                 try:
                     stock_policy.cashier_import_mode(
                         request.form.get("mode", "skip"),
                         request.form.get("allow_zero_prices", "false").lower() == "true",
                         request.form.get("force_repeat", "false").lower() == "true")
                 except stock_policy.InventoryForbidden as exc:
-                    return jsonify({"error":str(exc), "code":"staff_forbidden"}),403
-                manager = False
-            if path == "/api/customers" and request.method == "DELETE":
-                manager = True
-            if path.startswith("/api/customers/") and request.method == "DELETE":
-                manager = True
-        if (admin and role != "admin") or (manager and role == "cashier"):
-            return jsonify({"error":"Manager or administrator access required", "code":"staff_forbidden"}),403
+                    return jsonify({"error": str(exc), "code": "staff_forbidden"}), 403
         return None
 
     @app.after_request
@@ -477,23 +505,50 @@ def create_app(db_path=None, extra_hosts=()):
             return jsonify({"error":"Administrator access required"}),403
         return jsonify(staff.list_users(get_db()))
 
+    def _require_owner_settings_unlock():
+        # Permission changes are a second-factor owner operation, not merely
+        # something anyone with an unlocked register may perform.
+        if not getattr(g, "staff_actor", None) or g.staff_actor["role"] != "admin":
+            return jsonify({"error": "Owner account required", "code": "staff_forbidden"}), 403
+        if auth.is_configured(_admin_password()) and not auth.is_authenticated():
+            return jsonify({"error": "Unlock administrator Settings before changing staff access",
+                            "code": "settings_auth_required"}), 401
+        return None
+
     @app.post("/api/staff/users")
     def api_staff_create():
         conn=get_db()
         if staff.configured(conn):
-            if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
-                return jsonify({"error":"Administrator access required"}),403
+            denied = _require_owner_settings_unlock()
+            if denied is not None:
+                return denied
         elif not auth.is_configured(_admin_password()) or not auth.is_authenticated():
             return jsonify({"error":"Set an admin password and sign in to Settings before enabling staff PINs"}),403
         data=body()
         return jsonify(staff.add_user(conn,data.get("username"),data.get("display_name"),
-            data.get("role"),data.get("pin"))),201
+            data.get("role"),data.get("pin"),data.get("permissions"))),201
 
     @app.patch("/api/staff/users/<int:uid>")
     def api_staff_toggle(uid):
-        if not getattr(g,"staff_actor",None) or g.staff_actor["role"]!="admin":
-            return jsonify({"error":"Administrator access required"}),403
+        denied = _require_owner_settings_unlock()
+        if denied is not None:
+            return denied
         return jsonify(staff.set_active(get_db(),uid,body().get("active")))
+
+    @app.get("/api/staff/permissions")
+    def api_staff_permissions_schema():
+        if not getattr(g, "staff_actor", None) or g.staff_actor["role"] != "admin":
+            return jsonify({"error": "Owner access required"}), 403
+        return jsonify({"groups": staff.PERMISSION_GROUPS,
+                        "defaults": {key: key in staff.DEFAULT_STAFF for key in staff.PERMISSIONS},
+                        "supervisor": {key: key in staff.DEFAULT_SUPERVISOR for key in staff.PERMISSIONS}})
+
+    @app.put("/api/staff/users/<int:uid>/permissions")
+    def api_staff_permissions_update(uid):
+        denied = _require_owner_settings_unlock()
+        if denied is not None:
+            return denied
+        return jsonify(staff.set_permissions(get_db(), uid, body().get("permissions")))
 
     @app.get("/api/staff/audit")
     def api_staff_audit():
@@ -708,7 +763,7 @@ def create_app(db_path=None, extra_hosts=()):
             get_db(), query=q, group_id=group_id,
             low_stock_threshold=threshold, limit=limit, offset=offset,
         )
-        if g.staff_actor["role"] == "cashier":
+        if not staff.can(g.staff_actor, "view_cost"):
             for row in rows:
                 row["cost_price"] = None
         return jsonify(rows)
@@ -721,7 +776,7 @@ def create_app(db_path=None, extra_hosts=()):
         row = catalog.find_by_code(get_db(), code)
         if row is None:
             return fail(404, f"No product with SKU/barcode '{code}'")
-        if g.staff_actor["role"] == "cashier":
+        if not staff.can(g.staff_actor, "view_cost"):
             if "matches" in row:
                 for match in row["matches"]:
                     match["cost_price"] = None
@@ -734,14 +789,14 @@ def create_app(db_path=None, extra_hosts=()):
         row = catalog.get_product(get_db(), pid)
         if row is None:
             return fail(404, f"No product with id {pid}")
-        if g.staff_actor["role"] == "cashier":
+        if not staff.can(g.staff_actor, "view_cost"):
             row["cost_price"] = None
         return jsonify(row)
 
     @app.post("/api/products")
     def api_products_create():
         data = body()
-        cashier = g.staff_actor["role"] == "cashier"
+        cashier = not staff.can(g.staff_actor, "edit_products")
         if cashier:
             try:
                 stock_policy.cashier_new_product(data)
@@ -755,7 +810,7 @@ def create_app(db_path=None, extra_hosts=()):
             price=data.get("price"),
             quantity=data.get("quantity", 0),
             # Cashiers may enter selling prices, not inventory costs.
-            cost_price=0 if cashier else data.get("cost_price"),
+            cost_price=0 if (cashier or not staff.can(g.staff_actor, "view_cost")) else data.get("cost_price"),
             tax_rate=data.get("tax_rate", 0),
             hsn_code=data.get("hsn_code", ""),
             unit_code=data.get("unit_code", "NOS"),
@@ -768,7 +823,7 @@ def create_app(db_path=None, extra_hosts=()):
         staff.audit(conn, g.staff_actor, "CREATE", f"/api/products/{pid}", 201)
         conn.commit()
         created = catalog.get_product(conn, pid)
-        if cashier:
+        if not staff.can(g.staff_actor, "view_cost"):
             created["cost_price"] = None
         return jsonify(created), 201
 
@@ -778,6 +833,8 @@ def create_app(db_path=None, extra_hosts=()):
         for key in ("SKU", "barcode", "price", "cost_price", "tax_rate", "group_id", "hsn_code", "unit_code", "reorder_point"):
             if key in body():
                 fields[key] = body()[key]
+        if "cost_price" in fields and not staff.can(g.staff_actor, "view_cost"):
+            return jsonify({"error": "Viewing and editing costs requires permission", "code": "staff_forbidden"}), 403
         catalog.update_product(get_db(), pid, **fields,
                                verified_gst=body().get("verified_gst") is True,
                                verified_price=body().get("verified_price") is True)
@@ -803,7 +860,7 @@ def create_app(db_path=None, extra_hosts=()):
     def api_stock(pid):
         data = body()
         actor = g.staff_actor
-        allow_reduction = settings_mod.get_all_settings(get_db()).get("cashier_allow_stock_reduction") == "true"
+        allow_reduction = staff.can(actor, "reduce_stock")
         try:
             delta, reason, kind = stock_policy.authorize_adjustment(
                 data.get("delta"), data.get("reason", ""), data.get("kind", "ADJUSTMENT"),
@@ -818,7 +875,7 @@ def create_app(db_path=None, extra_hosts=()):
     def api_inventory_overview():
         threshold = settings_mod.get_settings(get_db()).get("low_stock_threshold") or "0"
         summary = catalog.stock_overview(get_db(), int(float(threshold)))
-        if g.staff_actor["role"] == "cashier":
+        if not staff.can(g.staff_actor, "view_cost"):
             summary.pop("missing_cost", None)
         return jsonify(summary)
 
@@ -848,7 +905,7 @@ def create_app(db_path=None, extra_hosts=()):
         if error is not None:
             return error
         return jsonify(catalog_import.preview(get_db(), items, issues, mode, allow_zero,
-            cashier_safe=g.staff_actor["role"] == "cashier"))
+            cashier_safe=not staff.can(g.staff_actor, "import_merge")))
 
     @app.post("/api/catalog/import/apply")
     def api_catalog_import_apply():
@@ -858,7 +915,7 @@ def create_app(db_path=None, extra_hosts=()):
         summary = catalog_import.apply(get_db(), items, issues, mode, allow_zero,
             force_repeat=request.form.get("force_repeat") == "true",
             repeat_reason=request.form.get("repeat_reason", ""),
-            cashier_safe=g.staff_actor["role"] == "cashier",
+            cashier_safe=not staff.can(g.staff_actor, "import_merge"),
             audit_actor=g.staff_actor)
         return jsonify(summary)
 
@@ -946,7 +1003,7 @@ def create_app(db_path=None, extra_hosts=()):
             return denied
         data = body()
         discount = data.get("discount") or {}
-        cashier = g.staff_actor["role"] == "cashier"
+        discount_restricted = not staff.can(g.staff_actor, "discount_override")
         receipt = sales.checkout(
             get_db(),
             items=data.get("items"),
@@ -958,9 +1015,10 @@ def create_app(db_path=None, extra_hosts=()):
             supply_type=data.get("supply_type", "intra"),
             place_of_supply=data.get("place_of_supply", ""),
             request_id=data.get("request_id"),
-            salesperson=(g.staff_actor["display_name"] if cashier else data.get("salesperson")),
+            salesperson=(data.get("salesperson") if g.staff_actor["role"] == "admin" else
+                         g.staff_actor["display_name"]),
             require_open_session=True,
-            max_discount_percent=(settings_mod.get_settings(get_db())["cashier_max_discount_percent"] if cashier else None),
+            max_discount_percent=(settings_mod.get_settings(get_db())["cashier_max_discount_percent"] if discount_restricted else None),
         )
         return jsonify(receipt), 201
 
@@ -1229,6 +1287,10 @@ def create_app(db_path=None, extra_hosts=()):
     # All loyalty balance edits and conversions require a configured admin
     # password AND an authenticated session; first-run bootstrap cannot bypass.
     def _loyalty_admin():
+        # Explicit owner-granted permission replaces the global shared
+        # Settings password for non-owner staff loyalty actions.
+        if g.staff_actor["role"] != "admin" and staff.can(g.staff_actor, "manage_loyalty"):
+            return None
         if not auth.is_configured(_admin_password()):
             return jsonify({"error": "Set an admin password in Settings before managing loyalty points"}), 403
         if not auth.is_authenticated():
@@ -1384,7 +1446,7 @@ def create_app(db_path=None, extra_hosts=()):
             ["refund_receipt_id", "timestamp_utc", "original_sale_id",
              "original_invoice_number", "customer_id", "reason",
              "subtotal", "discount", "recorded_gst", "total_refunded",
-             "cash", "card", "upi", "store_credit"],
+             "cash", "card", "upi", "store_credit", "refund_number"],
             "pypos-refunds.csv")
 
     @app.get("/api/export/sales.csv")
@@ -1401,7 +1463,8 @@ def create_app(db_path=None, extra_hosts=()):
                       COALESCE((SELECT SUM(quantity) FROM sale_items si
                                 WHERE si.sale_id = s.id), 0),
                       COALESCE((SELECT GROUP_CONCAT(DISTINCT method) FROM payments p
-                                WHERE p.sale_id = s.id), '')
+                                WHERE p.sale_id = s.id), ''),
+                      COALESCE(s.refund_number, '')
                FROM sales s
                WHERE (? IS NULL OR s.timestamp >= ?)
                  AND (? IS NULL OR s.timestamp <= ?)
@@ -1411,7 +1474,7 @@ def create_app(db_path=None, extra_hosts=()):
             [tuple(r) for r in cur.fetchall()],
             ["receipt", "invoice_number", "timestamp_utc", "status",
              "parent_sale", "subtotal", "discount", "tax", "total",
-             "salesperson", "signed_net_effect", "items", "payment_methods"],
+             "salesperson", "signed_net_effect", "items", "payment_methods", "refund_number"],
             "pypos-sales.csv")
 
     @app.get("/api/export/sale-lines.csv")
@@ -1432,7 +1495,8 @@ def create_app(db_path=None, extra_hosts=()):
                       COALESCE(si.hsn_at_sale, '') AS hsn,
                       COALESCE(si.unit_at_sale, '') AS uqc,
                       si.quantity, si.unit_price, si.tax_rate_at_sale,
-                      si.discount_cents, si.tax_cents
+                      si.discount_cents, si.tax_cents,
+                      COALESCE(s.refund_number, '') AS refund_number
                FROM sales s JOIN sale_items si ON si.sale_id = s.id
                WHERE (? IS NULL OR s.timestamp >= ?)
                  AND (? IS NULL OR s.timestamp <= ?)
@@ -1445,11 +1509,12 @@ def create_app(db_path=None, extra_hosts=()):
                          r["hsn"], r["uqc"], r["quantity"], r["unit_price"],
                          r["tax_rate_at_sale"],
                          round(int(r["discount_cents"] or 0) / 100, 2),
-                         round(int(r["tax_cents"] or 0) / 100, 2)))
+                         round(int(r["tax_cents"] or 0) / 100, 2),
+                         r["refund_number"]))
         return _csv_response(rows, ["receipt", "invoice_number", "timestamp_utc",
                     "status", "parent_sale", "sku_at_sale", "description_at_sale",
                     "hsn_sac_at_sale", "unit_code_at_sale", "quantity", "unit_price",
-                    "tax_percent_at_sale", "recorded_discount", "recorded_tax"],
+                    "tax_percent_at_sale", "recorded_discount", "recorded_tax", "refund_number"],
                     "pypos-sale-lines.csv")
 
     @app.get("/api/export/inventory.csv")

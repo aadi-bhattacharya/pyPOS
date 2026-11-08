@@ -1,4 +1,4 @@
-import { api, fmt, fmtDate } from "../api.js";
+import { api, can, fmt, fmtDate } from "../api.js";
 import { h, icon, toastError } from "../ui.js";
 import { refundDialog, detailModal } from "./salesview.js";
 
@@ -18,7 +18,7 @@ export async function renderRefunds(main) {
     h("div", { class: "view-title" }, h("h2", {}, "Returns & refunds"),
       h("div", { class: "sub" }, "Find an original invoice, select returned items and record the repayment")),
     h("div", { class: "view-actions" },
-      h("a", { class: "btn", href: "/api/export/refunds.csv", download: "" }, "Refunds CSV"),
+      can("export_data") ? h("a", { class: "btn", href: "/api/export/refunds.csv", download: "" }, "Refunds CSV") : null,
       h("a", { class: "btn", href: "#/sales" }, icon("i-sales"), "All sales")));
   main.append(title,
     h("section", { class: "card return-search-card" },
@@ -80,7 +80,7 @@ export async function renderRefunds(main) {
       const page = rows.slice(0, PAGE);
       offset += page.length;
       for (const r of page) recent.append(h("div", { class: "return-history-row" },
-        h("div", {}, h("strong", {}, `Refund #${r.id}`),
+        h("div", {}, h("strong", {}, r.refund_number || `Refund #${r.id}`),
           h("div", { class: "cl-sub" }, `${fmtDate(r.timestamp)} · Original sale #${r.parent_sale_id || "?"}`)),
         h("strong", { class: "return-negative" }, `−${fmt(r.total)}`),
         h("button", { class: "btn sm", onclick: () => detailModal(r.id) }, "View / print")));

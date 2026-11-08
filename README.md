@@ -53,45 +53,45 @@ Start with [INDIA_SETUP.md](INDIA_SETUP.md) and [CHANGES_INDIA.md](CHANGES_INDIA
 pyPOS is a single small app that keeps all data on your machine. Pick whichever
 route fits you:
 
-**Option A — one file, no installation (recommended for a shop PC)**
+**Option A — native managed release (recommended for a shop PC)**
 
-Build once, copy anywhere:
+Download the per-platform `.zip` and corresponding checksum from a stable
+GitHub release. Extract it and open `pypos-launcher.exe` (Windows) or
+`pypos-launcher` (Linux/macOS). No Python or administrator account is needed.
+The launcher installs pyPOS into per-user application paths, adds **pyPOS** and
+**Stop pyPOS** shortcuts, runs the register without a console window on Windows,
+and installs verified updates in the background for the *next* launch. Running
+sales are never interrupted for an update. The prior version is retained and
+pre-update SQLite backups are made before activation. See
+[MANAGED_UPDATES.md](MANAGED_UPDATES.md) for paths, legacy database migration,
+release verification, recovery and supported platforms.
 
-```bash
-python build_portable.py          # produces dist/pypos-<version>.pyz (~2 MB)
-                                  # plus "Start pyPOS.bat" for Windows
-```
-
-Then on any machine that has Python 3.10+ (Windows/macOS/Linux):
-
-```bash
-python pypos-1.0.0.pyz            # starts the register, opens the browser
-```
-
-**On Windows, double-click `Start pyPOS.bat`** (sits right next to the `.pyz`)
-— no typing needed; it finds Python for you.
-
-No venv, no pip, no admin rights. Data appears in `./pypos-data` next to where
-you run it — put the `.pyz` on a USB stick together with that folder and your
-whole till travels with it.
-
-**Option B — native binary (no Python needed at all)**
-
-PyInstaller can't cross-compile, so each OS builds its own binary. Three ways:
+Maintainers can build the two native executables and release archive on a
+supported operating system:
 
 ```bash
-# on the target OS (needs Python + pip):
-pip install "Flask>=3.0" pyinstaller
-pyinstaller pypos.spec            # -> dist/pypos  (dist\pypos.exe on Windows)
+python -m pip install -r requirements.txt pyinstaller
+pyinstaller --clean --noconfirm pypos.spec
+pyinstaller --clean --noconfirm launcher.spec
+python package_native.py
 ```
 
-Or let GitHub do it: push a `v*` tag (or use the Actions tab → **build-binaries**
-→ Run workflow) and collect `pypos-linux`, `pypos-windows`, `pypos-macos`
-from the run's Artifacts. The workflow lives at
-`.github/workflows/build-binaries.yml`.
+Publishing a stable `vMAJOR.MINOR.PATCH` GitHub tag runs CI, stamps the trusted
+release source, builds each OS/CPU package and enables automatic updates. A
+manually built package is intentionally update-disabled.
 
-The resulting single executable runs standalone — copy it to the shop PC and
-double-click.
+**Option B — portable Python zipapp (manual updates, Python required)**
+
+```bash
+python build_portable.py       # dist/pypos-<version>.pyz
+```
+
+Run `python pypos-<version>.pyz`, or open `Start pyPOS.vbs` on Windows for a
+console-free launch. The zipapp includes its Python dependencies but requires
+Python 3.10+. Create a folder named `pypos-data` **beside the .pyz** to opt into
+USB-stick data portability, or set `PYPOS_HOME`. Otherwise it uses the
+platform-standard data directory. Do not keep live shop data in a folder you
+intend to delete when updating the app.
 
 **Option C — proper pip / pipx package**
 
@@ -103,7 +103,8 @@ pypos                             # console command, same flags as main.py
 **Option D — straight from this checkout**
 
 ```bash
-./run.sh                          # Windows: run.bat  (auto-creates .venv)
+./run.sh                          # Windows: double-click "Start pyPOS.vbs"
+                                  # (run.bat delegates to it)
 # or manually:
 pip install -r requirements.txt   # Flask, Waitress and QR generation
 python main.py                    # starts server + opens your browser
@@ -323,7 +324,11 @@ pos/               the whole application
   schema.sql       database schema (+ idempotent migrations on start)
 tests/             unittest suite for the business logic
 build_portable.py  builds the single-file .pyz (app + Flask bundled)
-pypos.spec         PyInstaller spec for a native single-file binary
+pypos.spec         PyInstaller spec for the native register server
+launcher.spec       Spec for the console-free managed launcher
+package_native.py   Verified OS/CPU release archive builder
+pos/update_core.py  Background release verification and staging
+pos/managed_launcher.py   Version switching and rollback
 ```
 
 The frontend talks to the API under `/api/*`; all money math lives in the

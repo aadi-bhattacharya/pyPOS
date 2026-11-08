@@ -1465,3 +1465,14 @@ a.btn, a.btn:hover, a.btn:focus { text-decoration: none; }
 @media (max-width:560px) {.pay-row {grid-template-columns:100px minmax(0,1fr) 28px;}.upi-qr-image {width:190px;height:190px;}}
 
 .upi-internal-record {border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:12px;display:flex;flex-direction:column;gap:6px;font-size:12px;overflow-wrap:anywhere;}
+
+/* Individual operator permissions: grouped, easy to scan, keyboard accessible. */
+.staff-permission-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(270px,1fr)); gap:14px; margin-top:14px; }
+.staff-permission-group { min-width:0; border:1px solid var(--border); border-radius:10px; padding:14px; }
+.staff-permission-group h4 { font-size:14px; margin:0 0 9px; }
+.staff-permission-toggle { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:9px 0; cursor:pointer; border-bottom:1px solid var(--border); font-size:13px; line-height:1.35; }
+.staff-permission-toggle:last-child { border:0; }
+.staff-permission-toggle input[type="checkbox"] { flex:0 0 auto; width:19px; height:19px; accent-color:var(--accent); cursor:pointer; }
+.staff-sensitive { display:block; font-size:11px; color:var(--danger); font-weight:650; margin-top:2px; }
+.staff-permission-presets { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+#nav a[hidden] { display:none !important; }

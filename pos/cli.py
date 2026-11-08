@@ -4,7 +4,13 @@ import ipaddress
 import socket
 import threading
 import webbrowser
+import os
+import time
+from pathlib import Path
+import sys
+import logging
 
+from .launch_dialog import configure_logging, show_error, unexpected_failure
 from .db import connect, init_db
 from .demo import seed_demo_data
 from . import auth
@@ -20,7 +26,40 @@ def _is_loopback(host):
         return host.lower() in ("localhost",)
 
 
+class PortBusyError(RuntimeError):
+    """A live till or another service already owns the requested port."""
+
+
 def main(argv=None):
+    """GUI-capable entry point. Native Windows builds never depend on cmd.exe."""
+    frozen = getattr(sys, "frozen", False)
+    # pythonw.exe for a source checkout is also console-free on Windows.
+    graphical = frozen or (sys.platform == "win32" and sys.stdout is None)
+    if graphical:
+        logfile = configure_logging()
+        # PyInstaller --windowed supplies no stdout/stderr on Windows. Keep
+        # diagnostic output in the user-specific log instead of crashing.
+        if sys.stdout is None:
+            sys.stdout = open(logfile, "a", buffering=1, encoding="utf-8")
+        if sys.stderr is None:
+            sys.stderr = open(logfile, "a", buffering=1, encoding="utf-8")
+    try:
+        return _run(argv)
+    except PortBusyError as exc:
+        if graphical:
+            logging.getLogger("pypos").warning("Port conflict: %s", exc)
+            show_error("pyPOS is already running or the port is occupied", str(exc))
+        else:
+            print(f"pyPOS: {exc}", file=sys.stderr)
+        return 73
+    except Exception as exc:
+        if graphical:
+            unexpected_failure("Starting the register", exc)
+            return 1
+        raise
+
+
+def _run(argv=None):
     parser = argparse.ArgumentParser(
         prog="pyPOS", description="pyPOS — simple point of sale")
     parser.add_argument("--host", default="127.0.0.1",
@@ -55,6 +94,9 @@ def main(argv=None):
             "connection is unencrypted HTTP.")
 
     if args.set_password:
+        if getattr(sys, "frozen", False) and sys.platform == "win32":
+            raise RuntimeError("Use the Settings page to change the administrator password. "
+                               "The graphical application has no interactive console.")
         _set_password(db_path)
         return 0
 
@@ -74,23 +116,20 @@ def main(argv=None):
         finally:
             conn.close()
 
+    if not _port_free(args.host, args.port):
+        raise PortBusyError(
+            f"Port {args.port} is already in use on {args.host}.\n\n"
+            "Another pyPOS window may already be running. First check your "
+            "browser at http://127.0.0.1:8420/. If pyPOS is not running, "
+            "close the program using this port and start pyPOS again.\n\n"
+            "For advanced use: python main.py --port 8421")
+
     scheduler = backups.BackupScheduler(_scheduler_settings, source_path=db_path)
     scheduler.start()
-
-    if not _port_free(args.host, args.port):
-        print(f"\n  ERROR: port {args.port} is already in use on {args.host}.")
-        print("  Another program (possibly an older pyPOS still running) owns")
-        print("  it, so this instance cannot start — anything your browser")
-        print("  shows on that port is NOT this server.")
-        print(f"\n  Fix:  fuser -k {args.port}/tcp     # stop whatever holds it")
-        print(f"  or:   python main.py --port {args.port + 1}")
-        raise SystemExit(1)
 
     app = create_app(db_path, extra_hosts=("*",) if args.lan else ())
     url = f"http://{args.host}:{args.port}"
 
-    if not args.no_browser:
-        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
     print(r"  ___               ____  _____  ___ ")
     print(r" | _ \_ _ ___ ___ |   _\|_   _||_ _|")
@@ -105,8 +144,37 @@ def main(argv=None):
         print("  Isolated to this computer (127.0.0.1) — no outside access.")
     print("  Press Ctrl+C to stop.\n")
 
-    from waitress import serve
-    serve(app, host=args.host, port=args.port, threads=8)
+    from waitress import create_server
+    # Bind before opening the browser: it must never open an older instance
+    # after this server failed to acquire its listener.
+    try:
+        server = create_server(app, host=args.host, port=args.port, threads=8)
+    except OSError as exc:
+        raise PortBusyError(f"Could not bind {args.host}:{args.port}: {exc}") from exc
+
+    if not args.no_browser:
+        threading.Timer(1.2, lambda: webbrowser.open(url)).start()
+
+    stop_file = os.environ.get("PYPOS_STOP_FILE")
+    if stop_file:
+        path = Path(stop_file)
+        def listen_for_stop():
+            while True:
+                if path.is_file():
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    logging.getLogger("pypos").info("Graceful shutdown requested from launcher")
+                    server.close()
+                    return
+                time.sleep(0.3)
+        threading.Thread(target=listen_for_stop, name="pypos-stop", daemon=True).start()
+    try:
+        server.run()
+    finally:
+        server.close()
+    return 0
 
 
 def _port_free(host, port):
