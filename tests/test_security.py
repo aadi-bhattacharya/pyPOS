@@ -169,7 +169,7 @@ class LanModeTests(unittest.TestCase):
         r = self.client.post("/api/backups",
                              headers={"Host": "192.168.1.50:8420",
                                       "Origin": "http://192.168.1.50:8420"})
-        self.assertIn(r.status_code, (200, 201))
+        self.assertIn(r.status_code, (200, 201), r.get_data(as_text=True))
 
     def test_loopback_still_allowed(self):
         self._login("127.0.0.1:8420")

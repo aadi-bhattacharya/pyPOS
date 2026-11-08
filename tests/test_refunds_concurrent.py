@@ -1,5 +1,6 @@
 """Concurrency and upgrade checks on disposable file-backed databases."""
 import tempfile
+from contextlib import closing
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -12,7 +13,7 @@ class ConcurrentRefundTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             database = str(Path(tmp) / 'pos.db')
             init_db(database)
-            with connect(database) as conn:
+            with closing(connect(database)) as conn:
                 group = catalog.create_product_group(conn, 'Test')
                 pid = catalog.add_product_to_group(conn, group_id=group,
                     SKU='CONCURRENT-1', barcode=None, price=80, quantity=10,
@@ -33,13 +34,13 @@ class ConcurrentRefundTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(run, range(2)))
             self.assertEqual(results[0], results[1])
-            with connect(database) as conn:
+            with closing(connect(database)) as conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM sales WHERE status="REFUNDED"').fetchone()[0],1)
                 self.assertEqual(catalog.get_product(conn,pid)['quantity'],9)
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM stock_movements WHERE kind="REFUND"').fetchone()[0],1)
                 old_count = conn.execute('SELECT COUNT(*) FROM sales').fetchone()[0]
             init_db(database)  # migration remains repeatable, sale IDs unchanged
-            with connect(database) as conn:
+            with closing(connect(database)) as conn:
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM sales').fetchone()[0],old_count)
                 self.assertEqual(conn.execute('SELECT COUNT(*) FROM refund_requests').fetchone()[0],1)
 

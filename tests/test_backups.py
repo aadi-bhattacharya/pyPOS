@@ -48,6 +48,30 @@ class BackupsTests(POSTestCase):
         backups.validate_database(path)  # must not raise
         self.assertFalse(result["pushed"])
 
+    def test_online_backup_includes_wal_without_checkpointing_live_register(self):
+        # Keep a live WAL connection open, as the running till would. A
+        # snapshot must contain committed data without truncating the live WAL
+        # or requiring exclusive access to the register database.
+        live = sqlite3.connect(str(self.live_db), isolation_level=None)
+        try:
+            live.execute("PRAGMA journal_mode=WAL")
+            live.execute("INSERT INTO settings(key, value) VALUES('live_wal_check', 'saved')")
+            wal = Path(str(self.live_db) + "-wal")
+            self.assertTrue(wal.is_file())
+            before = wal.stat().st_size
+            self.assertGreater(before, 0)
+            name = backups.create_backup(self.live_db)
+            self.assertEqual(wal.stat().st_size, before)
+            check = sqlite3.connect(str(self.bdir / name))
+            try:
+                self.assertEqual(check.execute(
+                    "SELECT value FROM settings WHERE key='live_wal_check'"
+                ).fetchone()[0], "saved")
+            finally:
+                check.close()
+        finally:
+            live.close()
+
     def test_list_and_prune(self):
         for _ in range(4):
             name = backups.create_backup(self.live_db)

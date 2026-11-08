@@ -42,11 +42,13 @@ class PathsTests(unittest.TestCase):
 
 
 def archive(version="1.2.3", platform="linux-x86_64", mutated=False):
-    files = {"pypos-app": b"EXE 1", "pypos-launcher": b"EXE 2"}
+    system = "win32" if platform.startswith("windows-") else "linux"
+    app, launcher = binary_names(system=system)
+    files = {app: b"EXE 1", launcher: b"EXE 2"}
     manifest = {"version": version, "platform": platform,
                 "sha256": {name: hashlib.sha256(b).hexdigest() for name, b in files.items()}}
     if mutated:
-        files["pypos-app"] = b"ATTACK"
+        files[app] = b"ATTACK"
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as f:
         for name, data in files.items():
@@ -191,11 +193,48 @@ class ManagedInstallTests(unittest.TestCase):
             f"https://github.com/{repo}/releases/download/v1.1.0/pypos-linux-x86_64.zip.sha256": (checksum + "\n").encode(),
             f"https://github.com/{repo}/releases/download/v1.1.0/pypos-linux-x86_64.zip": data,
         }
-        self.assertTrue(upd.update_once(self.root, "1.0.0", repo, system="linux",
-                                        fetch=lambda url, limit: urls[url]))
+        # This fixture intentionally models Linux x86_64 even when the host
+        # running the test is a macOS ARM64 runner. Host CPU detection has a
+        # separate test; it must not change which mocked asset this test serves.
+        with patch.object(upd, "platform_key", return_value="linux-x86_64"):
+            self.assertTrue(upd.update_once(self.root, "1.0.0", repo, system="linux",
+                                            fetch=lambda url, limit: urls[url]))
         self.assertEqual(upd.read_version_file(self.root / "pending.txt"), "1.1.0")
         self.assertIsNone(upd.read_version_file(self.root / "current.txt"))
         self.assertTrue((self.root / "versions" / "1.1.0" / "sha256.json").exists())
+
+    def test_native_update_asset_selection_matches_each_ci_platform(self):
+        # Exercise the exact platforms in build-binaries.yml on any host OS.
+        # Each archive must contain the right native filenames, and the
+        # release must match the architecture selected by platform_key.
+        cases = (
+            ("linux", "x86_64", "linux-x86_64"),
+            ("darwin", "x86_64", "macos-x86_64"),
+            ("darwin", "arm64", "macos-arm64"),
+            ("win32", "AMD64", "windows-x86_64"),
+        )
+        from pos.platform_paths import host_platform
+        for system, machine, key in cases:
+            with self.subTest(platform=key), tempfile.TemporaryDirectory() as td:
+                data, checksum = archive(version="1.1.0", platform=key)
+                repo = "seller/pypos"
+                url = f"https://github.com/{repo}/releases/download/v1.1.0/pypos-{key}.zip"
+                api = f"https://api.github.com/repos/{repo}/releases/latest"
+                urls = {
+                    api: json.dumps({"tag_name": "v1.1.0", "assets": [
+                        {"name": f"pypos-{key}.zip", "browser_download_url": url},
+                        {"name": f"pypos-{key}.zip.sha256", "browser_download_url": url + ".sha256"},
+                    ]}).encode(),
+                    url + ".sha256": (checksum + "\n").encode(),
+                    url: data,
+                }
+                with patch.object(host_platform, "machine", return_value=machine):
+                    self.assertTrue(upd.update_once(Path(td), "1.0.0", repo,
+                        system=system, fetch=lambda src, _limit: urls[src]))
+                self.assertEqual(upd.read_version_file(Path(td) / "pending.txt"), "1.1.0")
+                names = set(binary_names(system=system))
+                self.assertEqual({p.name for p in (Path(td) / "versions" / "1.1.0").iterdir()},
+                                 names | {"sha256.json"})
 
     def test_atomic_version_file_refuses_traversal(self):
         with self.assertRaises(upd.UpdateError):
@@ -240,7 +279,8 @@ class DesktopShortcutTests(unittest.TestCase):
             shortcut = create_shortcut(target, system="linux", env={"XDG_DATA_HOME": str(root / "xdg")})
             content = shortcut.read_text()
             self.assertIn('Terminal=false', content)
-            self.assertIn(str(target), content)
+            # create_shortcut canonicalizes paths; Windows may expand short 8.3 names.
+            self.assertIn(str(target.resolve()), content)
             self.assertEqual(create_shortcut(target, system="linux", env={"XDG_DATA_HOME": str(root / "xdg")}), shortcut)
 
     def test_mac_creates_app_bundle_without_touching_store(self):
@@ -251,7 +291,8 @@ class DesktopShortcutTests(unittest.TestCase):
             stable.write_bytes(b"binary")
             result = create_shortcut(stable, system="darwin", home=root)
             self.assertTrue((result / "Contents" / "Info.plist").exists())
-            self.assertIn(str(stable), (result / "Contents" / "MacOS" / "pyPOS").read_text())
+            self.assertIn(str(stable.resolve()),
+                          (result / "Contents" / "MacOS" / "pyPOS").read_text())
 
 class NativeReleasePackagingTests(unittest.TestCase):
     def test_release_zip_matches_expected_updater_manifest(self):

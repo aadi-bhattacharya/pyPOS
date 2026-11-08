@@ -177,10 +177,12 @@ def create_backup(source_path=None):
     try:
         source_conn = sqlite3.connect(src)
         try:
-            # Fold the WAL into the main db so the snapshot is small & fast.
-            source_conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # SQLite's online backup API already copies a consistent snapshot
+            # including committed WAL data. Do NOT force a checkpoint here:
+            # other active register readers/writers can make it busy, and the
+            # backup should not interfere with live sales.
             dest_conn = sqlite3.connect(str(tmp))
-            source_conn.backup(dest_conn)
+            source_conn.backup(dest_conn, pages=256, sleep=0.1)
             dest_conn.execute("PRAGMA journal_mode = DELETE")  # self-contained file
             result = dest_conn.execute("PRAGMA integrity_check").fetchone()
             if not result or result[0] != "ok":
