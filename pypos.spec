@@ -1,5 +1,5 @@
 # PyInstaller spec — builds a single-file native binary:
-#   pip install flask pyinstaller
+#   pip install flask waitress qrcode pyinstaller
 #   pyinstaller pypos.spec
 # Produces dist/pypos[-<platform>] with Python, Flask and the whole UI baked in.
 # No Python installation is needed on the target machine.

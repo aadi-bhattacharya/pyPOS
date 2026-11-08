@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "pyPOS contributors" }]
 requires-python = ">=3.10"
-dependencies = ["Flask>=3.0"]
+dependencies = ["Flask>=3.0", "waitress>=3.0", "qrcode>=7.4"]
 keywords = ["point-of-sale", "pos", "retail", "sqlite", "offline"]
 classifiers = [
     "Environment :: Web Environment",

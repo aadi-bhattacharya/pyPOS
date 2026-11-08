@@ -13,11 +13,12 @@ export function publicVariant(attributes = []) {
   return publicAttributes(attributes).map(a => `${a.name}: ${a.value}`).join(" · ");
 }
 export function needsBillingReview(attributes = []) {
-  return attributes.some(a => ["gst review required", "price review required"].includes(
+  return attributes.some(a => ["gst review required", "price review required", "manager review required"].includes(
     String(a.name).toLowerCase()));
 }
 export function billingReviewLabel(attributes = []) {
   const names = new Set(attributes.map(a => String(a.name).toLowerCase()));
   return names.has("gst review required") ? "GST review required" :
-    names.has("price review required") ? "Price review required" : "";
+    names.has("price review required") ? "Price review required" :
+    names.has("manager review required") ? "Manager review needed" : "";
 }

@@ -12,12 +12,21 @@ export const state = {
   },
 };
 
+// The token is embedded only in HTML served by pyPOS (never in a static file).
+// It authenticates a request even when a Windows browser emits Origin:null.
+export function csrfHeaders() {
+  const token = typeof document !== "undefined"
+    ? document.querySelector('meta[name="pypos-csrf-token"]')?.content
+    : null;
+  return token ? { "X-pyPOS-CSRF": token } : {};
+}
+
 async function request(path, options = {}) {
   let res;
   try {
     res = await fetch(`/api${path}`, {
-      headers: { "Content-Type": "application/json" },
       ...options,
+      headers: { "Content-Type": "application/json", ...csrfHeaders(), ...options.headers },
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
     });
   } catch (e) {
@@ -46,7 +55,9 @@ async function importUpload(endpoint, file, mode, allowZeroPrices, forceRepeat =
   data.append("repeat_reason", repeatReason);
   let response;
   try {
-    response = await fetch(`/api/catalog/import/${endpoint}`, { method: "POST", body: data });
+    response = await fetch(`/api/catalog/import/${endpoint}`, {
+      method: "POST", headers: csrfHeaders(), body: data,
+    });
   } catch (_) {
     throw new Error("Cannot reach the POS server.");
   }
@@ -56,6 +67,9 @@ async function importUpload(endpoint, file, mode, allowZeroPrices, forceRepeat =
 }
 
 export const api = {
+  // UPI reference is local POS-generated, not a verified bank UTR.
+  upiReference: () => request("/upi/reference"),
+
   // optional staff PINs
   staffStatus: () => request("/staff/status"),
   staffUsers: () => request("/staff/users"),
@@ -128,7 +142,8 @@ export const api = {
   stocktakeDetail: (id) => request(`/stocktakes/${id}`),
   countStock: (id, productId, counted) => request(`/stocktakes/${id}/count/${productId}`,
     { method: "PUT", body: { counted } }),
-  postStocktake: (id) => request(`/stocktakes/${id}/post`, { method: "POST" }),
+  postStocktake: (id, reason = "") => request(`/stocktakes/${id}/post`,
+    { method: "POST", body: { reason } }),
 
   // sales
   checkout: (payload) => request("/sales", { method: "POST", body: payload }),

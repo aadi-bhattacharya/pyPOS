@@ -275,10 +275,110 @@ def _barcode_review(conn, items):
     return errors, resolved
 
 
-def preview(conn, items, issues, mode="skip", allow_zero_prices=False):
+def _cashier_existing_only_errors(conn, items, resolved):
+    """Fail closed on every row that is not the precise authorised SKU/edition.
+
+    Called both during preview and again under apply()'s write lock.
+    An EAN/MRP match is not sufficient: cashiers cannot create alternate SKUs.
+    """
+    rows = {str(r["SKU"]).casefold(): dict(r) for r in conn.execute("""
+        SELECT p.id, p.SKU, p.price, p.tax_rate, g.name AS product_name,
+        COALESCE(p.barcode, (SELECT x.barcode FROM barcode_price_options x
+                WHERE x.product_id=p.id)) AS barcode
+        FROM products p LEFT JOIN product_groups g ON g.id=p.group_id
+    """)}
+    problems = []
+    for item, target in zip(items, resolved):
+        row = rows.get(item["sku"].casefold())
+        label = f"Row {item['source_row']}: SKU {item['sku']}"
+        if not row or not target or target["id"] != row["id"]:
+            problems.append(f"{label} is not an existing approved SKU. Ask a manager to create it")
+            continue
+        if item["quantity"] <= 0:
+            problems.append(f"{label} must receive a positive quantity")
+        if item["name"].strip().casefold() != str(row["product_name"] or "").strip().casefold():
+            problems.append(f"{label} has a different product name than the approved catalogue")
+        if item["barcode"] and item["barcode"] != row["barcode"]:
+            problems.append(f"{label} has a different barcode")
+        if (item["price"] is not None and
+                round(item["price"] * 100) != round(float(row["price"]) * 100)):
+            problems.append(f"{label} has a different MRP")
+        if (item["tax_rate"] is not None and
+                round(item["tax_rate"] * 100) != round(float(row["tax_rate"]) * 100)):
+            problems.append(f"{label} has a different GST rate")
+        if item["attrs"]:
+            attrs = {str(a["attribute_name"]).casefold(): str(a["attribute_value"]).strip().casefold()
+                for a in conn.execute("SELECT attribute_name,attribute_value FROM product_attributes WHERE product_id=?", (row["id"],))}
+            for name, value in item["attrs"].items():
+                if name.casefold() in ("colour", "color", "size", "style") and attrs.get(name.casefold()) != str(value).strip().casefold():
+                    problems.append(f"{label} has a different {name} variant")
+    return problems
+
+
+def _cashier_safe_errors(conn, items, resolved, mode):
+    """Allow new SKUs and safe receipts; prohibit price/tax/variant edits to existing SKUs."""
+    by_sku = {r["SKU"].casefold(): dict(r) for r in conn.execute("""
+        SELECT p.id, p.SKU, p.price, p.tax_rate, p.barcode,
+               g.name AS product_name FROM products p
+        LEFT JOIN product_groups g ON p.group_id=g.id
+    """)}
+    problems = []
+    for item, target in zip(items, resolved):
+        label = f"Row {item['source_row']}: SKU {item['sku']}"
+        row = by_sku.get(item["sku"].casefold())
+        if not row:
+            if target is not None:
+                problems.append(f"{label} matches another SKU by EAN/MRP. Use that exact SKU for receipts")
+            if item["price"] is None or item["price"] <= 0:
+                problems.append(f"{label} needs a positive selling price before cashier import")
+            if item["attrs"] and any(k.casefold() in ("gst review required", "price review required", "cost review required", "manager review required") for k in item["attrs"]):
+                problems.append(f"{label} contains a reserved billing review attribute")
+            if item["barcode"] and conn.execute("""SELECT 1 FROM products p LEFT JOIN barcode_price_options o ON o.product_id=p.id
+                      WHERE p.barcode=? OR o.barcode=? LIMIT 1""", (item["barcode"], item["barcode"])).fetchone():
+                problems.append(f"{label} shares an existing EAN. A manager must create extra price editions")
+            if item["tax_rate"] is None:
+                problems.append(f"{label} needs an explicit GST rate, including 0 if applicable")
+            continue
+        if target is None or target["id"] != row["id"]:
+            problems.append(f"{label} does not match the exact existing SKU / price edition")
+            continue
+        if mode == "add_stock":
+            # Reconcile against the existing catalogue, not the spreadsheet's
+            # claim about the product. 'skip' cannot change existing records.
+            if item["quantity"] <= 0:
+                problems.append(f"{label} must receive a positive quantity")
+            if item["name"].strip().casefold() != str(row["product_name"] or "").strip().casefold():
+                problems.append(f"{label} uses a different product name")
+            if item["barcode"] and item["barcode"] != row["barcode"]:
+                alias = conn.execute("SELECT 1 FROM barcode_price_options WHERE product_id=? AND barcode=?",
+                    (row["id"], item["barcode"])).fetchone()
+                if not alias:
+                    problems.append(f"{label} uses a different barcode")
+            if item["price"] is not None and round(item["price"]*100) != round(float(row["price"])*100):
+                problems.append(f"{label} has a different MRP")
+            if item["tax_rate"] is not None and round(item["tax_rate"]*100) != round(float(row["tax_rate"])*100):
+                problems.append(f"{label} has a different GST rate")
+            if item["attrs"]:
+                attrs = {a["attribute_name"].casefold(): str(a["attribute_value"]).strip().casefold()
+                         for a in conn.execute("SELECT attribute_name,attribute_value FROM product_attributes WHERE product_id=?", (row["id"],))}
+                for key, value in item["attrs"].items():
+                    if key.casefold() in ("size", "colour", "color", "style") and attrs.get(key.casefold()) != str(value).strip().casefold():
+                        problems.append(f"{label} has a different {key} variant")
+    return problems
+
+
+def preview(conn, items, issues, mode="skip", allow_zero_prices=False, *, existing_only=False, cashier_safe=False):
     if mode not in MODES:
         raise ImportError("Unknown import mode")
     review_errors, resolved = _barcode_review(conn, items)
+    if existing_only:
+        if mode != "add_stock" or allow_zero_prices:
+            review_errors.append("Existing-only receipts require Add Stock and a valid selling price")
+        review_errors.extend(_cashier_existing_only_errors(conn, items, resolved))
+    if cashier_safe:
+        if mode not in ("skip", "add_stock") or allow_zero_prices:
+            review_errors.append("Cashiers may create new SKUs or receive quantities, but cannot merge or create zero-price drafts")
+        review_errors.extend(_cashier_safe_errors(conn, items, resolved, mode))
     existing = {row["SKU"].casefold(): row["id"] for row in conn.execute("SELECT id, SKU FROM products")}
     counts = {"new": 0, "existing": 0, "stock_to_add": 0, "missing_prices": 0,
               "missing_gst": 0, "skipped": 0, "total_rows": len(items)}
@@ -308,8 +408,12 @@ def preview(conn, items, issues, mode="skip", allow_zero_prices=False):
 
 
 def apply(conn, items, issues, mode="skip", allow_zero_prices=False,
-          force_repeat=False, repeat_reason=""):
+          force_repeat=False, repeat_reason="", *, existing_only=False, cashier_safe=False, audit_actor=None):
     """Atomic import; repeat of the same inventory receipt needs explicit acknowledgement."""
+    if existing_only and (mode != "add_stock" or allow_zero_prices or force_repeat):
+        raise ImportError("Existing-only receipts cannot create SKUs or bypass repeat checks")
+    if cashier_safe and (mode not in ("skip", "add_stock") or allow_zero_prices or force_repeat):
+        raise ImportError("Cashier imports cannot merge catalogue edits, create zero-price drafts or bypass repeat checks")
     digest = hashlib.sha256(json.dumps(items, sort_keys=True,
         separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()
     repeat_reason = str(repeat_reason or "").strip()
@@ -326,7 +430,8 @@ def apply(conn, items, issues, mode="skip", allow_zero_prices=False,
             if old:
                 raise ImportError("This same stock file was already received. Use Skip Existing, "
                                   "or explicitly confirm a new delivery with a reason.")
-        check = preview(conn, items, issues, mode, allow_zero_prices)
+        check = preview(conn, items, issues, mode, allow_zero_prices,
+                        existing_only=existing_only, cashier_safe=cashier_safe)
         if not check["can_import"]:
             if check["error_count"]:
                 raise ImportError("Correct the file errors before importing: " + check["errors"][0])
@@ -390,7 +495,7 @@ def apply(conn, items, issues, mode="skip", allow_zero_prices=False,
                 (group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code, unit_code)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (group_id, item["sku"], canonical, item["price"] if item["price"] is not None else 0,
-                 item["quantity"], item["cost_price"] if item["cost_price"] is not None else 0,
+                 item["quantity"], 0 if cashier_safe else (item["cost_price"] if item["cost_price"] is not None else 0),
                  item["tax_rate"] if item["tax_rate"] is not None else 0,
                  item["hsn_code"], item["unit_code"]))
             pid = cur.lastrowid
@@ -402,8 +507,11 @@ def apply(conn, items, issues, mode="skip", allow_zero_prices=False,
                 attributes.setdefault("Price Review Required", "No selling price supplied; created at ₹0")
             if item["tax_rate"] is None:
                 attributes.setdefault("GST Review Required", "Unverified: no GST rate supplied; 0 is only a database placeholder")
-            if item["cost_price"] is None:
-                attributes.setdefault("Cost Review Required", "No purchase cost supplied; stored as ₹0")
+            if cashier_safe or item["cost_price"] is None:
+                attributes.setdefault("Cost Review Required", "Purchase cost not entered; manager review required")
+            if cashier_safe:
+                by = str((audit_actor or {}).get("username") or "unknown")[:60]
+                attributes["Manager Review Required"] = f"New SKU imported by operator={by}; verify MRP, tax and identity"
             for name, val in attributes.items():
                 conn.execute("INSERT INTO product_attributes(product_id, attribute_name, attribute_value) VALUES(?, ?, ?)",
                              (pid, name, val))
@@ -411,9 +519,13 @@ def apply(conn, items, issues, mode="skip", allow_zero_prices=False,
             result["created"] += 1
             result["no_price_created"] += (item["price"] is None)
             result["gst_missing_created"] += (item["tax_rate"] is None)
-        conn.execute("""UPDATE stock_movements SET kind='IMPORT_RECEIPT',
-            reason=? WHERE id>? AND kind='CHANGE'""",
-            (f"Catalogue import ({mode})", movement_start))
+        actor = ""
+        if audit_actor:
+            actor = (f"; operator={str(audit_actor.get('username', 'unknown'))[:60]} "
+                     f"role={str(audit_actor.get('role', 'unknown'))[:20]}")
+        conn.execute("""UPDATE stock_movements SET kind=CASE WHEN kind='CHANGE' THEN 'IMPORT_RECEIPT' ELSE kind END,
+            reason=? WHERE id>? AND kind IN ('INITIAL_STOCK', 'CHANGE')""",
+            (f"Catalogue import ({mode}){actor}; digest={digest[:16]}", movement_start))
         if mode in ("add_stock", "merge"):
             conn.execute("""INSERT INTO stock_import_batches
                 (digest, mode, rows_added, stock_added, repeat_reason)

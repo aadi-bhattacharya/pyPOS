@@ -1415,3 +1415,53 @@ a.btn, a.btn:hover, a.btn:focus { text-decoration: none; }
   .statusbar { overflow-x: auto; flex-wrap: nowrap; }
   .statusbar .sb-item { flex-shrink: 0; }
 }
+
+/* Searchable stock SKU selector: selection always resolves to an exact product ID.
+   Repeated EANs show separate MRP editions rather than guessing one. */
+.sku-picker { position: relative; min-width: 0; }
+.sku-picker .input { min-width: 0; }
+.sku-picker-summary { margin-top: 5px; line-height: 1.4; }
+.sku-picker-menu {
+  position: absolute; left: 0; right: 0; top: calc(var(--h-input) + 2px);
+  z-index: 20; max-height: min(295px, 45vh); overflow-y: auto;
+  border: 1px solid var(--border-strong); border-radius: var(--radius);
+  background: var(--surface); box-shadow: var(--shadow-pop);
+  overscroll-behavior: contain;
+}
+.sku-picker-menu[hidden] { display: none; }
+.sku-picker-option {
+  display: flex; flex-direction: column; align-items: stretch; width: 100%;
+  text-align: left; padding: 9px 11px; gap: 3px;
+  background: transparent; color: var(--text); border: 0;
+  border-bottom: 1px solid var(--border); cursor: pointer;
+}
+.sku-picker-option:hover, .sku-picker-option.active,
+.sku-picker-option:focus-visible { background: var(--accent-soft); outline-offset: -2px; }
+.sku-picker-option-heading { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.sku-picker-price { white-space: nowrap; font-weight: 700; font-variant-numeric: tabular-nums; }
+.sku-picker-option-detail { font-size: 11px; color: var(--text-2); overflow-wrap: anywhere; }
+.sku-picker-message { padding: 8px 11px; font-size: 11px; color: var(--text-2); background: var(--surface-2); }
+.stocktake-session-row { margin-top: 14px; max-width: 520px; }
+.stocktake-session-row .field { margin-bottom: 0; }
+.stocktake-session-row select { text-overflow: ellipsis; }
+@media (max-width: 600px) {
+  .sku-picker-menu { max-height: min(220px, 35vh); }
+  .stocktake-session-row { max-width: none; }
+}
+
+/* When used inside the scrollable purchasing modal, render the list within
+   the dialog (outside its scrolling body) so options are not cropped. */
+.sku-picker-menu.in-modal {
+  position: absolute; right: auto; z-index: 40;
+}
+
+/* UPI merchant payment workflow: supplemental controls inside tender rows. */
+.pay-row .upi-extra { grid-column:1/-1; padding:10px 12px; border-radius:7px; background:var(--surface-2, #f7f7f7); display:flex; flex-direction:column; gap:8px; min-width:0; }
+.pay-row .upi-extra[hidden] { display:none; }
+.upi-ref-line { display:flex;align-items:center;flex-wrap:wrap;gap:7px;font-size:12px; }
+.upi-reference {font-weight:700;font-family:monospace;overflow-wrap:anywhere;}
+.upi-qr-box {display:flex; flex-direction:column; align-items:center; gap:12px; text-align:center;}
+.upi-qr-image {width:230px;height:230px;max-width:100%;background:#fff;padding:10px;}
+@media (max-width:560px) {.pay-row {grid-template-columns:100px minmax(0,1fr) 28px;}.upi-qr-image {width:190px;height:190px;}}
+
+.upi-internal-record {border:1px solid var(--border);border-radius:8px;padding:10px;margin-top:12px;display:flex;flex-direction:column;gap:6px;font-size:12px;overflow-wrap:anywhere;}

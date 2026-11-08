@@ -241,7 +241,7 @@ def count_stock(conn, stocktake_id, product_id, counted):
     return get_stocktake(conn,stocktake_id)
 
 
-def post_stocktake(conn, stocktake_id):
+def post_stocktake(conn, stocktake_id, *, adjustment_reason="", actor=None):
     conn.execute("BEGIN IMMEDIATE")
     try:
         row=conn.execute("SELECT status FROM stocktakes WHERE id=?",(stocktake_id,)).fetchone()
@@ -255,13 +255,25 @@ def post_stocktake(conn, stocktake_id):
         if stale:
             raise OperationError("Stock changed since these SKUs were counted. Recheck: " +
                                  ", ".join(map(str,stale[:10])))
+        adjustment_reason = str(adjustment_reason or "").strip()
+        if any(x["counted"] < x["expected"] for x in lines) and not 4 <= len(adjustment_reason) <= 200:
+            raise OperationError("A stocktake reducing stock requires a reason (4–200 characters)")
+        if len(adjustment_reason) > 200:
+            raise OperationError("Stocktake reason must be 200 characters or shorter")
         movement_start=conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         for r in lines:
             if r["counted"]!=r["expected"]:
                 conn.execute("UPDATE products SET quantity=?,updated=CURRENT_TIMESTAMP WHERE id=?",
                              (r["counted"],r["product_id"]))
+        attribution = ""
+        if actor:
+            attribution = (f"; operator={str(actor.get('username', 'unknown'))[:60]} "
+                           f"role={str(actor.get('role', 'unknown'))[:20]}")
+        reason = f"Physical stocktake #{stocktake_id}{attribution}"
+        if adjustment_reason:
+            reason += f" | {adjustment_reason}"
         conn.execute("""UPDATE stock_movements SET kind='STOCKTAKE',reference_id=?,reason=?
-            WHERE id>? AND kind='CHANGE'""",(stocktake_id,f"Physical stocktake #{stocktake_id}",movement_start))
+            WHERE id>? AND kind='CHANGE'""",(stocktake_id,reason,movement_start))
         conn.execute("UPDATE stocktakes SET status='POSTED',posted_at=CURRENT_TIMESTAMP WHERE id=?",(stocktake_id,))
         conn.commit()
     except Exception:

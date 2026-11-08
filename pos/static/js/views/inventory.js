@@ -1,5 +1,5 @@
 import { api, fmt, state } from "../api.js";
-import { h, icon, openModal, toast, toastError } from "../ui.js";
+import { h, icon, openModal, toast, toastError, confirmDialog } from "../ui.js";
 import { publicVariant, billingReviewLabel } from "../productLabels.js";
 import { printProductLabels } from "../labels.js";
 
@@ -31,15 +31,19 @@ export async function renderInventory(main) {
     filter = e.target.value; page = 0; paint();
   } },
     ...[["all", "All SKUs"], ["low", "At/below reorder point"], ["out", "Out of stock"],
-      ["uncosted", "Missing purchase cost"]].map(([value, name]) => h("option", { value }, name)));
+      ...(state.staff?.operator?.role === "cashier" ? [] : [["uncosted", "Missing purchase cost"]])]
+      .map(([value, name]) => h("option", { value }, name)));
   main.append(totalsEl,
     h("div", { class: "inventory-toolbar" },
       h("div", { class: "search-wrap" }, icon("i-search"), search),
       select,
       h("button", { class: "btn", onclick: showMovements }, "Stock history"),
-      h("a", { class: "btn", href: "#/stocktake" }, "Physical count"),
-      h("a", { class: "btn", href: "#/purchasing" }, "Supplier receipts"),
-      h("a", { class: "btn", href: "/api/export/inventory.csv" }, "Export CSV"),
+      state.staff?.operator?.role === "cashier" ? null :
+        h("a", { class: "btn", href: "#/stocktake" }, "Physical count"),
+      state.staff?.operator?.role === "cashier" ? null :
+        h("a", { class: "btn", href: "#/purchasing" }, "Supplier receipts"),
+      state.staff?.operator?.role === "cashier" ? null :
+        h("a", { class: "btn", href: "/api/export/inventory.csv" }, "Export CSV"),
       h("a", { class: "btn", href: "#/catalog" }, "Edit catalogue / Import")),
     h("p", { class: "form-hint inventory-intro" },
       "Counts are SKU-level. Stock changes are recorded; historical balances before migration are not reconstructed. Import stock in Catalogue."),
@@ -103,9 +107,13 @@ function paint() {
           ? `${threshold(p)} (default)` : `${p.reorder_point}`),
         h("td", { class: "num" }, fmt(p.price)),
         h("td", {}, h("div", { class: "inventory-actions" },
-          h("button", { class: "btn sm", onclick: () => stockModal(p) }, "Stock ±"),
-          h("button", { class: "btn sm", onclick: () => reorderModal(p) }, "Reorder"),
-          p.group_id ? h("button", { class: "btn sm", onclick: () => classifyModal(p) }, "Classify") : null,
+          h("button", { class: "btn sm", onclick: () => stockModal(p) },
+            state.staff?.operator?.role === "cashier" && state.settings.cashier_allow_stock_reduction !== "true"
+              ? "Receive stock" : "Receive / Correct"),
+          state.staff?.operator?.role === "cashier" ? null :
+            h("button", { class: "btn sm", onclick: () => reorderModal(p) }, "Reorder"),
+          p.group_id && state.staff?.operator?.role !== "cashier" ?
+            h("button", { class: "btn sm", onclick: () => classifyModal(p) }, "Classify") : null,
           h("button", { class: "btn ghost sm", onclick: () => showMovements(p) }, "History"),
           h("button", { class: "btn ghost sm", onclick: () => labelModal(p) }, "Label"))));
     })));
@@ -126,26 +134,37 @@ async function refresh() {
 }
 
 function stockModal(p) {
+  const cashier = state.staff?.operator?.role === "cashier";
+  const canReduce = !cashier || state.settings.cashier_allow_stock_reduction === "true";
   const type = h("select", { class: "input" },
-    h("option", { value: "RECEIPT" }, "Receive delivery (+)"),
-    h("option", { value: "ADJUSTMENT" }, "Stock correction (+ / -)"));
-  const amount = h("input", { class: "input", type: "number", step: "1", value: "1" });
+    h("option", { value: "RECEIPT" }, "Receive delivery"),
+    canReduce ? h("option", { value: "ADJUSTMENT" }, "Record documented shortage / damage") : null);
+  const amount = h("input", { class: "input", type: "number", min: "1", max: "1000000", step: "1", value: "1" });
   const reason = h("input", { class: "input", maxlength: "300", placeholder: "Supplier invoice / reason" });
   let modal;
   modal = openModal({ title: `Update stock · ${p.SKU}`, narrow: true,
     body: h("div", {},
       h("p", {}, `Current stock: ${p.quantity} units`),
       h("div", { class: "field" }, h("label", {}, "Operation"), type),
-      h("div", { class: "field" }, h("label", {}, "Quantity change (signed for corrections)"), amount),
+      h("div", { class: "field" }, h("label", {}, "Units (positive whole number)"), amount),
       h("div", { class: "field" }, h("label", {}, "Reason / supplier document"), reason),
-      h("p", { class: "form-hint" }, "Receiving adds units. Corrections can add or remove stock. This does not replace a full physical stocktake.")),
+      h("p", { class: "form-hint" }, "Receiving adds stock. Only an authorised operator can document a shortage. This does not replace a full physical stocktake.")),
     footer: [h("button", { class: "btn", onclick: () => modal.close() }, "Cancel"),
       h("button", { class: "btn primary", onclick: async () => {
-        const delta = Number(amount.value);
-        if (!Number.isSafeInteger(delta) || delta === 0 || (type.value === "RECEIPT" && delta < 0)) {
-          toast("Enter a valid non-zero whole quantity; receipts must be positive.", "warn"); return;
+        const text = amount.value.trim();
+        const units = /^\d+$/.test(text) ? Number(text) : NaN;
+        const correction = type.value === "ADJUSTMENT";
+        const delta = correction ? -units : units;
+        if (!Number.isSafeInteger(units) || units <= 0 || units > 1_000_000 ||
+            p.quantity + delta < 0 || (correction && !canReduce)) {
+          toast("Enter a valid positive whole quantity.", "warn"); return;
         }
-        if (!reason.value.trim()) { toast("Enter the reason or supplier reference.", "warn"); return; }
+        if (reason.value.trim().length < (correction ? 8 : 4) || reason.value.trim().length > 200) {
+          toast("Enter a reason or supplier reference (up to 200 characters).", "warn"); return;
+        }
+        if (correction && !await confirmDialog({ title: "Confirm stock shortage",
+          message: `Record ${units} damaged/missing units of ${p.SKU}? This reduces stock from ${p.quantity} to ${p.quantity - units}. Reason: ${reason.value.trim()}`,
+          confirmLabel: "Record shortage" })) return;
         try {
           await api.adjustStock(p.id, delta, reason.value.trim(), type.value);
           modal.close(); await refresh(); toast("Stock updated and recorded.", "success");

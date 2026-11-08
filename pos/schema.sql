@@ -296,7 +296,9 @@ CREATE TABLE IF NOT EXISTS payments (
   method TEXT NOT NULL CHECK (method IN ('CASH', 'CARD', 'UPI')),
   amount REAL NOT NULL CHECK (amount >= 0),
   is_partial BOOLEAN NOT NULL DEFAULT 0 CHECK (is_partial IN (0, 1)),
-  parent_payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL
+  parent_payment_id INTEGER REFERENCES payments(id) ON DELETE SET NULL,
+  reference TEXT NOT NULL DEFAULT '',
+  upi_utr TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS invoice_sequences (

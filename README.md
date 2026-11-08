@@ -105,7 +105,7 @@ pypos                             # console command, same flags as main.py
 ```bash
 ./run.sh                          # Windows: run.bat  (auto-creates .venv)
 # or manually:
-pip install -r requirements.txt   # just Flask
+pip install -r requirements.txt   # Flask, Waitress and QR generation
 python main.py                    # starts server + opens your browser
 ```
 

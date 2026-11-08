@@ -1,6 +1,6 @@
 #!/bin/sh
 # Run pyPOS from this folder with zero manual setup.
-# Creates a local .venv on first run, installs Flask, starts the register.
+# Creates a local .venv on first run, installs runtime dependencies, starts the register.
 set -e
 cd "$(dirname "$0")"
 
@@ -11,7 +11,7 @@ if [ ! -x "$PY" ]; then
     "$PY" -m pip install --quiet --upgrade pip
 fi
 
-if ! "$PY" -c "import flask" 2>/dev/null; then
+if ! "$PY" -c "import flask, waitress, qrcode" 2>/dev/null; then
     "$PY" -m pip install --quiet -r requirements.txt
 fi
 

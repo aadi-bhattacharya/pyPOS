@@ -18,7 +18,10 @@ SETTING_KEYS = {
     "pos_logo_mode": "default",  # default mark, receipt, custom, or none
     "pos_logo_size": "28",  # square icon width in POS sidebar, pixels
     "pos_logo": "",
-    "show_staff_menu": "true",  # Navigation only: never disables staff access control.
+    "show_staff_menu": "true",
+    "cashier_allow_stock_reduction": "false",  # Default denies manual reductions.
+    "cashier_allow_stock_import": "true",  # Existing approved SKU receipts only.
+    "cashier_max_discount_percent": "0",  # 0% by default; approve discounts in Settings.
     "show_receipt_logo": "true",
     "receipt_logo_width": "32",
     "receipt_paper": "80mm",
@@ -96,8 +99,12 @@ def save_settings(conn, values):
             value = gstin(value)
         elif key in ("store_logo", "pos_logo"):
             value = logo_data(value)
-        elif key == "show_staff_menu" and value not in ("true", "false"):
-            raise ValueError("Staff menu visibility must be true or false")
+        elif key in ("show_staff_menu", "cashier_allow_stock_reduction",
+                     "cashier_allow_stock_import") and value not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false")
+        elif key == "cashier_max_discount_percent":
+            if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= 100:
+                raise ValueError("Cashier maximum discount must be a whole percentage (0–100)")
         elif key == "pos_display_name":
             value = " ".join(value.split())
             if not 1 <= len(value) <= 48 or any(ord(c) < 32 or ord(c) == 127 for c in value):

@@ -14,11 +14,35 @@ machine as hostile. This module enforces that boundary:
 """
 
 from urllib.parse import urlparse
+import hmac
+import secrets
 
-from flask import jsonify, request
+from flask import jsonify, request, session
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "[::1]", "::1"}
 MUTATING_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+
+def issue_csrf_token():
+    """Generate a per-session token delivered only by our own served pages.
+
+    It gives legitimate Windows/browser clients a way to authenticate requests
+    where their browser emits the opaque ``Origin: null``. An opaque origin on
+    its own is never enough to authorize a write.
+    """
+    token = session.get("pypos_csrf_token")
+    if not isinstance(token, str) or len(token) < 32:
+        token = secrets.token_urlsafe(32)
+        session["pypos_csrf_token"] = token
+    return token
+
+
+def _valid_csrf_token():
+    presented = (request.headers.get("X-pyPOS-CSRF") or
+                 request.form.get("_csrf") or "")
+    expected = session.get("pypos_csrf_token")
+    return (isinstance(presented, str) and isinstance(expected, str)
+            and bool(expected) and hmac.compare_digest(expected, presented))
 
 
 def _hostname(netloc):
@@ -53,8 +77,19 @@ def _origin_allowed(value, allowed_hosts=None, target_origin=None):
     if (parsed.scheme not in ("http", "https") or not parsed.netloc or
             parsed.username is not None or parsed.password is not None):
         return False
-    return (parsed.scheme == current.scheme and
-            parsed.netloc.lower() == current.netloc.lower())
+    if parsed.scheme != current.scheme:
+        return False
+    if parsed.netloc.lower() == current.netloc.lower():
+        return True
+    # Windows shortcuts may open localhost while the desktop server resolves
+    # 127.0.0.1 (or vice versa). Only alias the same TCP port on loopback.
+    try:
+        return (parsed.hostname in ("localhost", "127.0.0.1", "::1") and
+                current.hostname in ("localhost", "127.0.0.1", "::1") and
+                parsed.port == current.port)
+    except ValueError:
+        return False
+    return False
 
 
 def install_security(app, extra_hosts=()):
@@ -79,14 +114,21 @@ def install_security(app, extra_hosts=()):
             origin = request.headers.get("Origin") or ""
             referer = request.headers.get("Referer") or ""
             source = origin or referer
-            # An opaque ("null") Origin is *not* proof of a same-origin
-            # request. Sandboxed iframes and file: pages can create one.
-            if source and not _origin_allowed(source, allowed, request.host_url):
+            # Browsers sometimes send an opaque Origin on Windows. Only our
+            # served UI can read the unpredictable, session-bound CSRF token.
+            # Do not trust Origin:null by itself: file: and sandboxed pages
+            # generate it too. Foreign explicit origins are *always* denied.
+            opaque = origin.strip().lower() == "null"
+            trusted = (_valid_csrf_token() if opaque else
+                       not source or _origin_allowed(source, allowed, request.host_url))
+            if not trusted:
                 return jsonify({
                     "error": "Forbidden — mutating requests from another "
                              "site are blocked (cross-site request shield).",
-                    "hint": f"request Origin was: {origin!r}, "
-                            f"Referer was: {referer!r}"}), 403
+                    "hint": (f"request Origin was: {origin!r}, Referer was: {referer!r}. "
+                             "Open the POS using its http://127.0.0.1 address "
+                             "and reload. Opaque-origin requests require a "
+                             "valid token from the served pyPOS page.")}), 403
         return None
 
     @app.after_request
@@ -100,7 +142,9 @@ def install_security(app, extra_hosts=()):
             "default-src 'self'; script-src 'self'; style-src 'self' "
             "'unsafe-inline'; img-src 'self' data:; connect-src 'self'; "
             "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
-        if request.path.startswith("/api/"):
+        if request.path.startswith("/api/") or request.path in (
+                "/", "/login", "/staff-login", "/staff-setup"):
+            # These pages contain per-session tokens; never cache them.
             resp.headers["Cache-Control"] = "no-store"
         return resp
 

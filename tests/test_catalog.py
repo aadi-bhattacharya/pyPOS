@@ -107,6 +107,10 @@ class CatalogTests(POSTestCase):
 
     def test_delete_product_without_sales(self):
         pid = self.mkproduct()
+        # Hardened deletion requires stock to be explicitly written off first.
+        with self.assertRaises(catalog.InvalidInputError):
+            catalog.delete_product(self.conn, pid)
+        catalog.adjust_stock(self.conn, pid, -5, reason="Recorded writeoff")
         catalog.delete_product(self.conn, pid)
         self.assertIsNone(catalog.get_product(self.conn, pid))
         with self.assertRaises(catalog.ProductNotFoundError):

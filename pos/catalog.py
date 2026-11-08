@@ -167,9 +167,28 @@ def _assign_barcode_on_update(conn, product_id, code, group_id, price):
         conn.execute("DELETE FROM barcode_price_options WHERE product_id=?", (product_id,))
         conn.execute("UPDATE products SET barcode=? WHERE id=?", (code, product_id))
 
-def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code="", unit_code="NOS"):
+def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_price, tax_rate, hsn_code="", unit_code="NOS", *, attributes=None, audit_actor=None):
+    if attributes is None:
+        attributes = {}
+    if not isinstance(attributes, dict) or len(attributes) > 40:
+        raise InvalidInputError("Product attributes must be an object of at most 40 name/value pairs")
+    validated_attrs = {}
+    for key, value in attributes.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise InvalidInputError("Variant attribute names and values must be text")
+        name = key.strip()
+        val = value.strip()
+        if not name or not val or len(name) > 80 or len(val) > 500:
+            raise InvalidInputError("Variant attributes need a name and value of reasonable length")
+        if name.casefold() in ("price review required", "gst review required", "cost review required", "manager review required"):
+            raise InvalidInputError("Reserved review flags cannot be set as product variants")
+        validated_attrs[name] = val
     if not SKU or not str(SKU).strip():
         raise InvalidInputError("SKU cannot be empty")
+    if type(quantity) is bool or not re.fullmatch(r"[0-9]+", str(quantity)):
+        raise InvalidInputError("Opening stock must be a non-negative whole quantity")
+    if int(quantity) > 1_000_000:
+        raise InvalidInputError("Opening stock cannot exceed 1,000,000 units")
     if price is None or float(price) < 0:
         raise InvalidInputError("Price cannot be negative")
     if quantity is None or int(quantity) < 0:
@@ -184,6 +203,10 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
     cur = conn.cursor()
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if conn.execute("SELECT 1 FROM products WHERE SKU = ? COLLATE NOCASE", (str(SKU).strip(),)).fetchone():
+            raise DuplicateSKUError(f"SKU '{SKU}' already exists (case-insensitive match)")
+        if audit_actor and audit_actor.get("role") == "cashier" and _barcode_owners(conn, str(barcode).strip() if barcode else None):
+            raise DuplicateBarcodeError("EAN already exists; a manager must approve an additional MRP edition")
         canonical, secondary = _safe_barcode_for_new_product(conn, barcode, group_id, price)
         cur.execute(sql, (
             group_id, str(SKU).strip(), canonical, float(price), int(quantity),
@@ -196,11 +219,24 @@ def add_product_to_group(conn, group_id, SKU, barcode, price, quantity, cost_pri
         if secondary:
             conn.execute("INSERT INTO barcode_price_options(product_id, barcode) VALUES(?,?)",
                          (pid, secondary))
+        if audit_actor and audit_actor.get("role") == "cashier":
+            username = str(audit_actor.get("username") or "unknown")[:60]
+            validated_attrs["Manager Review Required"] = f"New SKU created by operator={username}; verify MRP, tax and identity"
+            validated_attrs["Cost Review Required"] = "Purchase cost not entered; manager review required"
+        for name, value in validated_attrs.items():
+            conn.execute("INSERT INTO product_attributes(product_id, attribute_name, attribute_value) VALUES(?,?,?)",
+                         (pid, name, value))
+        if audit_actor and int(quantity) > 0:
+            actor = str(audit_actor.get("username") or "unknown")[:60]
+            role = str(audit_actor.get("role") or "unknown")[:20]
+            conn.execute("""UPDATE stock_movements SET reason=?
+                WHERE product_id=? AND kind='INITIAL_STOCK'""",
+                (f"Product created by operator={actor} role={role}", pid))
         conn.commit()
         return pid
-    except (sqlite3.IntegrityError, DuplicateBarcodeError) as e:
+    except (sqlite3.IntegrityError, DuplicateBarcodeError, DuplicateSKUError) as e:
         conn.rollback()
-        if isinstance(e, DuplicateBarcodeError):
+        if isinstance(e, (DuplicateBarcodeError, DuplicateSKUError)):
             raise
         message = str(e)
         if "SKU" in message:
@@ -394,22 +430,31 @@ def update_product(conn, product_id, *, verified_gst=False, verified_price=False
 
 
 def delete_product(conn, product_id):
-    sql = ''' DELETE FROM products WHERE id = ? '''
-    cur = conn.cursor()
+    """Never erase an SKU with stock on hand or a linked sales history.
+
+    A manager must first post a separately logged stock correction (and cannot
+    hide it by deleting the SKU immediately).
+    """
+    conn.execute("BEGIN IMMEDIATE")
     try:
-        cur.execute(sql, (product_id,))
+        row = conn.execute("SELECT quantity FROM products WHERE id=?", (product_id,)).fetchone()
+        if row is None:
+            raise ProductNotFoundError(f"No product with id {product_id}")
+        if row["quantity"] != 0:
+            raise InvalidInputError(
+                "Product still has stock. Record a documented stock adjustment before deletion")
+        cur = conn.execute("DELETE FROM products WHERE id=?", (product_id,))
         conn.commit()
+        return cur.rowcount
     except sqlite3.IntegrityError as e:
         conn.rollback()
         if "FOREIGN KEY" in str(e):
             raise ProductHasSalesError(
-                f"Product {product_id} has sales history and cannot be deleted"
-            ) from e
+                f"Product {product_id} has linked transaction history and cannot be deleted") from e
         raise CatalogError(str(e)) from e
-
-    if cur.rowcount == 0:
-        raise ProductNotFoundError(f"No product with id {product_id}")
-    return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _attach_attributes(conn, products):

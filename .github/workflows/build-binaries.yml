@@ -33,7 +33,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install build deps
-        run: pip install "Flask>=3.0" "waitress>=3.0" pyinstaller
+        run: pip install "Flask>=3.0" "waitress>=3.0" "qrcode>=7.4" pyinstaller
 
       # UPX compresses the frozen binary; PyInstaller no-ops safely if it's
       # absent, but installing it shrinks Linux/Windows builds noticeably.

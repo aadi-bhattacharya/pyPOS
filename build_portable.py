@@ -54,12 +54,12 @@ def main() -> int:
         #    a zipapp are importable only from its root, not subfolders.
         #    --ignore-installed keeps pip from cross-checking unrelated
         #    packages in the host environment (jupyter etc.).
-        print("Vendoring Flask...")
+        print("Vendoring Flask, Waitress and offline UPI QR generator...")
         subprocess.run(
             [sys.executable, "-m", "pip", "install",
              "--target", str(staging), "--ignore-installed",
              "--no-compile", "--quiet", "--upgrade",
-             "Flask>=3.0"],
+             "Flask>=3.0", "waitress>=3.0", "qrcode>=7.4"],
             check=True, capture_output=True, text=True)
 
         # 3. Entry point executed when the .pyz is run. The shebang makes

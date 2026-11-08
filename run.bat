@@ -43,13 +43,13 @@ if not exist "%PY%" (
   )
 )
 
-"%PY%" -c "import flask" >nul 2>&1
+"%PY%" -c "import flask, waitress, qrcode" >nul 2>&1
 if errorlevel 1 (
-  echo Installing Flask into the local environment (one-time, needs internet)...
+  echo Installing missing pyPOS dependencies (one-time, needs internet)...
   "%PY%" -m pip install --quiet -r requirements.txt
   if errorlevel 1 (
     echo.
-    echo  Could not install Flask. Check your internet connection and run
+    echo  Could not install pyPOS dependencies. Check your internet connection and run
     echo  this file again.
     pause
     exit /b 1

@@ -104,7 +104,7 @@ class AccountingSafetyTests(POSTestCase):
         # A new draft captures the latest count; uncounted second SKU stays intact.
         st2=operations.start_stocktake(self.conn,"Fresh count")
         operations.count_stock(self.conn,st2["id"],a,5)
-        operations.post_stocktake(self.conn,st2["id"])
+        operations.post_stocktake(self.conn,st2["id"], adjustment_reason="Verified shelf count")
         self.assertEqual(catalog.get_product(self.conn,a)["quantity"],5)
         self.assertEqual(catalog.get_product(self.conn,b)["quantity"],4)
         with self.assertRaises(operations.OperationError):

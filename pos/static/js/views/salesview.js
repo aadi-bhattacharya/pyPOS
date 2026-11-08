@@ -45,16 +45,19 @@ export async function renderSales(main) {
     "Sales CSV");
   const exportItems = h("a", { class: "btn", title: "Export ALL sale line items with recorded GST and HSN details" },
     "GST lines CSV");
+  const exportUPI = h("a", { class: "btn", title: "Export UPI references and bank UTRs for reconciliation (not verified by pyPOS)" },
+    "UPI CSV");
   const syncExports = () => {
     const qs = new URLSearchParams(dateRange()).toString();
     exportSales.href = `/api/export/sales.csv?${qs}`;
     exportItems.href = `/api/export/sale-lines.csv?${qs}`;
+    exportUPI.href = `/api/export/upi.csv?${qs}`;
   };
   syncExports();
   const head = h("div", { class: "view-head" }, title,
     h("div", { class: "view-actions" },
       h("a", { class: "btn primary", href: "#/refunds" }, icon("i-undo"), "Returns & refunds"),
-      exportSales, exportItems,
+      exportSales, exportItems, exportUPI,
       h("button", { class: "btn ghost icon-only", title: "Refresh transactions",
         onclick: () => loadRows(true) }, icon("i-refresh"))));
 
@@ -237,6 +240,13 @@ export async function detailModal(id) {
     narrow: true,
     body: h("div", {},
       receiptEl,
+      sale.payments?.some(p => p.method === "UPI" && (p.reference || p.upi_utr))
+        ? h("div", { class: "upi-internal-record" },
+          h("strong", {}, "Internal UPI reconciliation (not on receipt)"),
+          ...sale.payments.filter(p => p.method === "UPI").map(p =>
+            h("div", {}, `${fmt(p.amount)} · POS note: ${p.reference || "—"} · Bank UTR: ${p.upi_utr || "not entered"}`)),
+          h("div", { class: "form-hint" }, "Compare with merchant app or bank statement; these details are not automatic payment verification."))
+        : null,
       partialHint,
       sale.children && sale.children.length
         ? h("p", { class: "form-hint", style: "text-align:center;margin-top:10px" },

@@ -1,4 +1,4 @@
-import { api, state, refreshSettings, fmt } from "../api.js";
+import { api, state, refreshSettings, fmt, csrfHeaders } from "../api.js";
 import { h, icon, toast, toastError, confirmDialog, printReceipt } from "../ui.js";
 import { fmtDate } from "../api.js";
 import { DEFAULT_ACCENT, applyBranding, brandingPalette, normalizeAccent } from "../branding.js";
@@ -655,6 +655,56 @@ export async function renderSettingsView(main) {
         })()),
 
       h("div", { class: "card card-pad", style: "margin-top:16px" },
+        h("h3", { style: "margin-bottom:8px" }, "Sales staff inventory permissions"),
+        h("p", { class: "form-hint", style: "margin-bottom:12px" },
+          "Sales staff can sell stock as normal. These controls affect only manual inventory operations; every change is recorded."),
+        (() => {
+          const reduce = h("input", { type: "checkbox", checked: s.cashier_allow_stock_reduction === "true" });
+          const importAllowed = h("input", { type: "checkbox", checked: s.cashier_allow_stock_import !== "false" });
+          return h("div", {},
+            h("label", { class: "credit-toggle" }, importAllowed,
+              h("span", {}, "Allow cashiers to add stock and run additive imports")),
+            h("label", { class: "credit-toggle", style: "margin-top:10px" }, reduce,
+              h("span", {}, "Allow cashiers to reduce stock manually (off by default)")),
+            h("p", { class: "form-hint" },
+              "Cashier imports accept approved existing SKUs only. All manual movements require a reason. Cashiers cannot create/delete products or post stocktakes; manager/admin corrections remain audited. Enabling cashier reductions increases theft risk."),
+            h("button", { class: "btn primary", style: "margin-top:12px", onclick: async () => {
+              if (reduce.checked && s.cashier_allow_stock_reduction !== "true") {
+                if (!await confirmDialog({ title: "Enable cashier stock reductions?",
+                  message: "This lets cashiers manually reduce stock without manager approval. A reason will still be required and recorded, but this weakens theft controls. Only enable for a trusted, supervised operation.",
+                  confirmLabel: "Enable high-risk permission", danger: true })) return;
+              }
+              try {
+                state.settings = await api.saveSettings({
+                  cashier_allow_stock_reduction: String(reduce.checked),
+                  cashier_allow_stock_import: String(importAllowed.checked),
+                });
+                toast("Sales stock permissions saved.", "success");
+              } catch (e) { toastError(e); }
+            } }, icon("i-check"), "Save stock permissions"));
+        })()),
+
+      h("div", { class: "card card-pad", style: "margin-top:16px" },
+        h("h3", { style: "margin-bottom:8px" }, "Cashier discount limit"),
+        h("p", { class: "form-hint" },
+          "Cashiers cannot override catalogue prices. Maximum whole-sale discount defaults to 0%; change only for explicitly approved promotions."),
+        (() => {
+          const max = h("input", { type: "number", class: "input", min: "0", max: "100", step: "1",
+            style: "max-width:160px", value: s.cashier_max_discount_percent || "0" });
+          return h("div", {},
+            h("div", { class: "field" }, h("label", {}, "Maximum discount (%)"), max),
+            h("button", { class: "btn primary", onclick: async () => {
+              if (!/^(?:100|\d{1,2})$/.test(max.value)) {
+                toast("Enter a whole percentage between 0 and 100.", "warn"); return;
+              }
+              try {
+                state.settings = await api.saveSettings({ cashier_max_discount_percent: max.value });
+                toast("Cashier discount policy saved.", "success");
+              } catch (e) { toastError(e); }
+            } }, "Save discount policy"));
+        })()),
+
+      h("div", { class: "card card-pad", style: "margin-top:16px" },
         h("h3", { style: "margin-bottom:8px" }, "Sample data"),
         h("p", { style: "color:var(--text-2);margin-bottom:12px" },
           productsCount > 0
@@ -765,7 +815,7 @@ async function renderBackups(wrap) {
       const fd = new FormData();
       fd.append("file", f);
       try {
-        await fetch("/api/backups/upload-restore", { method: "POST", body: fd })
+        await fetch("/api/backups/upload-restore", { method: "POST", headers: csrfHeaders(), body: fd })
           .then(async (res) => {
             if (!res.ok) throw new Error((await res.json()).error || "Restore failed");
           });
@@ -912,7 +962,7 @@ function gdriveSection(status, refresh) {
           });
           if (!ok) return;
           try {
-            await fetch("/api/backups/gdrive/disconnect", { method: "POST" });
+            await fetch("/api/backups/gdrive/disconnect", { method: "POST", headers: csrfHeaders() });
             toast("Google Drive disconnected.", "success");
             refresh();
           } catch (e) { toastError(e); }
@@ -937,7 +987,7 @@ function gdriveSection(status, refresh) {
       try {
         const res = await fetch("/api/backups/gdrive/connect", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", ...csrfHeaders() },
           body: JSON.stringify({ client_id: clientIdIn.value.trim(),
                                  client_secret: secretIn.value.trim() }),
         });

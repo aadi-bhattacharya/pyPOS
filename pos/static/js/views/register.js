@@ -59,7 +59,7 @@ export async function renderRegister(main) {
     headerActions));
 
   // Cash status stays visible at the till instead of being buried in Reports.
-  // It is advisory: if fetching drawer status fails, billing still works.
+  // An open day is enforced server-side even if the status request fails.
   cashStripEl = h("section", { class: "reg-cash-strip", "aria-label": "Cash drawer" });
   rootEl.append(cashStripEl);
   void renderCashStatusStrip(cashStripEl);
@@ -496,6 +496,13 @@ function cartTotals() {
 }
 
 function renderCart() {
+  // A saved or recalled manager cart may contain an old discount.  Do not
+  // keep a hidden discount active when a cashier takes over the register.
+  if (state.staff?.operator?.role === "cashier" &&
+      Number(state.settings.cashier_max_discount_percent || 0) === 0 && discountValue !== 0) {
+    discountValue = 0;
+    saveCart();
+  }
   cartLinesEl.innerHTML = "";
   cartSummaryEl.innerHTML = "";
 
@@ -572,17 +579,25 @@ function renderCart() {
 
   const sumRows = [
     h("div", { class: "sum-row discount-edit" }, customerBox),
-    h("div", { class: "reg-salesperson-field" },
-      h("label", { for: "reg-salesperson" }, "Salesperson ",
-        h("span", { class: "reg-salesperson-optional" }, "(optional · internal only)")),
-      h("input", { id: "reg-salesperson", class: "input", type: "text",
-        maxlength: "80", autocomplete: "off", placeholder: "Name for sales tracking",
-        value: salesperson, oninput: (e) => {
-          salesperson = e.target.value;
-          saveCart();
-        },
-      })),
-    h("div", { class: "sum-row discount-edit" },
+    state.staff?.operator?.role === "cashier"
+      ? h("div", { class: "reg-salesperson-field" },
+          h("label", {}, "Salesperson"),
+          h("div", { class: "form-hint" },
+            `${state.staff.operator.username} (signed-in operator)`))
+      : h("div", { class: "reg-salesperson-field" },
+          h("label", { for: "reg-salesperson" }, "Salesperson ",
+            h("span", { class: "reg-salesperson-optional" }, "(optional · internal only)")),
+          h("input", { id: "reg-salesperson", class: "input", type: "text",
+            maxlength: "80", autocomplete: "off", placeholder: "Name for sales tracking",
+            value: salesperson, oninput: (e) => {
+              salesperson = e.target.value;
+              saveCart();
+            },
+          })),
+    (state.staff?.operator?.role === "cashier" && Number(state.settings.cashier_max_discount_percent || 0) === 0)
+      ? h("div", { class: "sum-row discount-edit" },
+          h("span", {}, "Discount"), h("span", { class: "form-hint" }, "Manager approval required"))
+      : h("div", { class: "sum-row discount-edit" },
       h("span", {}, "Discount"),
       h("input", {
         class: "input", type: "number", min: "0", step: "any",
@@ -766,10 +781,13 @@ async function parkFlow() {
       { hour: "2-digit", minute: "2-digit" }),
   });
   const okBtn = h("button", { class: "btn primary" }, icon("i-pause"), "Park sale");
+  let parking = false;
   okBtn.addEventListener("click", async () => {
+    if (parking) return;
+    parking = true;
+    okBtn.disabled = true;
     try {
       await api.parkCart({
-        request_id: checkoutRequestId,
         items: [...cart.entries()].map(([product_id, quantity]) =>
           ({ product_id, quantity })),
         label: labelInput.value.trim(),
@@ -790,6 +808,9 @@ async function parkFlow() {
       toast("Sale parked — pick it up any time from Parked.", "success");
     } catch (e) {
       toastError(e);
+    } finally {
+      parking = false;
+      okBtn.disabled = false;
     }
   });
   const m = openModal({
@@ -929,8 +950,18 @@ async function refreshCatalog() {
   renderTiles();
 }
 
-function openPayment() {
+async function openPayment() {
   if (cart.size === 0) return;
+  try {
+    const session = await api.currentSession();
+    if (!session || !session.session || session.session.closed_at) {
+      toast("Start Day in Cash Drawer before collecting payment.", "warn");
+      return;
+    }
+  } catch (e) {
+    toastError(e, "Cannot verify open cash session");
+    return;
+  }
   const t = cartTotals();
   const creditAvailable = customer && useCredit !== false
     ? Math.min(Number(customer.store_credit || 0), t.total)
@@ -982,9 +1013,58 @@ function openPayment() {
     const input = h("input", {
       class: "input num", type: "number", min: "0", step: "any",
       placeholder: "0.00", value: amount,
-      oninput: () => update(),
+      oninput: () => {
+        if (select.value === "UPI") {
+          checked.checked = false;
+          utrInput.value = "";
+        }
+        update();
+      },
     });
-    const row = { select, input };
+    const note = h("span", { class: "upi-reference" }, "Preparing reference…");
+    const utrInput = h("input", { class: "input", maxlength: "40", autocomplete: "off",
+      placeholder: "Enter actual UPI UTR (from payment details)" });
+    const checked = h("input", { type: "checkbox" });
+    const showQR = h("button", { class: "btn sm", type: "button", onclick: async () => {
+      if (!row.reference) await ensureReference(row);
+      if (!row.reference) return;
+      if (!state.settings.store_upi_id) {
+        toast("Set your UPI ID under Settings → Store first. You can still use the reference note.", "warn");
+        return;
+      }
+      const amount = Number(input.value);
+      if (!Number.isFinite(amount) || amount <= 0 ||
+          Math.abs(amount * 100 - Math.round(amount * 100)) > 1e-7) {
+        return toast("Enter an exact UPI amount in rupees and paise.", "warn");
+      }
+      const qs = new URLSearchParams({ amount: amount.toFixed(2), ref: row.reference });
+      const qrImg = h("img", { src: `/api/upi/qr.svg?${qs.toString()}`,
+        alt: `UPI payment QR for ${row.reference}`, class: "upi-qr-image" });
+      const m = openModal({ title: "UPI — scan to pay", narrow: true,
+        body: h("div", { class: "upi-qr-box" },
+          h("b", {}, fmt(amount)), qrImg,
+          h("div", {}, `Merchant: ${state.settings.store_upi_id}`),
+          h("code", {}, row.reference),
+          h("p", { class: "form-hint" },
+            "Merchant reference is not a bank UTR. Check payment in your merchant/bank app before completing the sale.")),
+        footer: [h("button", { class: "btn primary", onclick: () => m.close() }, "Close QR")],
+      });
+    } }, "Show QR");
+    const copyRef = h("button", { class: "btn sm", type: "button", onclick: async () => {
+      if (!row.reference) await ensureReference(row);
+      if (!row.reference) return;
+      try { await navigator.clipboard.writeText(row.reference); toast("Reference copied.", "success"); }
+      catch (_) { toast(`Reference: ${row.reference}`); }
+    } }, "Copy reference");
+    const extra = h("div", { class: "upi-extra", hidden: method !== "UPI" },
+      h("div", { class: "upi-ref-line" },
+        h("span", {}, "Ask payer to include note:"), note, copyRef, showQR),
+      utrInput,
+      h("label", { class: "credit-toggle" }, checked,
+        h("span", {}, "I checked that this UPI payment was received (manual confirmation)")),
+      h("div", { class: "form-hint" },
+        "POS reference is generated locally; the bank issues the actual UTR after payment."));
+    const row = { select, input, extra, checked, utrInput, reference: "", refTask: null };
     row.el = h("div", { class: "pay-row" },
       select,
       input,
@@ -996,8 +1076,33 @@ function openPayment() {
           row.el.remove();
           update();
         },
-      }, icon("i-x")));
-    select.addEventListener("change", update);
+      }, icon("i-x")), extra);
+    async function ensureReference(r) {
+      if (r.reference) return r.reference;
+      if (!r.refTask) r.refTask = api.upiReference().then(data => {
+        r.reference = data.reference;
+        note.textContent = r.reference;
+        update();
+        return r.reference;
+      }).catch(e => {
+        r.refTask = null; // A transient API error must not permanently disable this row.
+        note.textContent = "Reference unavailable";
+        toastError(e);
+        return "";
+      });
+      return r.refTask;
+    }
+    const syncMethod = () => {
+      // A confirmation applies only to the exact tender method and amount.
+      checked.checked = false;
+      utrInput.value = "";
+      extra.hidden = select.value !== "UPI";
+      if (select.value === "UPI") void ensureReference(row);
+      update();
+    };
+    select.addEventListener("change", syncMethod);
+    checked.addEventListener("change", update);
+    if (method === "UPI") void ensureReference(row);
     payRows.push(row);
     rowsWrap.append(row.el);
     setTimeout(() => input.focus(), 20);
@@ -1027,7 +1132,9 @@ function openPayment() {
       remainingEl.textContent = "Fully covered ✓";
       remainingEl.className = "pay-remaining covered";
     }
-    completeBtn.disabled = !result.valid || !result.covered ||
+    const upiUnconfirmed = payRows.some(r => r.select.value === "UPI" &&
+      Number(r.input.value) > 0 && (!r.checked.checked || !r.reference));
+    completeBtn.disabled = !result.valid || !result.covered || upiUnconfirmed ||
       (payments().length === 0 && creditApplied <= 0);
     const changeDue = result.valid ? result.change : 0;
     if (changeDue > 0) {
@@ -1097,6 +1204,11 @@ function openPayment() {
     `ck_${Date.now()}_${Math.random().toString(36).slice(2)}`).replace(/-/g, "_");
   let modal;
   async function finishSale() {
+    if (payRows.some(r => r.select.value === "UPI" && Number(r.input.value) > 0 &&
+      (!r.reference || !r.checked.checked))) {
+      toast("Confirm each UPI payment in the merchant app before completing this sale.", "warn");
+      return;
+    }
     completeBtn.disabled = true;
     completeBtn.replaceChildren(icon("i-check"), " Saving…");
     try {
@@ -1108,6 +1220,8 @@ function openPayment() {
           .map((r) => ({
             method: r.select.value,
             amount: parseFloat(r.input.value) || 0,
+            reference: r.select.value === "UPI" ? r.reference : "",
+            upi_utr: r.select.value === "UPI" ? r.utrInput.value.trim() : "",
           }))
           .filter((p) => p.amount > 0),
         discount: t.discount > 0

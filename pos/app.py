@@ -1,9 +1,11 @@
 import csv
 import html
 import io
+import re
 import secrets
 import sqlite3
 from datetime import datetime
+from urllib.parse import urlencode
 from pathlib import Path
 
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_file, session
@@ -19,8 +21,9 @@ from pos import loyalty
 from pos import catalog_import
 from pos import operations
 from pos import staff
+from pos import stock_policy
 from pos.demo import seed_demo_data
-from pos.security import install_security
+from pos.security import install_security, issue_csrf_token
 from pos.india import LOGO_PATTERN
 
 NOT_FOUND_ERRORS = (
@@ -45,64 +48,182 @@ CONFLICT_ERRORS = (
 
 _LOGIN_PAGE = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>{brand_name} — Settings login</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{page_title} · {brand_name}</title>
 <link rel="stylesheet" href="/static/css/app.css">
-<style>
-  body {{ display: grid; place-items: center; min-height: 100vh; margin: 0; }}
-  .login-card {{ width: 320px; padding: 28px 30px; }}
-  .login-brand {{ text-align: center; margin-bottom: 18px; }}
-  .login-brand .brand-mark {{ display: inline-grid; place-items: center;
-    width: 40px; height: 40px; border-radius: 9px; background: {accent};
-    color: {foreground}; font-weight: 800; font-size: 20px; }}
-  .login-brand .brand-mark.has-image {{ background: #fff; border: 1px solid var(--border); overflow:hidden; }}
-  .login-brand .brand-mark img {{ width: 100%; height: 100%; object-fit: contain; }}
-  .login-brand h1 {{ font-size: 15px; margin: 8px 0 2px; }}
-  .login-brand p {{ margin: 0; color: var(--muted); font-size: 12px; }}
-  .login-error {{ color: var(--danger); font-size: 12.5px; font-weight: 600;
-    margin-bottom: 10px; }}
-  .login-hint {{ color: var(--muted); font-size: 12.5px; }}
-</style></head>
-<body>
-  <div class="card login-card">
-    <div class="login-brand">
+<link rel="stylesheet" href="/static/css/login.css">
+<script type="module" src="/static/js/login.js"></script>
+</head><body class="auth-page auth-page--{mode}" style="--auth-brand-accent:{accent};--auth-brand-foreground:{foreground}">
+<main class="auth-layout">
+  {intro}
+  <section class="card auth-panel" aria-labelledby="auth-title">
+    <header class="auth-brand">
       {brand_mark}
-      <h1>{brand_name}</h1>
-      <p>Settings access</p>
+      <span class="auth-brand-name">{brand_name}</span>
+    </header>
+    <div class="auth-head">
+      <span class="auth-eyebrow">{eyebrow}</span>
+      <h1 id="auth-title">{page_heading}</h1>
+      <p>{page_description}</p>
     </div>
     {error}
     {body}
-  </div>
+  </section>
+</main>
 </body></html>"""
 
 
-def _login_page(error="", body=None, next="/#/settings", escaped_next=None, branding=None):
+_SETUP_INTRO = """
+<aside class="auth-intro" aria-label="First-time setup guide">
+  <span class="auth-intro-tag">FIRST-TIME SETUP</span>
+  <h2>Make this register yours.</h2>
+  <p>Create the first administrator account on this computer. You can add
+     cashier accounts and set their permissions later.</p>
+  <ol class="auth-steps">
+    <li><span class="auth-step-num">1</span><div><strong>Create your account</strong>
+        <span>Choose a name, username and secure login details</span></div></li>
+    <li><span class="auth-step-num">2</span><div><strong>Open the register</strong>
+        <span>You will be signed in automatically after setup</span></div></li>
+    <li><span class="auth-step-num">3</span><div><strong>Start the day</strong>
+        <span>Open your cash session before taking payments</span></div></li>
+  </ol>
+  <p class="auth-preserve">Your existing products, sales and inventory are kept.</p>
+</aside>"""
+
+
+def _login_page(error="", body=None, next="/#/settings", escaped_next=None,
+                branding=None, mode="settings"):
+    """Shared shell for staff setup, staff sign-in and Settings password."""
     if body is None:
         body = """
-    <form method="post" action="/login">
+    <form class="auth-form" method="post" action="/login">
       <input type="hidden" name="next" value="{next}">
-      <div class="field"><label for="pw">Admin password</label>
-        <input class="input" type="password" id="pw" name="password"
-               autofocus autocomplete="current-password" required></div>
-      <button class="btn primary block" type="submit">Log in</button>
+      <div class="field"><label for="pw">Administrator password</label>
+        <div class="auth-secret"><input class="input" type="password" id="pw" name="password"
+             autofocus autocomplete="current-password" required>
+          <button class="auth-reveal" type="button" data-reveal="pw"
+             aria-controls="pw" aria-pressed="false" aria-label="Show administrator password">Show</button>
+        </div>
+        <p class="auth-field-help">This is the Settings password, not your daily register PIN.</p>
+      </div>
+      <button class="btn primary block auth-submit" type="submit">Unlock Settings</button>
     </form>""".format(
-            next=html.escape(escaped_next if escaped_next is not None else next))
+            next=html.escape(escaped_next if escaped_next is not None else next, quote=True))
+    # CSRF token is generated for the browser's session, not a global value.
+    field = '<input type="hidden" name="_csrf" value="' + issue_csrf_token() + '">'
+    body = re.sub(r'(<form\b[^>]*\bmethod=["\']post["\'][^>]*>)',
+                  lambda match: match.group(1) + field, body,
+                  flags=re.IGNORECASE)
     branding = branding or {}
     name = str(branding.get("pos_display_name") or "pyPOS").strip() or "pyPOS"
     raw_color = str(branding.get("pos_accent_color") or "#1B6BB5")
-    import re
     color = raw_color if re.fullmatch(r"#[0-9A-Fa-f]{6}", raw_color) else "#1B6BB5"
     rgb = [int(color[i:i + 2], 16) for i in (1, 3, 5)]
     foreground = "#151515" if sum(x * w for x, w in zip(rgb, (0.299, 0.587, 0.114))) / 255 > 0.58 else "#ffffff"
-    mode = branding.get("pos_logo_mode") or "default"
-    src = branding.get("pos_logo") if mode == "custom" else branding.get("store_logo") if mode == "receipt" else ""
+    logo_mode = branding.get("pos_logo_mode") or "default"
+    src = (branding.get("pos_logo") if logo_mode == "custom" else
+           branding.get("store_logo") if logo_mode == "receipt" else "")
     if isinstance(src, str) and LOGO_PATTERN.fullmatch(src):
         mark = f'<span class="brand-mark has-image"><img alt="" src="{html.escape(src, quote=True)}"></span>'
     else:
-        # Use a plain text initial, escaped even for user-supplied store names.
-        mark = f'<span class="brand-mark">{html.escape(name[0].upper())}</span>' if mode != "none" else ""
-    return _LOGIN_PAGE.format(error=error, body=body, brand_name=html.escape(name),
-                              brand_mark=mark, accent=color, foreground=foreground)
+        mark = (f'<span class="brand-mark">{html.escape(name[0].upper())}</span>'
+                if logo_mode != "none" else "")
+    pages = {
+        "setup": ("Create administrator account", "Administrator setup",
+                  "Create your account", "First-time setup on this computer"),
+        "staff": ("Staff sign in", "STAFF SIGN IN", "Welcome back",
+                  "Sign in with your staff username and PIN to open the register."),
+        "settings": ("Settings sign in", "SETTINGS ACCESS", "Administrator verification",
+                     "Enter your Settings password to continue."),
+    }
+    if mode not in pages:
+        mode = "settings"
+    title, eyebrow, heading, description = pages[mode]
+    return _LOGIN_PAGE.format(
+        error=error, body=body, brand_name=html.escape(name),
+        brand_mark=mark, accent=color, foreground=foreground,
+        intro=_SETUP_INTRO if mode == "setup" else "", mode=mode,
+        page_title=html.escape(title), eyebrow=eyebrow,
+        page_heading=heading, page_description=description)
+
+
+def _staff_setup_form(existing_password=False, username="", display_name=""):
+    """Explain the two credentials explicitly; retain safe, non-secret input on errors."""
+    user = html.escape(str(username or ""), quote=True)
+    display = html.escape(str(display_name or ""), quote=True)
+    password_label = ("Existing administrator password" if existing_password
+                      else "Create administrator password")
+    password_help = ("Use the password already configured in Settings. It is different from the register PIN."
+                     if existing_password else
+                     "Protects Settings, staff permissions and backups. Use a strong password, distinct from your PIN.")
+    password_auto = "current-password" if existing_password else "new-password"
+    return f"""<form class="auth-form" method="post" action="/staff-setup">
+      <section class="auth-form-section" aria-labelledby="setup-identity">
+        <h2 id="setup-identity" class="auth-section-heading">Account details</h2>
+        <div class="field">
+          <label for="setup-name">Your name</label>
+          <input class="input" id="setup-name" type="text" name="display_name"
+            placeholder="e.g. Store owner" value="{display}" autocomplete="name"
+            maxlength="100" required autofocus>
+          <p class="auth-field-help">Shown on sales and staff activity records.</p>
+        </div>
+        <div class="field">
+          <label for="setup-username">Login username</label>
+          <input class="input" id="setup-username" type="text" name="username"
+            placeholder="e.g. owner" value="{user}" autocomplete="username"
+            autocapitalize="none" spellcheck="false" maxlength="32"
+            pattern="[A-Za-z][A-Za-z0-9_.-]{{2,31}}" required
+            aria-describedby="username-help">
+          <p class="auth-field-help" id="username-help">Use 3–32 characters. Start with a letter; then letters, numbers, dots, dashes or underscores.</p>
+        </div>
+      </section>
+      <section class="auth-form-section" aria-labelledby="setup-credentials">
+        <h2 id="setup-credentials" class="auth-section-heading">Sign-in &amp; security</h2>
+        <div class="field">
+          <label for="setup-pin">Register PIN</label>
+          <div class="auth-secret"><input class="input" id="setup-pin" type="password" name="pin"
+            placeholder="6–12 digits" autocomplete="new-password" inputmode="numeric"
+            pattern="[0-9]{{6,12}}" minlength="6" maxlength="12" required>
+            <button class="auth-reveal" type="button" data-reveal="setup-pin"
+              aria-controls="setup-pin" aria-pressed="false" aria-label="Show register PIN">Show</button>
+          </div>
+          <p class="auth-field-help">Use this PIN when opening the register each shift. Do not share it with cashiers.</p>
+        </div>
+        <div class="field">
+          <label for="setup-admin-password">{password_label}</label>
+          <div class="auth-secret"><input class="input" id="setup-admin-password" type="password"
+            name="admin_password" autocomplete="{password_auto}" required>
+            <button class="auth-reveal" type="button" data-reveal="setup-admin-password"
+              aria-controls="setup-admin-password" aria-pressed="false"
+              aria-label="Show administrator password">Show</button>
+          </div>
+          <p class="auth-field-help">{password_help}</p>
+        </div>
+      </section>
+      <button class="btn primary block auth-submit" type="submit">Create administrator &amp; open register</button>
+      <p class="auth-footnote">This is the first administrator account. Add individual cashier accounts in Settings afterward.</p>
+    </form>"""
+
+
+def _staff_login_form(username=""):
+    safe_username = html.escape(str(username or ""), quote=True)
+    return f"""<form class="auth-form" method="post" action="/staff-login">
+      <div class="field"><label for="staff-username">Username</label>
+        <input class="input" id="staff-username" name="username"
+          value="{safe_username}" placeholder="e.g. cashier01"
+          autocomplete="username" autocapitalize="none" spellcheck="false"
+          required autofocus></div>
+      <div class="field"><label for="staff-pin">Register PIN</label>
+        <div class="auth-secret"><input class="input" id="staff-pin" name="pin"
+          type="password" inputmode="numeric" autocomplete="current-password"
+          placeholder="Your 6–12 digit PIN" required>
+          <button class="auth-reveal" type="button" data-reveal="staff-pin"
+            aria-controls="staff-pin" aria-pressed="false" aria-label="Show register PIN">Show</button>
+        </div>
+      </div>
+      <button class="btn primary block auth-submit" type="submit">Sign in to register</button>
+      <p class="auth-footnote">Need an account or having trouble signing in? Ask your store administrator.</p>
+    </form>"""
 
 
 def _assets_on_disk() -> bool:
@@ -144,6 +265,7 @@ def create_app(db_path=None, extra_hosts=()):
     app.jinja_env.auto_reload = False
     install_security(app, extra_hosts)
     _ensure_session_secret(app)
+    app.config["STAFF_BOOT_NONCE"] = secrets.token_urlsafe(24)
 
     def _admin_password():
         conn = connect(app.config.get("DB_PATH"))
@@ -170,8 +292,8 @@ def create_app(db_path=None, extra_hosts=()):
         finally:
             conn.close()
 
-    # Staff PIN access is opt-in. Existing single-operator installs are unaffected
-    # until an administrator deliberately enrols the first staff account.
+    # On first launch staff enrollment is mandatory. Existing catalogue and
+    # financial records remain intact; no default PIN is created.
     @app.before_request
     def _staff_guard():
         if request.path.startswith("/static/"):
@@ -181,9 +303,18 @@ def create_app(db_path=None, extra_hosts=()):
             enabled = staff.configured(conn)
             g.staff_enabled = enabled
             if not enabled:
+                # An unconfigured installation must enroll an administrator
+                # before opening a live till. Static assets and enrollment
+                # stay accessible, business APIs do not.
+                if request.path == "/":
+                    return redirect("/staff-setup")
+                if request.path.startswith("/api/") and request.path not in (
+                        "/api/staff/status", "/api/settings/auth"):
+                    return jsonify({"error":"Set up the first sales login", "code":"staff_setup_required"}), 403
                 return None
             actor = staff.get_user(conn, session.get("staff_user_id")) if session.get("staff_user_id") else None
-            g.staff_actor = actor if actor and actor["active"] else None
+            g.staff_actor = actor if (actor and actor["active"] and
+                session.get("staff_boot_nonce") == app.config["STAFF_BOOT_NONCE"]) else None
         finally:
             conn.close()
         if request.path == "/":
@@ -199,6 +330,9 @@ def create_app(db_path=None, extra_hosts=()):
         # A manager with Settings authentication must still not gain access to
         # the operator database or private backup downloads.
         if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+            if g.staff_actor["role"] == "cashier" and (
+                    path.startswith(("/api/backups", "/api/staff/", "/api/export/"))):
+                return jsonify({"error":"Manager access required", "code":"staff_forbidden"}),403
             if path.startswith(("/api/backups", "/api/staff/")) and g.staff_actor["role"] != "admin":
                 return jsonify({"error":"Administrator access required", "code":"staff_forbidden"}),403
             return None
@@ -209,10 +343,34 @@ def create_app(db_path=None, extra_hosts=()):
                     "/api/categories", "/api/catalog/import", "/api/suppliers",
                     "/api/purchases", "/api/stocktakes", "/api/cash-sessions")) or
                    (path.startswith("/api/sales/") and
-                    (path.endswith("/refund") or path.endswith("/void"))) or
+                    (path.endswith("/refund") or path.endswith("/refund/preview") or path.endswith("/void"))) or
                    (path.startswith("/api/customers/") and
                     any(x in path for x in ("/credit", "/loyalty/"))))
         role=g.staff_actor["role"]
+        if role == "cashier":
+            flags = settings_mod.get_all_settings(get_db())
+            if path.startswith("/api/products/") and path.endswith("/stock") and request.method == "POST":
+                # Full sign/range/reason validation also occurs in api_stock.
+                manager = False
+            # Creating new catalogue records is normal counter work. Mutating an
+            # existing record (price, barcode, variant, deletion) remains restricted.
+            if request.method == "POST" and path in ("/api/products", "/api/groups"):
+                manager = False
+            if path.startswith("/api/catalog/import/"):
+                if flags.get("cashier_allow_stock_import") != "true":
+                    return jsonify({"error":"Sales staff stock importing is disabled by the administrator"}), 403
+                try:
+                    stock_policy.cashier_import_mode(
+                        request.form.get("mode", "skip"),
+                        request.form.get("allow_zero_prices", "false").lower() == "true",
+                        request.form.get("force_repeat", "false").lower() == "true")
+                except stock_policy.InventoryForbidden as exc:
+                    return jsonify({"error":str(exc), "code":"staff_forbidden"}),403
+                manager = False
+            if path == "/api/customers" and request.method == "DELETE":
+                manager = True
+            if path.startswith("/api/customers/") and request.method == "DELETE":
+                manager = True
         if (admin and role != "admin") or (manager and role == "cashier"):
             return jsonify({"error":"Manager or administrator access required", "code":"staff_forbidden"}),403
         return None
@@ -226,12 +384,54 @@ def create_app(db_path=None, extra_hosts=()):
             conn=connect(app.config.get("DB_PATH"))
             try:
                 staff.audit(conn,actor,request.method,
-                    request.url_rule.rule if request.url_rule else request.path,response.status_code)
+                    request.path, response.status_code)
             except Exception:
                 app.logger.exception("Staff audit write failed")
             finally:
                 conn.close()
         return response
+
+    @app.route("/staff-setup", methods=["GET", "POST"])
+    def staff_setup():
+        conn = connect(app.config.get("DB_PATH"))
+        try:
+            if staff.configured(conn):
+                return redirect("/staff-login")
+            # Initial enrollment cannot be performed from a remote/LAN client.
+            if request.remote_addr not in ("127.0.0.1", "::1", "localhost"):
+                return fail(403, "First-run staff enrollment is local-only")
+            stored = settings_mod.get_all_settings(conn).get("admin_password") or ""
+            error = ""
+            if request.method == "POST":
+                password = str(request.form.get("admin_password") or "")
+                if auth.is_configured(stored):
+                    valid = auth.verify_password(password, stored)
+                else:
+                    valid = len(password) >= auth.MIN_PASSWORD_LEN
+                if not valid:
+                    error = '<div class="login-error" role="alert">Check the administrator password. If this is a new setup, create a password of at least 4 characters.</div>'
+                    auth.throttle_failed_login()
+                else:
+                    try:
+                        if not auth.is_configured(stored):
+                            settings_mod.save_settings(conn, {"admin_password": auth.hash_password(password)})
+                        user = staff.add_user(conn, request.form.get("username"),
+                           request.form.get("display_name"), "admin", request.form.get("pin"))
+                        conn.commit()
+                        session.clear()
+                        session["staff_user_id"] = user["id"]
+                        session["staff_boot_nonce"] = app.config["STAFF_BOOT_NONCE"]
+                        return redirect("/#/register")
+                    except (staff.StaffError, ValueError) as exc:
+                        error = '<div class="login-error" role="alert">' + html.escape(str(exc)) + '</div>'
+            return _login_page(error=error,
+                body=_staff_setup_form(
+                    existing_password=auth.is_configured(stored),
+                    username=request.form.get("username") if request.method == "POST" else "",
+                    display_name=request.form.get("display_name") if request.method == "POST" else ""),
+                branding=_login_branding(), mode="setup")
+        finally:
+            conn.close()
 
     @app.route("/staff-login", methods=["GET","POST"])
     def staff_login():
@@ -243,23 +443,22 @@ def create_app(db_path=None, extra_hosts=()):
             if request.method=="POST":
                 actor=staff.verify_login(conn,request.form.get("username"),request.form.get("pin"))
                 if actor:
-                    session["staff_user_id"]=actor["id"]
+                    session.clear()
+                    session["staff_user_id"] = actor["id"]
+                    session["staff_boot_nonce"] = app.config["STAFF_BOOT_NONCE"]
                     return redirect("/#/register")
                 auth.throttle_failed_login()
-                error='<div class="login-error">Incorrect username or PIN.</div>'
+                error='<div class="login-error" role="alert">Incorrect username or PIN. Check your details and try again.</div>'
         finally:
             conn.close()
-        form='''<form method="post" action="/staff-login">
-          <div class="field"><label>Staff username</label><input class="input" name="username"
-            autocomplete="username" required autofocus></div>
-          <div class="field"><label>PIN</label><input class="input" name="pin" type="password"
-            inputmode="numeric" autocomplete="current-password" required></div>
-          <button class="btn primary block" type="submit">Open register</button></form>'''
-        return _login_page(error=error,body=form,branding=_login_branding())
+        return _login_page(error=error,
+            body=_staff_login_form(request.form.get("username") if request.method == "POST" else ""),
+            branding=_login_branding(), mode="staff")
 
     @app.get("/staff-logout")
     def staff_logout():
         session.pop("staff_user_id",None)
+        session.pop("staff_boot_nonce",None)
         session.pop("settings_auth",None)
         return redirect("/staff-login")
 
@@ -321,7 +520,7 @@ def create_app(db_path=None, extra_hosts=()):
                 return redirect(_safe_next())
             auth.throttle_failed_login()
             return _login_page(
-                error='<div class="login-error">Wrong password.</div>',
+                error='<div class="login-error" role="alert">Wrong password.</div>',
                 next=_safe_next(), branding=branding)
 
         if auth.is_authenticated():
@@ -398,6 +597,7 @@ def create_app(db_path=None, extra_hosts=()):
         def index():
             html = resources.files("pos").joinpath(
                 "templates", "index.html").read_text(encoding="utf-8")
+            html = html.replace("{{ csrf_token }}", issue_csrf_token())
             return Response(html, mimetype="text/html")
 
     def get_db():
@@ -441,7 +641,7 @@ def create_app(db_path=None, extra_hosts=()):
     if assets_ok:
         @app.get("/")
         def index():
-            return render_template("index.html")
+            return render_template("index.html", csrf_token=issue_csrf_token())
 
     # ---------------- groups ----------------
     @app.get("/api/groups")
@@ -508,6 +708,9 @@ def create_app(db_path=None, extra_hosts=()):
             get_db(), query=q, group_id=group_id,
             low_stock_threshold=threshold, limit=limit, offset=offset,
         )
+        if g.staff_actor["role"] == "cashier":
+            for row in rows:
+                row["cost_price"] = None
         return jsonify(rows)
 
     @app.get("/api/lookup")
@@ -518,6 +721,12 @@ def create_app(db_path=None, extra_hosts=()):
         row = catalog.find_by_code(get_db(), code)
         if row is None:
             return fail(404, f"No product with SKU/barcode '{code}'")
+        if g.staff_actor["role"] == "cashier":
+            if "matches" in row:
+                for match in row["matches"]:
+                    match["cost_price"] = None
+            else:
+                row["cost_price"] = None
         return jsonify(row)
 
     @app.get("/api/products/<int:pid>")
@@ -525,11 +734,19 @@ def create_app(db_path=None, extra_hosts=()):
         row = catalog.get_product(get_db(), pid)
         if row is None:
             return fail(404, f"No product with id {pid}")
+        if g.staff_actor["role"] == "cashier":
+            row["cost_price"] = None
         return jsonify(row)
 
     @app.post("/api/products")
     def api_products_create():
         data = body()
+        cashier = g.staff_actor["role"] == "cashier"
+        if cashier:
+            try:
+                stock_policy.cashier_new_product(data)
+            except stock_policy.InventoryForbidden as exc:
+                return jsonify({"error": str(exc), "code": "staff_forbidden"}), 403
         pid = catalog.add_product_to_group(
             get_db(),
             group_id=data.get("group_id"),
@@ -537,12 +754,23 @@ def create_app(db_path=None, extra_hosts=()):
             barcode=data.get("barcode"),
             price=data.get("price"),
             quantity=data.get("quantity", 0),
-            cost_price=data.get("cost_price"),
+            # Cashiers may enter selling prices, not inventory costs.
+            cost_price=0 if cashier else data.get("cost_price"),
             tax_rate=data.get("tax_rate", 0),
             hsn_code=data.get("hsn_code", ""),
             unit_code=data.get("unit_code", "NOS"),
+            attributes=data.get("attributes", {}),
+            audit_actor=g.staff_actor,
         )
-        return jsonify(catalog.get_product(get_db(), pid)), 201
+        # Include the new identifier in the staff audit log as the generic
+        # endpoint audit only records the route, not the created product.
+        conn = get_db()
+        staff.audit(conn, g.staff_actor, "CREATE", f"/api/products/{pid}", 201)
+        conn.commit()
+        created = catalog.get_product(conn, pid)
+        if cashier:
+            created["cost_price"] = None
+        return jsonify(created), 201
 
     @app.patch("/api/products/<int:pid>")
     def api_products_update(pid):
@@ -573,16 +801,26 @@ def create_app(db_path=None, extra_hosts=()):
 
     @app.post("/api/products/<int:pid>/stock")
     def api_stock(pid):
-        delta = body().get("delta")
-        new_qty = catalog.adjust_stock(get_db(), pid, delta,
-            reason=body().get("reason", ""), kind=body().get("kind", "ADJUSTMENT"))
+        data = body()
+        actor = g.staff_actor
+        allow_reduction = settings_mod.get_all_settings(get_db()).get("cashier_allow_stock_reduction") == "true"
+        try:
+            delta, reason, kind = stock_policy.authorize_adjustment(
+                data.get("delta"), data.get("reason", ""), data.get("kind", "ADJUSTMENT"),
+                actor, cashier_can_reduce=allow_reduction)
+        except stock_policy.InventoryForbidden as exc:
+            return jsonify({"error":str(exc), "code":"staff_forbidden"}),403
+        new_qty = catalog.adjust_stock(get_db(), pid, delta, reason=reason, kind=kind)
         return jsonify({"id": pid, "quantity": new_qty})
 
     # ---------------- inventory ----------------
     @app.get("/api/inventory/overview")
     def api_inventory_overview():
         threshold = settings_mod.get_settings(get_db()).get("low_stock_threshold") or "0"
-        return jsonify(catalog.stock_overview(get_db(), int(float(threshold))))
+        summary = catalog.stock_overview(get_db(), int(float(threshold)))
+        if g.staff_actor["role"] == "cashier":
+            summary.pop("missing_cost", None)
+        return jsonify(summary)
 
     @app.get("/api/inventory/movements")
     def api_inventory_movements():
@@ -609,7 +847,8 @@ def create_app(db_path=None, extra_hosts=()):
         items, issues, mode, allow_zero, error = _catalog_import_payload()
         if error is not None:
             return error
-        return jsonify(catalog_import.preview(get_db(), items, issues, mode, allow_zero))
+        return jsonify(catalog_import.preview(get_db(), items, issues, mode, allow_zero,
+            cashier_safe=g.staff_actor["role"] == "cashier"))
 
     @app.post("/api/catalog/import/apply")
     def api_catalog_import_apply():
@@ -618,7 +857,9 @@ def create_app(db_path=None, extra_hosts=()):
             return error
         summary = catalog_import.apply(get_db(), items, issues, mode, allow_zero,
             force_repeat=request.form.get("force_repeat") == "true",
-            repeat_reason=request.form.get("repeat_reason", ""))
+            repeat_reason=request.form.get("repeat_reason", ""),
+            cashier_safe=g.staff_actor["role"] == "cashier",
+            audit_actor=g.staff_actor)
         return jsonify(summary)
 
     # ---------------- retail operations: suppliers, receiving, stocktakes ----------------
@@ -672,13 +913,40 @@ def create_app(db_path=None, extra_hosts=()):
 
     @app.post("/api/stocktakes/<int:sid>/post")
     def api_stocktake_post(sid):
-        return jsonify(operations.post_stocktake(get_db(),sid))
+        return jsonify(operations.post_stocktake(get_db(), sid,
+            adjustment_reason=body().get("reason", ""), actor=g.staff_actor))
+
+    # ---------------- UPI payment display (does not verify a transfer) ----------------
+    @app.get("/api/upi/reference")
+    def api_upi_reference():
+        return jsonify({"reference": "POS" + secrets.token_hex(7).upper()})
+
+    @app.get("/api/upi/qr.svg")
+    def api_upi_qr():
+        from pos.upi import payment_svg
+        opts = settings_mod.get_settings(get_db())
+        try:
+            svg = payment_svg(opts.get("store_upi_id"), opts.get("store_name"),
+                request.args.get("amount"), request.args.get("ref"))
+        except (ValueError, RuntimeError) as e:
+            return fail(400, e)
+        return Response(svg, mimetype="image/svg+xml",
+            headers={"Cache-Control": "no-store", "X-Content-Type-Options":"nosniff"})
 
     # ---------------- sales ----------------
+    def require_open_day():
+        if cash_sessions.current_session(get_db()) is None:
+            return jsonify({"error": "Open the day in Cash Drawer before recording monetary transactions", "code": "day_closed"}), 409
+        return None
+
     @app.post("/api/sales")
     def api_checkout():
+        denied = require_open_day()
+        if denied is not None:
+            return denied
         data = body()
         discount = data.get("discount") or {}
+        cashier = g.staff_actor["role"] == "cashier"
         receipt = sales.checkout(
             get_db(),
             items=data.get("items"),
@@ -690,7 +958,9 @@ def create_app(db_path=None, extra_hosts=()):
             supply_type=data.get("supply_type", "intra"),
             place_of_supply=data.get("place_of_supply", ""),
             request_id=data.get("request_id"),
-            salesperson=data.get("salesperson"),
+            salesperson=(g.staff_actor["display_name"] if cashier else data.get("salesperson")),
+            require_open_session=True,
+            max_discount_percent=(settings_mod.get_settings(get_db())["cashier_max_discount_percent"] if cashier else None),
         )
         return jsonify(receipt), 201
 
@@ -720,17 +990,24 @@ def create_app(db_path=None, extra_hosts=()):
 
     @app.post("/api/sales/<int:sid>/refund")
     def api_sale_refund(sid):
+        denied = require_open_day()
+        if denied is not None:
+            return denied
         data = body()
         lines = data.get("lines")
         to_credit = bool(data.get("to_credit"))
         return jsonify(sales.refund_sale(get_db(), sid, lines=lines,
                                          to_credit=to_credit,
                                          reason=data.get("reason", ""),
-                                         request_id=data.get("request_id")))
+                                         request_id=data.get("request_id"),
+                                         require_open_session=True))
 
     @app.post("/api/sales/<int:sid>/void")
     def api_sale_void(sid):
-        return jsonify(sales.void_sale(get_db(), sid))
+        denied = require_open_day()
+        if denied is not None:
+            return denied
+        return jsonify(sales.void_sale(get_db(), sid, require_open_session=True))
 
     # ---------------- reports ----------------
     @app.get("/api/reports/summary")
@@ -1061,6 +1338,28 @@ def create_app(db_path=None, extra_hosts=()):
         return Response(
             data, mimetype="text/csv",
             headers={"Content-Disposition": f"attachment; filename={filename}"})
+
+    @app.get("/api/export/upi.csv")
+    def api_export_upi():
+        from_date = request.args.get("from", "").strip()
+        to_date = request.args.get("to", "").strip()
+        params = []
+        where = ["p.method='UPI'"]
+        if from_date:
+            where.append("date(s.timestamp) >= date(?)")
+            params.append(from_date)
+        if to_date:
+            where.append("date(s.timestamp) <= date(?)")
+            params.append(to_date)
+        query = """SELECT s.id, s.invoice_number, s.timestamp, s.status,
+                p.amount, p.reference, p.upi_utr
+                FROM payments p JOIN sales s ON s.id=p.sale_id
+                WHERE """ + " AND ".join(where) + " ORDER BY s.id DESC, p.id DESC"
+        rows = [tuple(r) for r in get_db().execute(query, params)]
+        return _csv_response(rows,
+            ["Sale ID", "Invoice", "Timestamp", "Sale status", "Recorded UPI amount",
+             "POS reference (not bank UTR)", "Bank UTR entered by cashier"],
+            "pyPOS-UPI-Reconciliation.csv")
 
     @app.get("/api/export/loyalty.csv")
     def api_export_loyalty():

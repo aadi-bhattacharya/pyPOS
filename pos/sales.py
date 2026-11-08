@@ -260,7 +260,15 @@ def _normalize_payments(payments, total, currency_note=True):
         if amt == 0:
             continue
         tendered_cents += _cents(amt)
-        clean.append({"method": method, "amount_cents": _cents(amt)})
+        reference = str(p.get("reference") or "").strip()
+        utr = str(p.get("upi_utr") or "").strip().upper()
+        if (len(reference) > 40 or len(utr) > 40 or
+                any(ord(c) < 33 or ord(c) > 126 for c in reference + utr)):
+            raise InvalidPaymentError("Payment reference or UTR contains invalid characters")
+        if method != "UPI" and utr:
+            raise InvalidPaymentError("A UPI UTR can only be attached to a UPI payment")
+        clean.append({"method": method, "amount_cents": _cents(amt),
+                      "reference": reference, "upi_utr": utr})
 
     if tendered_cents < total_cents:
         short = (Decimal(total_cents - tendered_cents) / 100).quantize(MONEY_Q)
@@ -285,6 +293,7 @@ def _normalize_payments(payments, total, currency_note=True):
                 "method": p["method"],
                 "applied": Decimal(take) / 100,
                 "tendered": Decimal(p["amount_cents"]) / 100,
+                "reference": p["reference"], "upi_utr": p["upi_utr"],
             })
             remaining -= take
     return applied, change
@@ -346,7 +355,8 @@ def _split_refund(total, parts):
 
 def checkout(conn, items, payments=None, discount_mode=None, discount_value=None,
              customer_id=None, use_credit=False, supply_type="intra", place_of_supply="",
-             request_id=None, salesperson=None):
+             request_id=None, salesperson=None, require_open_session=False,
+             max_discount_percent=None):
     """
     Complete a sale atomically: validate stock, recompute all money server-side,
     insert sale + items + payments, decrement inventory (via trigger), commit.
@@ -392,6 +402,9 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
                 if existing["credit_cents"]:
                     receipt["store_credit_used"] = existing["credit_cents"] / 100
                 return receipt
+        if require_open_session and conn.execute(
+                "SELECT 1 FROM cash_sessions WHERE closed_at IS NULL LIMIT 1").fetchone() is None:
+            raise InvalidSaleError("Start Day before recording a sale")
         movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         normalized = _normalize_items(conn, items)
         cfg_checkout = settings_mod.get_settings(conn)
@@ -408,6 +421,15 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
         tax_inclusive = cfg_checkout.get("price_tax_mode") == "inclusive"
         totals = compute_totals(normalized, discount_mode, discount_value,
                                 tax_inclusive=tax_inclusive)
+        if max_discount_percent is not None:
+            # Evaluate after live prices are reloaded under the write lock;
+            # cart-supplied prices and JavaScript limits are never trusted.
+            cap = _d(max_discount_percent)
+            if cap < 0 or cap > 100:
+                raise InvalidSaleError("Invalid cashier discount policy")
+            if totals["discount_total"] * 100 > totals["subtotal_gross"] * cap:
+                raise InvalidSaleError(
+                    "Discount exceeds the cashier's permitted limit; ask a manager")
 
         customer = None
         if customer_id is not None:
@@ -512,11 +534,27 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
                  src_line["description"], src_line["SKU"]),
             )
 
+        seen_upi_utrs = set()
         for p in applied_payments:
+            if p["method"] == "UPI":
+                if p.get("reference"):
+                    existing = conn.execute(
+                        "SELECT id FROM payments WHERE method='UPI' AND reference=? LIMIT 1",
+                        (p["reference"],)).fetchone()
+                    if existing:
+                        raise InvalidPaymentError("This UPI payment reference was already used")
+                if p.get("upi_utr"):
+                    normalized_utr = p["upi_utr"].upper()
+                    if normalized_utr in seen_upi_utrs or conn.execute(
+                        "SELECT 1 FROM payments WHERE method='UPI' AND UPPER(upi_utr)=? LIMIT 1",
+                        (normalized_utr,)).fetchone():
+                        raise InvalidPaymentError(
+                            "This bank UTR is already recorded against another UPI payment")
+                    seen_upi_utrs.add(normalized_utr)
             cur.execute(
-                ''' INSERT INTO payments(sale_id, method, amount, is_partial)
-                    VALUES(?, ?, ?, 0) ''',
-                (sale_id, p["method"], float(p["applied"])),
+                ''' INSERT INTO payments(sale_id, method, amount, is_partial, reference, upi_utr)
+                    VALUES(?, ?, ?, 0, ?, ?) ''',
+                (sale_id, p["method"], float(p["applied"]), p.get("reference", ""), p.get("upi_utr", "")),
             )
 
         if credit_cents > 0:
@@ -675,14 +713,19 @@ def get_sale_detail(conn, sale_id):
         })
 
     cur.execute(
-        ''' SELECT method, amount, is_partial FROM payments
+        ''' SELECT method, amount, is_partial, reference, upi_utr FROM payments
             WHERE sale_id = ? ORDER BY id ''',
         (sale_id,),
     )
-    payments = [
-        {"method": r["method"], "amount": float(r["amount"]), "is_partial": bool(r["is_partial"])}
-        for r in cur.fetchall()
-    ]
+    payments = []
+    for r in cur.fetchall():
+        entry = {"method": r["method"], "amount": float(r["amount"]),
+                 "is_partial": bool(r["is_partial"])}
+        if r["reference"]:
+            entry["reference"] = r["reference"]
+        if r["upi_utr"]:
+            entry["upi_utr"] = r["upi_utr"]
+        payments.append(entry)
 
     cur.execute(
         ''' SELECT id, status FROM sales WHERE parent_sale_id = ? ''', (sale_id,)
@@ -989,7 +1032,7 @@ def preview_refund(conn, sale_id, lines=None, to_credit=False):
     }
 
 
-def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_id=None):
+def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_id=None, require_open_session=False):
     """
     Refund a completed sale.
 
@@ -1021,6 +1064,9 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
                     raise InvalidSaleError("Refund request ID was reused with different details")
                 conn.commit()
                 return get_sale_detail(conn, existing["refund_sale_id"])
+        if require_open_session and conn.execute(
+                "SELECT 1 FROM cash_sessions WHERE closed_at IS NULL LIMIT 1").fetchone() is None:
+            raise InvalidSaleError("Start Day before recording a refund")
         movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         sale = get_sale(conn, sale_id)
         if sale is None:
@@ -1176,7 +1222,7 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
     return get_sale_detail(conn, refund_id)
 
 
-def void_sale(conn, sale_id):
+def void_sale(conn, sale_id, require_open_session=False):
     """Void a never-refunded sale, retaining its original invoice item audit trail.
 
     Rather than deleting the lines and losing evidence of what was sold,
@@ -1184,6 +1230,9 @@ def void_sale(conn, sale_id):
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
+        if require_open_session and conn.execute(
+                "SELECT 1 FROM cash_sessions WHERE closed_at IS NULL LIMIT 1").fetchone() is None:
+            raise InvalidSaleError("Start Day before voiding a sale")
         movement_start = conn.execute("SELECT COALESCE(MAX(id),0) FROM stock_movements").fetchone()[0]
         sale = get_sale(conn, sale_id)
         if sale is None:

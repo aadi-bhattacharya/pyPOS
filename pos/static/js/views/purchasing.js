@@ -1,5 +1,6 @@
 import { api, fmt, fmtDate } from "../api.js";
 import { h, openModal, toast, toastError, confirmDialog } from "../ui.js";
+import { createSkuPicker } from "../skuPicker.js";
 
 const field = (name, control) => h("div", { class: "field" }, h("label", {}, name), control);
 const input = (hint, type = "text", value = "") => h("input", {
@@ -79,9 +80,6 @@ async function receiveModal(suppliers, refresh) {
   if (!suppliers.length) { toast("Create a supplier first.", "warn"); return; }
   let products;
   try { products = await api.listProducts(); } catch (e) { return toastError(e); }
-  const bySku = new Map(products.map(p => [String(p.SKU).toLowerCase(), p]));
-  const opts = h("datalist", { id: "receipt-sku-list" },
-    ...products.map(p => h("option", { value: p.SKU }, `${p.group_name || "Product"} · ${fmt(p.price)}`)));
   const supplier = h("select", { class: "input" },
     ...suppliers.map(s => h("option", { value: s.id }, s.name)));
   const invoice = input("Exactly as on the supplier's invoice");
@@ -91,14 +89,17 @@ async function receiveModal(suppliers, refresh) {
   const lineHost = h("div", {});
   const rows = [];
   function addLine() {
-    const sku = h("input", { class: "input", list: "receipt-sku-list", placeholder: "Exact SKU / MRP edition" });
     const qty = h("input", { class: "input num", type: "number", step: "1", min: "1", value: "1" });
+    const picker = createSkuPicker(products, {
+      placeholder: "Scan EAN, SKU or find a product…",
+      onSelect: () => qty.focus(),
+    });
     const unit = input("Landed price per unit ₹", "number");
     const r = {};
     const el = h("div", { class: "purchase-line-grid" },
-      field("Exact SKU", sku), field("Quantity", qty), field("Unit landed cost ₹", unit),
+      field("Exact SKU / MRP edition", picker.element), field("Quantity", qty), field("Unit landed cost ₹", unit),
       button("Remove", () => { el.remove(); rows.splice(rows.indexOf(r), 1); }, "btn sm"));
-    Object.assign(r, { sku, qty, unit, el });
+    Object.assign(r, { picker, qty, unit, el });
     rows.push(r); lineHost.append(el);
   }
   addLine();
@@ -109,13 +110,18 @@ async function receiveModal(suppliers, refresh) {
         "Amounts are actual landed/unit purchase costs including any GST, not selling MRPs."),
       field("Supplier", supplier), field("Supplier invoice number *", invoice),
       field("Invoice GST ₹ (informational, optional)", invoiceGst), field("Reference / notes", note),
-      opts, lineHost, button("+ Add SKU line", addLine, "btn sm"),
+      lineHost, button("+ Add SKU line", addLine, "btn sm"),
       h("label", { style: "display:flex;gap:8px;margin-top:15px" }, updateCost,
         "Also update current catalogue cost from this receipt (historical sale costs remain unchanged)")),
     footer: [button("Cancel", () => m.close()), button("Receive stock", async () => {
-      const lines = rows.map(r => ({ product_id: bySku.get(r.sku.value.trim().toLowerCase())?.id,
+      const lines = rows.map(r => ({ product_id: r.picker.getSelected()?.id,
         quantity: r.qty.value, unit_cost: r.unit.value }));
-      if (lines.some(l => !l.product_id)) return toast("One or more SKUs are missing or unrecognised.", "warn");
+      if (!lines.length || lines.some(l => !l.product_id))
+        return toast("Select the exact SKU / MRP edition for every receipt line.", "warn");
+      if (lines.some(l => !/^[1-9]\d*$/.test(l.quantity) || !Number.isSafeInteger(Number(l.quantity))))
+        return toast("Receipt quantities must be positive whole units.", "warn");
+      if (lines.some(l => !/^(?:0|[1-9]\d*)(?:\.\d{1,2})?$/.test(l.unit_cost)))
+        return toast("Enter each unit's actual landed cost in rupees (max. two decimals).", "warn");
       if (!await confirmDialog({ title: "Confirm stock receipt", message:
         `This will ADD the quantities of ${lines.length} SKU(s). Supplier invoice numbers cannot be received twice.`,
         confirmLabel: "Receive goods" })) return;

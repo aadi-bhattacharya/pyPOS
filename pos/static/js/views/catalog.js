@@ -34,6 +34,7 @@ export async function renderCatalog(main) {
     reviewOnly = !reviewOnly; catalogPage = 0; renderSub(); renderTable();
   } }, "Billing review");
 
+  const cashier = roleIsCashier();
   const grid = h("div", {
     style: "display:grid;grid-template-columns:minmax(200px,250px) 1fr;gap:16px;align-items:start",
   },
@@ -58,14 +59,14 @@ export async function renderCatalog(main) {
         h("h2", {}, "Catalog"),
         h("div", { class: "sub", id: "cat-sub" })),
       h("div", { class: "view-actions" },
-        h("a", {
+        cashier ? null : h("a", {
           class: "btn",
           href: "/api/export/inventory.csv",
           title: "Download inventory as CSV (opens in Excel/Sheets)",
         }, icon("i-sales"), "Export CSV"),
-        h("button", {
+        cashier && state.settings.cashier_allow_stock_import !== "true" ? null : h("button", {
           class: "btn", onclick: importCatalogModal,
-        }, icon("i-plus"), "Import stock"),
+        }, icon("i-plus"), "Import / Receive stock"),
         h("button", {
           class: "btn primary",
           onclick: () => productModal(),
@@ -101,15 +102,17 @@ function renderSub() {
 }
 
 // ================= additive CSV/XLSX import =================
+function roleIsCashier() { return !["manager", "admin"].includes(state.staff?.operator?.role); }
 
 function importCatalogModal() {
   const fileInput = h("input", { class: "input", type: "file", accept: ".xlsx,.csv" });
+  const cashier = (roleIsCashier());
   const mode = h("select", { class: "input" },
     h("option", { value: "skip" }, "Create new products, skip existing SKUs (safest)"),
-    h("option", { value: "add_stock" }, "Create new + add stock on existing SKUs"),
-    h("option", { value: "merge" }, "Create new + add stock + update supplied fields/attributes"));
-  const allowZero = h("input", { type: "checkbox" });
-  const forceRepeat = h("input", { type: "checkbox" });
+    h("option", { value: "add_stock" }, "Create new products + receive stock into existing SKUs"),
+    cashier ? null : h("option", { value: "merge" }, "Create new + add stock + update supplied fields/attributes"));
+  const allowZero = h("input", { type: "checkbox", disabled: cashier });
+  const forceRepeat = h("input", { type: "checkbox", disabled: cashier });
   const repeatReason = h("input", { class: "input", maxlength: "250",
     placeholder: "Why is this an additional delivery of identical stock?" });
   const previewArea = h("div", { style: "margin-top:14px" },
@@ -150,7 +153,8 @@ function importCatalogModal() {
         h("div", {}, `${r.missing_prices} new product(s) lack selling prices.`),
         h("div", {}, `${r.missing_gst} new product(s) lack GST rates (0 is a database placeholder, NOT a verified zero GST rate).`),
         h("div", {}, `${r.stock_to_add} units would be added to existing stock using this mode.`),
-        h("div", {}, "All imported attributes remain editable under Catalog → Edit product."));
+        h("div", {}, cashier ? "New products can be sold immediately. A manager can review prices, tax and costs afterward." :
+          "All imported attributes remain editable under Catalog → Edit product."));
       const sampleRows = r.sample.map((x) => h("tr", {},
         h("td", {}, String(x.row)), h("td", {}, x.sku), h("td", {}, x.name),
         h("td", { class: "num" }, String(x.quantity)),
@@ -196,18 +200,20 @@ function importCatalogModal() {
     title: "Import stock (additive)", wide: true,
     body: h("div", {},
       h("p", { class: "form-hint", style: "margin-bottom:12px" },
-        "CSV UTF-8 or XLSX with an Import sheet. Nothing is deleted or locked; SKU matches control duplicates."),
+        cashier ? "New SKUs can be created here; existing SKUs can receive more stock. Changes to existing MRPs, taxes and variants are not permitted. Zero-price drafts, merge edits and repeat overrides require a manager." :
+          "CSV UTF-8 or XLSX with an Import sheet. Nothing is deleted or locked; SKU matches control duplicates."),
       h("a", { class: "btn sm", href: "/static/templates/pyPOS_Import_Template.xlsx", download: "pyPOS_Import_Template.xlsx",
         style: "margin-bottom:14px" }, icon("i-sales"), "Download editable Excel template"),
       h("div", { class: "field" }, h("label", {}, "Import file"), fileInput),
       h("div", { class: "field" }, h("label", {}, "What to do if a SKU already exists"), mode),
-      h("label", { style: "display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-top:9px" },
+      cashier ? null : h("label", { style: "display:flex;gap:8px;align-items:flex-start;font-size:13px;margin-top:9px" },
         allowZero, "Allow new products without a price at ₹0 (mark Price Review Required; review before selling)"),
-      h("label", { style: "display:flex;gap:8px;align-items:center;font-size:13px;margin-top:12px" },
+      cashier ? null : h("label", { style: "display:flex;gap:8px;align-items:center;font-size:13px;margin-top:12px" },
         forceRepeat, "Authorised repeat delivery (same file was already imported)"),
-      h("div", { class: "field" }, h("label", {}, "Reason for repeating the same stock file"), repeatReason),
+      cashier ? null : h("div", { class: "field" }, h("label", {}, "Reason for repeating the same stock file"), repeatReason),
       h("p", { class: "form-hint", style: "margin-top:9px" },
-        "GST/HSN and costs are never inferred. Blank GST is flagged UNVERIFIED (0 is only a storage placeholder). Unverified GST prevents checkout until an operator confirms the rate. Source snapshots are not automatically added together."),
+        cashier ? "New SKUs require a selling price and an explicit GST rate. Cost stays at zero until manager review. This screen never subtracts stock; use it only for genuine new arrivals." :
+          "GST/HSN and costs are never inferred. Blank GST is flagged UNVERIFIED (0 is only a storage placeholder). Unverified GST prevents checkout until an operator confirms the rate. Source snapshots are not automatically added together."),
       previewArea),
     footer: [h("button", { class: "btn", onclick: () => m.close() }, "Cancel"),
              previewBtn, applyBtn],
@@ -235,7 +241,7 @@ function renderGroups() {
     groupsListEl.append(
       h("div", { style: "display:flex;align-items:center;gap:2px" },
         h("div", { style: "flex:1;min-width:0" }, row(g.name, g.id, count)),
-        h("button", {
+        roleIsCashier() ? null : h("button", {
           class: "btn ghost icon-only sm",
           title: `Edit ${g.name}`,
           onclick: () => editGroupModal(g),
@@ -356,15 +362,15 @@ function renderTable() {
         p.hsn_code ? h("div", { class: "cell-sub" }, `HSN/SAC ${p.hsn_code}`) : null),
       h("td", { class: "num" }, fmt(p.price)),
       h("td", { class: "num cell-sub" },
-        Number(p.cost_price) > 0 ? fmt(p.cost_price) : "—"),
+        roleIsCashier() ? "—" : (Number(p.cost_price) > 0 ? fmt(p.cost_price) : "—")),
       h("td", { class: "num" }, trimRate(p.tax_rate) + "%"),
       h("td", {}, stockStepper(p)),
       h("td", { class: "actions-cell" },
         h("button", { class: "btn ghost icon-only sm", title: "Adjust stock",
           onclick: () => stockModal(p) }, icon("i-plus")),
-        h("button", { class: "btn ghost icon-only sm", title: "Edit",
+        roleIsCashier() ? null : h("button", { class: "btn ghost icon-only sm", title: "Edit",
           onclick: () => productModal(p) }, icon("i-edit")),
-        h("button", { class: "btn ghost icon-only sm", title: "Delete",
+        roleIsCashier() ? null : h("button", { class: "btn ghost icon-only sm", title: "Delete",
           onclick: () => deleteProduct(p) }, icon("i-trash"))))));
 
   tableWrapEl.append(h("div", { class: "table-wrap" },
@@ -409,47 +415,62 @@ async function deleteProduct(p) {
 // ================= stock modal =================
 
 function stockModal(p) {
-  const qtyInput = h("input", { class: "input", type: "number", value: "+1", step: "1" });
+  const cashier = roleIsCashier();
+  const canReduce = !cashier || state.settings.cashier_allow_stock_reduction === "true";
+  const operation = h("select", { class: "input", onchange: updatePreview },
+    h("option", { value: "RECEIPT" }, "Receive goods (add stock)"),
+    canReduce ? h("option", { value: "ADJUSTMENT" }, "Documented damage / shortage correction") : null);
+  const qtyInput = h("input", { class: "input", type: "number", min: "1", max: "1000000",
+    value: "1", step: "1" });
+  const reasonInput = h("input", { class: "input", type: "text", maxlength: "200",
+    placeholder: "Supplier invoice / delivery note / correction reason" });
   const preview = h("div", { class: "form-hint", style: "font-weight:650;margin-top:4px" });
   let m;
-
-  const updatePreview = () => {
-    const delta = parseInt(qtyInput.value, 10) || 0;
-    preview.textContent = `Preview: ${p.quantity} → ${Math.max(0, p.quantity + delta)}`;
-  };
+  function updatePreview() {
+    const text = qtyInput.value.trim();
+    const units = /^\d+$/.test(text) ? Number(text) : NaN;
+    const delta = operation.value === "ADJUSTMENT" ? -units : units;
+    preview.textContent = Number.isSafeInteger(units) && units > 0 && units <= 1_000_000 && p.quantity + delta >= 0
+      ? `Stock after movement: ${p.quantity + delta} units` : "Enter a valid positive number of units";
+  }
   qtyInput.addEventListener("input", updatePreview);
-
-  const chip = (n) => h("button", {
-    class: "chip",
-    onclick: () => { qtyInput.value = String(n); updatePreview(); },
-  }, (n > 0 ? "+" : "") + n);
-
+  const chip = (n) => h("button", { class: "chip", onclick: () => {
+    qtyInput.value = String(n); updatePreview();
+  } }, `+${n}`);
   m = openModal({
-    title: `Adjust stock — ${p.group_name || p.SKU}`,
+    title: `Receive stock · ${p.group_name || p.SKU}`,
     narrow: true,
     body: h("div", {},
-      h("p", { style: "color:var(--text-2);margin-bottom:12px" },
-        "Current stock: ", h("strong", {}, String(p.quantity))),
-      h("div", { class: "field" },
-        h("label", {}, "Change by (+ adds / − removes)"),
-        qtyInput, preview),
-      h("div", { class: "chips", style: "margin-top:8px" },
-        chip(-10), chip(-5), chip(-1), chip(1), chip(5), chip(10))),
+      h("p", { class: "form-hint" }, "Current stock: ", h("strong", {}, String(p.quantity))),
+      canReduce ? h("div", { class: "field" }, h("label", {}, "Movement"), operation) : null,
+      h("div", { class: "field" }, h("label", {}, "Number of units (positive only)"), qtyInput, preview),
+      h("div", { class: "chips", style: "margin-top:8px" }, ...[1, 5, 10].map(chip)),
+      h("div", { class: "field", style: "margin-top:12px" },
+        h("label", {}, "Reason / supplier reference (required)"), reasonInput)),
     footer: [
       h("button", { class: "btn", onclick: () => m.close() }, "Cancel"),
-      h("button", {
-        class: "btn primary",
-        onclick: async () => {
-          try {
-            const delta = parseInt(qtyInput.value, 10);
-            if (!delta) { toast("Enter a non-zero change.", "warn"); return; }
-            const r = await api.adjustStock(p.id, delta);
-            toast(`Stock updated to ${r.quantity}.`, "success");
-            m.close();
-            await load(); rerenderAll();
-          } catch (e) { toastError(e); }
-        },
-      }, "Apply"),
+      h("button", { class: "btn primary", onclick: async () => {
+        const text = qtyInput.value.trim();
+        const units = /^\d+$/.test(text) ? Number(text) : NaN;
+        const correction = operation.value === "ADJUSTMENT";
+        const delta = correction ? -units : units;
+        if (!Number.isSafeInteger(units) || units <= 0 || units > 1_000_000 ||
+            p.quantity + delta < 0 || (correction && !canReduce)) {
+          toast("Enter an authorised positive whole quantity.", "warn"); return;
+        }
+        const reason = reasonInput.value.trim();
+        if (reason.length < (correction ? 8 : 4) || reason.length > 200) {
+          toast("Enter a reason or supplier reference (up to 200 characters).", "warn"); return;
+        }
+        if (correction && !await confirmDialog({ title: "Confirm stock shortage",
+          message: `Record ${units} damaged/missing units of ${p.SKU}? This reduces stock from ${p.quantity} to ${p.quantity - units}. Reason: ${reason}`,
+          confirmLabel: "Record shortage" })) return;
+        try {
+          const r = await api.adjustStock(p.id, delta, reason, correction ? "ADJUSTMENT" : "RECEIPT");
+          toast(`Stock updated to ${r.quantity}. Movement recorded.`, "success");
+          m.close(); await load(); rerenderAll();
+        } catch (e) { toastError(e); }
+      } }, "Save stock movement"),
     ],
   });
   updatePreview();
@@ -472,13 +493,15 @@ function productModal(existing = null) {
   const fBarcode = fieldInput("Barcode", existing?.barcode || "");
   const fPrice = fieldInput("Price *", existing != null ? String(existing.price) : "",
     "number", "0.01");
-  const fCost = fieldInput("Cost",
+  const fCost = roleIsCashier() && !isEdit ? null : fieldInput("Cost",
     existing?.cost_price ? String(existing.cost_price) : "", "number", "0.01");
   const fHsn = fieldInput("HSN / SAC (optional)", existing?.hsn_code || "");
   const fUnit = fieldInput("Quantity unit (UQC, e.g. NOS / PCS)", existing?.unit_code || "NOS");
   const fTax = fieldInput("GST rate %", existing != null ? trimRate(existing.tax_rate) : "0",
     "number", "0.01");
   const fQty = fieldInput("Opening stock", "0", "number", "1");
+  fQty.input.min = "0";
+  fQty.input.max = "1000000";
   const hasGstReview = !!existing?.attributes?.some(a => a.name === "GST Review Required");
   const hasPriceReview = !!existing?.attributes?.some(a => a.name === "Price Review Required");
   const verifyGst = h("input", { type: "checkbox" });
@@ -513,7 +536,7 @@ function productModal(existing = null) {
     body: h("div", {},
       h("div", { class: "field" }, h("label", {}, "Group"), groupSel),
       h("div", { class: "form-row" }, fSKU.wrap, fBarcode.wrap),
-      h("div", { class: "form-row" }, fPrice.wrap, fCost.wrap, fTax.wrap),
+      h("div", { class: "form-row" }, fPrice.wrap, fCost?.wrap, fTax.wrap),
       h("div", { class: "form-row" }, fHsn.wrap, fUnit.wrap),
       h("p", { class: "form-hint" }, "Enter the correct applicable GST rate and HSN/SAC for the product. A 0% GST rate must be explicitly verified when appropriate; no rates are inferred."),
       hasGstReview ? h("label", { class: "form-hint", style: "display:flex;align-items:center;gap:8px;margin:8px 0;color:var(--danger)" },
@@ -543,7 +566,7 @@ function productModal(existing = null) {
       SKU: fSKU.input.value.trim(),
       barcode: fBarcode.input.value.trim() || null,
       price: parseFloat(fPrice.input.value),
-      cost_price: parseFloat(fCost.input.value) || 0,
+      ...(fCost ? { cost_price: parseFloat(fCost.input.value) || 0 } : {}),
       tax_rate: parseFloat(fTax.input.value) || 0,
       hsn_code: fHsn.input.value.trim(),
       unit_code: fUnit.input.value.trim().toUpperCase() || "NOS",
@@ -553,7 +576,7 @@ function productModal(existing = null) {
     };
 
     // inline validation — mark fields in place instead of only toasting
-    [fSKU, fBarcode, fPrice, fCost, fTax, fQty, fHsn, fUnit].forEach((f) => setFieldError(f, null));
+    [fSKU, fBarcode, fPrice, fCost, fTax, fQty, fHsn, fUnit].filter(Boolean).forEach((f) => setFieldError(f, null));
     let bad = null;
     if (!payload.SKU) bad = setFieldError(fSKU, "SKU is required");
     if (isNaN(payload.price) || payload.price < 0)
@@ -565,39 +588,41 @@ function productModal(existing = null) {
     if (!/^[A-Z]{2,8}$/.test(payload.unit_code))
       bad = setFieldError(fUnit, "Use 2–8 letters, e.g. NOS or PCS");
     if (!isEdit) {
-      const q = parseInt(fQty.input.value, 10);
-      if (isNaN(q) || q < 0) bad = setFieldError(fQty, "Stock can't be negative");
+      const q = Number(fQty.input.value);
+      if (!/^\d+$/.test(fQty.input.value.trim()) || !Number.isSafeInteger(q) || q > 1_000_000)
+        bad = setFieldError(fQty, "Enter a whole number of units from 0 to 1,000,000");
     }
     if (bad) return;
 
+    const desired = {};
+    for (const { nameIn, valIn } of attrRows) {
+      const n = nameIn.value.trim(), v = valIn.value.trim();
+      if (n && v) desired[n] = v;
+    }
+    if (verifyGst.checked) delete desired["GST Review Required"];
+    if (verifyPrice.checked) delete desired["Price Review Required"];
     try {
       let pid;
       if (isEdit) {
         pid = existing.id;
         await api.updateProduct(pid, payload);
       } else {
-        payload.quantity = parseInt(fQty.input.value, 10) || 0;
+        payload.quantity = Number(fQty.input.value);
+        payload.attributes = desired;
         const created = await api.createProduct(payload);
         pid = created.id;
       }
 
-      const desired = {};
-      for (const { nameIn, valIn } of attrRows) {
-        const n = nameIn.value.trim(), v = valIn.value.trim();
-        if (n && v) desired[n] = v;
-      }
-      if (verifyGst.checked) delete desired["GST Review Required"];
-      if (verifyPrice.checked) delete desired["Price Review Required"];
-      const current = isEdit
-        ? Object.fromEntries((existing.attributes || []).map((a) => [a.name, a.value]))
-        : {};
-      for (const [n, v] of Object.entries(desired)) {
-        if (current[n] !== v) await api.setAttribute(pid, n, v);
-      }
-      for (const n of Object.keys(current)) {
-        if (!(n in desired) && !(n === "GST Review Required" && verifyGst.checked)
-            && !(n === "Price Review Required" && verifyPrice.checked)) {
-          await api.removeAttribute(pid, n);
+      if (isEdit) {
+        const current = Object.fromEntries((existing.attributes || []).map((a) => [a.name, a.value]));
+        for (const [n, v] of Object.entries(desired)) {
+          if (current[n] !== v) await api.setAttribute(pid, n, v);
+        }
+        for (const n of Object.keys(current)) {
+          if (!(n in desired) && !(n === "GST Review Required" && verifyGst.checked)
+              && !(n === "Price Review Required" && verifyPrice.checked)) {
+            await api.removeAttribute(pid, n);
+          }
         }
       }
 
@@ -641,43 +666,16 @@ function stockBadge(qty) {
   return h("span", { class: "stock-badge" }, String(qty));
 }
 
-// Inline ^/v stepper on the stock cell — one click to receive or remove a unit.
+// Display the live balance and open an auditable movement form to change it.
+// Nobody, including a manager, gets a one-click stock decrement.
 function stockStepper(p) {
   const threshold = Number(state.settings.low_stock_threshold || 5);
-  const badge = h("span", { class: "stock-badge" }, String(p.quantity));
-  const down = h("button", {
-    class: "spin-btn", title: "Remove 1", disabled: p.quantity <= 0,
-    onclick: () => bump(-1),
-  }, icon("i-chev-down"));
-  const up = h("button", {
-    class: "spin-btn", title: "Receive 1",
-    onclick: () => bump(+1),
-  }, icon("i-chev-up"));
-
-  let busy = false;
-  async function bump(delta) {
-    if (busy) return;
-    busy = true;
-    up.disabled = down.disabled = true;
-    try {
-      const r = await api.adjustStock(p.id, delta);
-      p.quantity = r.quantity;              // keep tiles/sidebar in sync
-      badge.textContent = String(r.quantity);
-      badge.className = "stock-badge" +
-        (r.quantity <= 0 ? " out" : r.quantity <= threshold ? " low" : "");
-      down.disabled = r.quantity <= 0;
-      renderGroups();
-    } catch (e) {
-      toastError(e);
-    } finally {
-      busy = false;
-      up.disabled = false;
-    }
-  }
-
   return h("div", { class: "stock-spin" },
-    badge,
-    h("div", { class: "spin-col" }, up, down));
+    h("span", { class: "stock-badge" +
+      (p.quantity <= 0 ? " out" : p.quantity <= threshold ? " low" : "") },
+      String(p.quantity)),
+    h("button", { class: "spin-btn", title: "Record a stock receipt / correction",
+      onclick: () => stockModal(p) }, icon("i-plus")));
 }
 
 function trimRate(rate) {
