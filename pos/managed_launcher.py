@@ -12,12 +12,15 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import webbrowser
 from pathlib import Path
 
 from . import release_build
 from .install_links import create_shortcut
+from .instance_lock import instance_active, instance_lock
 from .launch_dialog import confirm_stop
 from .launch_dialog import configure_logging, show_error, unexpected_failure
 from .platform_paths import binary_names, install_root, platform_key
@@ -119,6 +122,61 @@ def first_install(folder, root):
     return stable
 
 
+def _refresh_stable_forwarder(root, version_dir):
+    """Replace the permanent launcher with the VERIFIED active release.
+
+    The initial install used to copy pyPOS.exe only once. That stranded
+    Start/Stop shortcuts on obsolete code through all future auto-updates.
+    Called only by the versioned supervisor, never the running forwarder.
+    """
+    root = Path(root)
+    version_dir = Path(version_dir)
+    if not verify_installed(root, version_dir.name):
+        raise UpdateError("Refusing to refresh forwarder from an unverified release")
+    source = version_dir / binary_names()[1]
+    target = root / ("pyPOS.exe" if os.name == "nt" else "pypos")
+    if target.is_symlink():
+        raise UpdateError("Refusing to replace a symbolic-link launcher")
+    digest = hashlib.sha256(source.read_bytes()).digest()
+    if target.is_file() and hashlib.sha256(target.read_bytes()).digest() == digest:
+        return False
+    fd, staged_name = tempfile.mkstemp(prefix=".pypos-forwarder-", dir=root)
+    os.close(fd)
+    staged = Path(staged_name)
+    try:
+        shutil.copy2(source, staged)
+        if hashlib.sha256(staged.read_bytes()).digest() != digest:
+            raise UpdateError("Staged launcher failed hash verification")
+        if os.name != "nt":
+            staged.chmod(0o700)
+        staged.replace(target)
+        LOG.info("Refreshed permanent pyPOS launcher from %s", version_dir.name)
+        return True
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def _refresh_forwarder_when_unlocked(root, version_dir):
+    # Windows keeps executable files locked while in use. The stable
+    # bootloader will normally exit just after it starts this supervisor.
+    for attempt in range(20):
+        try:
+            _refresh_stable_forwarder(root, version_dir)
+            return
+        except PermissionError:
+            time.sleep(0.5)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) in (5, 32):
+                time.sleep(0.5)
+            else:
+                LOG.exception("Unable to refresh permanent launcher")
+                return
+        except UpdateError:
+            LOG.exception("Unable to verify permanent launcher update")
+            return
+    LOG.warning("Windows kept the stable launcher locked; retry on next Start")
+
+
 def _pre_update_backup(current, pending):
     """Create an SQLite-consistent restore point before a new version can migrate.
 
@@ -164,6 +222,12 @@ def _pre_update_backup(current, pending):
 
 
 def stable_launch(root):
+    # Reopening Start must never activate an update underneath a live till.
+    if instance_active(root):
+        LOG.info("Another managed register is running; reopening browser")
+        webbrowser.open("http://127.0.0.1:8420/")
+        return
+    (root / "stop.request").unlink(missing_ok=True)
     current = read_version_file(root / "current.txt")
     pending = read_version_file(root / "pending.txt")
     if pending and verify_installed(root, pending):
@@ -194,27 +258,49 @@ def stable_launch(root):
 
 
 def request_stop(root):
-    running = root / "running.txt"
-    if not running.is_file():
-        show_error("pyPOS", "No managed register appears to be running on this computer.")
+    if not instance_active(root):
+        show_error("pyPOS", "No managed register is running. The source-checkout "
+                   "Start/Stop VBS scripts control a different instance.")
         return 0
-    if confirm_stop("Stop pyPOS?", "Stop the register on this computer? Finish all sales and receipts first."):
-        (root / "stop.request").write_text("stop\n", encoding="ascii")
-        LOG.info("Operator requested a graceful pyPOS shutdown")
-    return 0
+    if not confirm_stop("Stop pyPOS?", "Stop the register? Finish all sales "
+                        "and receipts before shutting it down."):
+        return 0
+    (root / "stop.request").write_text("stop\n", encoding="ascii")
+    LOG.info("Operator requested a graceful pyPOS shutdown")
+    # Wait for the actual supervisor to exit instead of trusting a stale PID.
+    for _ in range(100):
+        if not instance_active(root):
+            return 0
+        time.sleep(0.2)
+    show_error("pyPOS is still running", "The managed register did not exit "
+               "after the stop request. Do not force-close during a sale. "
+               "Check the application log before restarting.")
+    return 1
 
 
 def managed_run(root, version_dir):
+    # Lock is held for the entire life of the child, not just process creation.
+    with instance_lock(root) as acquired:
+        if not acquired:
+            LOG.info("Another managed launcher already owns the register")
+            return 0
+        return _run_locked(root, version_dir)
+
+
+def _run_locked(root, version_dir):
     version = version_dir.name
     if not verify_installed(root, version):
         raise UpdateError("Application integrity verification failed")
     if read_version_file(root / "current.txt") != version:
         raise UpdateError("This is not the active application version")
     app_file = version_dir / binary_names()[0]
-    (root / "stop.request").unlink(missing_ok=True)
+    # Preserve stop requests issued while the launcher is starting.
     child = _start_child(app_file, cwd=version_dir)
     (root / "running.txt").write_text(str(child.pid), encoding="ascii")
     LOG.info("Started pyPOS %s (PID %s)", version, child.pid)
+    threading.Thread(target=_refresh_forwarder_when_unlocked,
+                     args=(root, version_dir), name="pypos-forwarder",
+                     daemon=True).start()
     started = time.monotonic()
 
     def updater():
@@ -244,6 +330,7 @@ def managed_run(root, version_dir):
     running = root / "running.txt"
     if running.is_file() and running.read_text(encoding="ascii").strip() == str(child.pid):
         running.unlink(missing_ok=True)
+    (root / "stop.request").unlink(missing_ok=True)
     if result != 0 and result != 73 and time.monotonic() - started < 15:
         prior = read_version_file(root / "previous.txt")
         if prior and prior != version and verify_installed(root, prior):
@@ -271,6 +358,12 @@ def main(argv=None):
         if here == root.resolve():
             stable_launch(root)
         else:
+            # Double-clicking an extracted release ZIP while billing is in
+            # progress must not change current.txt or replace installed bits.
+            if instance_active(root):
+                LOG.info("Existing register is running; deferring extracted-ZIP install")
+                webbrowser.open("http://127.0.0.1:8420/")
+                return 0
             stable = first_install(here, root)
             _start_child(stable, cwd=root)
         return 0

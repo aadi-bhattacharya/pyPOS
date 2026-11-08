@@ -485,9 +485,8 @@ def create_app(db_path=None, extra_hosts=()):
 
     @app.get("/staff-logout")
     def staff_logout():
-        session.pop("staff_user_id",None)
-        session.pop("staff_boot_nonce",None)
-        session.pop("settings_auth",None)
+        # Switching user also clears Settings unlock and session CSRF state.
+        session.clear()
         return redirect("/staff-login")
 
     @app.get("/api/staff/status")

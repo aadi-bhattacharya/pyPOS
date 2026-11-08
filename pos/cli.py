@@ -145,35 +145,20 @@ def _run(argv=None):
     print("  Press Ctrl+C to stop.\n")
 
     from waitress import create_server
+    from .server_lifecycle import serve_register
     # Bind before opening the browser: it must never open an older instance
     # after this server failed to acquire its listener.
+    channel_map = {}
     try:
-        server = create_server(app, host=args.host, port=args.port, threads=8)
+        server = create_server(app, host=args.host, port=args.port, threads=8,
+                               map=channel_map)
     except OSError as exc:
         raise PortBusyError(f"Could not bind {args.host}:{args.port}: {exc}") from exc
 
     if not args.no_browser:
         threading.Timer(1.2, lambda: webbrowser.open(url)).start()
 
-    stop_file = os.environ.get("PYPOS_STOP_FILE")
-    if stop_file:
-        path = Path(stop_file)
-        def listen_for_stop():
-            while True:
-                if path.is_file():
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                    logging.getLogger("pypos").info("Graceful shutdown requested from launcher")
-                    server.close()
-                    return
-                time.sleep(0.3)
-        threading.Thread(target=listen_for_stop, name="pypos-stop", daemon=True).start()
-    try:
-        server.run()
-    finally:
-        server.close()
+    serve_register(server, channel_map, os.environ.get("PYPOS_STOP_FILE"))
     return 0
 
 

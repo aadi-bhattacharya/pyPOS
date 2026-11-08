@@ -156,6 +156,12 @@ async function apiStaffBoot() {
   document.getElementById("help-btn").addEventListener("click", showShortcuts);
   const staffStatus = await apiStaffBoot();
   state.staff = staffStatus;
+  const operatorLabel = document.getElementById("sidebar-operator");
+  if (operatorLabel) {
+    const operator = staffStatus?.operator;
+    operatorLabel.textContent = operator
+      ? `${operator.display_name || operator.username} (${operator.role})` : "";
+  }
   if (staffStatus?.enabled && !staffStatus.operator) {
     window.location.replace("/staff-login"); return;
   }

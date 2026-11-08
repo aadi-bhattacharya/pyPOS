@@ -60,6 +60,28 @@ class AuthFlowTests(unittest.TestCase):
         # and a new browser session. Only admin_client() signs staff in.
         self.set_stored_password("")
 
+    def test_sidebar_account_switch_from_cashier_to_admin(self):
+        conn = connect(self.db_path)
+        try:
+            # Unique per test: the HTTP login must not inherit admin privileges.
+            staff.add_user(conn, "switchcash", "Counter operator", "cashier", "24681357")
+        finally:
+            conn.close()
+        c = self.client()
+        self.assertEqual(c.post("/staff-login", data={
+            "username": "switchcash", "pin": "24681357"}).status_code, 302)
+        self.assertNotEqual(c.get("/api/staff/status").json["operator"]["role"], "admin")
+        self.assertEqual(c.get("/api/staff/users").status_code, 403)
+        out = c.get("/staff-logout")
+        self.assertEqual(out.status_code, 302)
+        self.assertTrue(out.headers["Location"].endswith("/staff-login"))
+        self.assertIsNone(c.get("/api/staff/status").json["operator"])
+        self.assertEqual(c.get("/api/staff/users").status_code, 401)
+        self.assertEqual(c.post("/staff-login", data={
+            "username": "owner1", "pin": "12345678"}).status_code, 302)
+        self.assertEqual(c.get("/api/staff/status").json["operator"]["role"], "admin")
+        self.assertEqual(c.get("/api/staff/users").status_code, 200)
+
     def test_settings_open_for_signed_in_admin_when_no_password_configured(self):
         c = self.admin_client()
         r = c.put("/api/settings", json={"store_name": "Open Store"})
