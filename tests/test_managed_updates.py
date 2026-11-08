@@ -279,8 +279,10 @@ class DesktopShortcutTests(unittest.TestCase):
             shortcut = create_shortcut(target, system="linux", env={"XDG_DATA_HOME": str(root / "xdg")})
             content = shortcut.read_text()
             self.assertIn('Terminal=false', content)
-            # create_shortcut canonicalizes paths; Windows may expand short 8.3 names.
-            self.assertIn(str(target.resolve()), content)
+            # Desktop Entry escaping doubles backslashes on Windows hosts;
+            # compare the serialized Exec value rather than the raw path.
+            escaped = str(target.resolve()).replace("\\", "\\\\").replace('"', '\\"')
+            self.assertIn(f'Exec="{escaped}"', content)
             self.assertEqual(create_shortcut(target, system="linux", env={"XDG_DATA_HOME": str(root / "xdg")}), shortcut)
 
     def test_mac_creates_app_bundle_without_touching_store(self):

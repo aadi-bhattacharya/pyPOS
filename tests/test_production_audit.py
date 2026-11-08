@@ -79,18 +79,23 @@ class AuditOnlineRestoreTests(unittest.TestCase):
             path = str(Path(td) / 'shop.db')
             init_db(path)
             active = connect(path)
-            active.execute("INSERT INTO settings(key,value) VALUES('audit_mark','before')")
-            name = backups.create_backup(path)
-            active.execute("UPDATE settings SET value='after' WHERE key='audit_mark'")
-            backups.restore_backup(name, live_path=path)
-            current = connect(path)
-            self.assertEqual(active.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'before')
-            self.assertEqual(current.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'before')
-            active.execute("UPDATE settings SET value='latest' WHERE key='audit_mark'")
-            self.assertEqual(current.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'latest')
-            self.assertEqual(current.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
-            active.close()
-            current.close()
+            current = None
+            try:
+                active.execute("INSERT INTO settings(key,value) VALUES('audit_mark','before')")
+                name = backups.create_backup(path)
+                active.execute("UPDATE settings SET value='after' WHERE key='audit_mark'")
+                backups.restore_backup(name, live_path=path)
+                current = connect(path)
+                self.assertEqual(active.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'before')
+                self.assertEqual(current.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'before')
+                active.execute("UPDATE settings SET value='latest' WHERE key='audit_mark'")
+                self.assertEqual(current.execute("SELECT value FROM settings WHERE key='audit_mark'").fetchone()[0], 'latest')
+                self.assertEqual(current.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+            finally:
+                if current is not None:
+                    current.close()
+                active.close()
+
 
 class AuditPaymentPrecisionTests(POSTestCase):
     def setUp(self):

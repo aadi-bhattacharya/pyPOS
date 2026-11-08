@@ -3,9 +3,9 @@ from pathlib import Path
 import re
 
 ROOT=Path(__file__).resolve().parents[1]
-INDEX=(ROOT/'pos/templates/index.html').read_text()
-CSS=(ROOT/'pos/static/css/app.css').read_text()
-SOURCES={v:(ROOT/f'pos/static/js/views/{v}.js').read_text() for v in ['register','purchasing','stocktake']}
+INDEX=(ROOT/'pos/templates/index.html').read_text(encoding='utf-8')
+CSS=(ROOT/'pos/static/css/app.css').read_text(encoding='utf-8')
+SOURCES={v:(ROOT/f'pos/static/js/views/{v}.js').read_text(encoding='utf-8') for v in ['register','purchasing','stocktake']}
 STATIC_INDEX=re.sub(r'<link rel="stylesheet" href="/static/css/app.css">','',INDEX)
 STATIC_INDEX=re.sub(r'<script type="module" src="/static/js/app.js"></script>','',STATIC_INDEX)
 

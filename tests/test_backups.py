@@ -48,6 +48,17 @@ class BackupsTests(POSTestCase):
         backups.validate_database(path)  # must not raise
         self.assertFalse(result["pushed"])
 
+    def test_snapshot_fsync_uses_writable_fd_on_windows(self):
+        # CRT _commit() (used by os.fsync on Windows) rejects O_RDONLY.
+        # Check the production path rather than mocking away the sync.
+        with mock.patch.object(backups.os, "open", wraps=backups.os.open) as opened:
+            name = backups.create_backup(self.live_db)
+        self.assertTrue((self.bdir / name).is_file())
+        temp_opens = [call for call in opened.call_args_list
+                      if str(call.args[0]).endswith(".db")]
+        self.assertTrue(temp_opens)
+        self.assertEqual(temp_opens[-1].args[1] & 3, backups.os.O_RDWR)
+
     def test_online_backup_includes_wal_without_checkpointing_live_register(self):
         # Keep a live WAL connection open, as the running till would. A
         # snapshot must contain committed data without truncating the live WAL

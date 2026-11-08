@@ -191,8 +191,11 @@ def create_backup(source_path=None):
             if dest_conn is not None:
                 dest_conn.close()
 
-        # Durable rename: fsync file, replace, fsync directory.
-        fd = os.open(str(tmp), os.O_RDONLY)
+        # On Windows, os.fsync() uses the CRT _commit(), which requires a
+        # writable file descriptor. O_RDONLY works on POSIX but raises EBADF
+        # on Windows, leaving every backup (including API backups) broken.
+        # SQLite has already closed the snapshot before this durability step.
+        fd = os.open(str(tmp), os.O_RDWR)
         try:
             os.fsync(fd)
         finally:
