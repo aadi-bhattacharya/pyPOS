@@ -46,6 +46,17 @@ for (const [file, exported] of Object.entries(expected)) {
   }
 }
 const html = (await import('node:fs')).readFileSync(resolve(root, 'pos/templates/index.html'), 'utf8');
+// Regression: GET /api/cash-sessions/current is a flattened session object,
+// not { session: {...}, report: {...} } like the POST open/close responses.
+// This check runs on every native-binary CI build, even without Chromium.
+const { isOpenCashSession } = await import(
+  pathToFileURL(resolve(jsRoot, 'views/register.js')));
+assert.equal(isOpenCashSession({ id: 19, opened_at: '2026-11-08 09:00:00',
+  closed_at: null, report: {} }), true, 'open day must permit payment');
+assert.equal(isOpenCashSession(null), false, 'closed day must block payment');
+assert.equal(isOpenCashSession({ id: 19, closed_at: '2026-11-08 18:00:00' }), false);
+assert.equal(isOpenCashSession({ session: { id: 19, closed_at: null } }), false,
+  'unexpected API response must not permit payment');
 assert.match(html, /data-view="cash"/, 'Cash Drawer must remain in main navigation');
 assert.match(html, /data-view="refunds"/, 'Returns must be directly accessible from navigation');
 console.log(`PASS: ${files.length} ES modules parse; all page imports and Cash Drawer exports link.`);

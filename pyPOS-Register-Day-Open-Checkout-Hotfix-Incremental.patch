@@ -1,0 +1,127 @@
+diff --git a/pos/static/js/views/register.js b/pos/static/js/views/register.js
+index a57166d..85d3bca 100644
+--- a/pos/static/js/views/register.js
++++ b/pos/static/js/views/register.js
+@@ -950,11 +950,19 @@ async function refreshCatalog() {
+   renderTiles();
+ }
+ 
++// /api/cash-sessions/current returns the session fields directly (plus
++// report); only the POST open/close responses wrap them in { session, report }.
++// Reject unexpected payloads rather than guessing that the till is open.
++export function isOpenCashSession(session) {
++  return Boolean(session && Number.isInteger(session.id) && session.id > 0 &&
++    session.closed_at === null);
++}
++
+ async function openPayment() {
+   if (cart.size === 0) return;
+   try {
+     const session = await api.currentSession();
+-    if (!session || !session.session || session.session.closed_at) {
++    if (!isOpenCashSession(session)) {
+       toast("Start Day in Cash Drawer before collecting payment.", "warn");
+       return;
+     }
+diff --git a/tests/check_frontend_modules.mjs b/tests/check_frontend_modules.mjs
+index fe3667b..89b7475 100644
+--- a/tests/check_frontend_modules.mjs
++++ b/tests/check_frontend_modules.mjs
+@@ -46,6 +46,17 @@ for (const [file, exported] of Object.entries(expected)) {
+   }
+ }
+ const html = (await import('node:fs')).readFileSync(resolve(root, 'pos/templates/index.html'), 'utf8');
++// Regression: GET /api/cash-sessions/current is a flattened session object,
++// not { session: {...}, report: {...} } like the POST open/close responses.
++// This check runs on every native-binary CI build, even without Chromium.
++const { isOpenCashSession } = await import(
++  pathToFileURL(resolve(jsRoot, 'views/register.js')));
++assert.equal(isOpenCashSession({ id: 19, opened_at: '2026-11-08 09:00:00',
++  closed_at: null, report: {} }), true, 'open day must permit payment');
++assert.equal(isOpenCashSession(null), false, 'closed day must block payment');
++assert.equal(isOpenCashSession({ id: 19, closed_at: '2026-11-08 18:00:00' }), false);
++assert.equal(isOpenCashSession({ session: { id: 19, closed_at: null } }), false,
++  'unexpected API response must not permit payment');
+ assert.match(html, /data-view="cash"/, 'Cash Drawer must remain in main navigation');
+ assert.match(html, /data-view="refunds"/, 'Returns must be directly accessible from navigation');
+ console.log(`PASS: ${files.length} ES modules parse; all page imports and Cash Drawer exports link.`);
+diff --git a/tests/smoke_cash_drawer.py b/tests/smoke_cash_drawer.py
+index 47b6932..eecf115 100644
+--- a/tests/smoke_cash_drawer.py
++++ b/tests/smoke_cash_drawer.py
+@@ -61,16 +61,33 @@ with sync_playwright() as pw:
+         const path=String(url);
+         const method=opts.method||'GET';
+         let result=null;
+-        if (path==='/api/settings') result=data.settings;
++        if (path==='/api/staff/status') result={enabled:true,operator:{id:1,role:'admin',display_name:'Owner'}};
++        else if (path==='/api/settings') result=data.settings;
+         else if (path==='/api/products') result=data.products;
+         else if (path==='/api/groups') result=data.groups;
+         else if (path==='/api/categories') result=[];
+         else if (path==='/api/parked') result=[];
++        else if (path==='/api/lookup?code=TS-001') result=data.products[0];
+         else if (path==='/api/cash-sessions/current') result=window.__session;
+         else if (path==='/api/cash-sessions') result=window.__history;
++        else if (path==='/api/sales' && method==='POST') {
++          if (!window.__session) return {ok:false,status:409,
++            json:async()=>({error:'Open the day in Cash Drawer before recording monetary transactions'})};
++          const payload=JSON.parse(opts.body);
++          if (payload.items.length!==1 || payload.items[0].product_id!==1) {
++            return {ok:false,status:400,json:async()=>({error:'Unexpected sale payload'})};
++          }
++          window.__operations.push('checkout');
++          result={id:1, invoice_number:'26-27/000001', status:'COMPLETED',
++            timestamp:'2026-11-08 06:30:00', subtotal:500,
++            discount_total:0, tax_total:25, total:525,
++            payments:[{method:'CASH',amount:525}], items:[{name:'Basic T-Shirt',
++              quantity:1,unit_price:500,line_total:500,tax_rate:5}],
++            invoice:{store_name:'Demo',currency:'₹'}};
++        }
+         else if (path==='/api/cash-sessions/open' && method==='POST') {
+           window.__operations.push('open');
+-          window.__session={id:2,opened_at:'2026-11-05 05:30:00',report:data.report};
++          window.__session={id:2,opened_at:'2026-11-05 05:30:00',closed_at:null,report:data.report};
+           result={session:window.__session,report:data.report};
+         }
+         else if (path==='/api/cash-sessions/close' && method==='POST') {
+@@ -106,6 +123,23 @@ with sync_playwright() as pw:
+     page.locator('.modal-overlay').wait_for(timeout=6000)
+     assert 'X read-out' in page.locator('.modal-overlay').inner_text()
+     page.locator('.modal-overlay button:has-text("Done")').click()
++    # Real register flow: the current-session GET returns {id, closed_at, report},
++    # while the POST /open response uses {session, report}. Payment must follow
++    # the GET shape after Start Day, and must be denied again after End Day.
++    page.locator('#reg-search').fill('TS-001')
++    page.locator('#reg-search').press('Enter')
++    page.locator('.cart-line').wait_for(timeout=6000)
++    page.locator('.cart-summary button:has-text("Charge")').click()
++    page.locator('.modal-overlay:has-text("Take payment")').wait_for(timeout=6000)
++    page.locator('.modal-overlay button:has-text("Complete sale")').click()
++    page.locator('.modal-overlay:has-text("Invoice 26-27/000001 complete")').wait_for(timeout=6000)
++    page.locator('.modal-overlay button:has-text("Done")').click()
++    assert page.evaluate('window.__operations')==['open','checkout']
++
++    # Leave another item in the cart to confirm a genuinely closed day blocks it.
++    page.locator('#reg-search').fill('TS-001')
++    page.locator('#reg-search').press('Enter')
++    page.locator('.cart-line').wait_for(timeout=6000)
+     page.locator('.reg-cash-strip button:has-text("End Day")').click()
+     page.locator('.modal-overlay input[type="number"]').fill('990')
+     page.locator('.modal-overlay button:has-text("Close day")').click()
+@@ -113,10 +147,13 @@ with sync_playwright() as pw:
+     assert 'Z report' in page.locator('.modal-overlay').inner_text()
+     page.locator('.modal-overlay button:has-text("Done")').click()
+     page.locator('.reg-cash-strip button:has-text("Start Day")').wait_for(timeout=6000)
+-    assert page.evaluate('window.__operations')==['open','close']
++    page.locator('.cart-summary button:has-text("Charge")').click()
++    page.get_by_text('Start Day in Cash Drawer before collecting payment.').wait_for(timeout=6000)
++    assert page.locator('.modal-overlay').count()==0, 'Closed day must not take payment'
++    assert page.evaluate('window.__operations')==['open','checkout','close']
+     page.locator('#nav a[data-view="cash"]').click()
+     page.locator('#main h2:has-text("Cash Drawer")').wait_for(timeout=6000)
+     assert 'RECENT DAYS' in page.locator('#main').inner_text()
+     assert not errors,errors
+-    print('PASS: Register cash status; Start Day; cash balance; X; End Day; Z; drawer page and history; no JS errors')
++    print('PASS: Register cash status; open-day payment gate; closed-day payment rejection; Start Day; cash balance; X; End Day; Z; drawer page and history; no JS errors')
+     browser.close()

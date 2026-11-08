@@ -950,11 +950,19 @@ async function refreshCatalog() {
   renderTiles();
 }
 
+// /api/cash-sessions/current returns the session fields directly (plus
+// report); only the POST open/close responses wrap them in { session, report }.
+// Reject unexpected payloads rather than guessing that the till is open.
+export function isOpenCashSession(session) {
+  return Boolean(session && Number.isInteger(session.id) && session.id > 0 &&
+    session.closed_at === null);
+}
+
 async function openPayment() {
   if (cart.size === 0) return;
   try {
     const session = await api.currentSession();
-    if (!session || !session.session || session.session.closed_at) {
+    if (!isOpenCashSession(session)) {
       toast("Start Day in Cash Drawer before collecting payment.", "warn");
       return;
     }
