@@ -12,6 +12,21 @@ from pos import cash_sessions, settings as cfg, thermal_print as tp
 from pos.db import connect, init_db
 
 
+class ReceiptTimezoneTests(unittest.TestCase):
+    def test_utc_timestamp_is_rendered_in_ist_without_iana_tzdata(self):
+        # Windows does not bundle the IANA Asia/Kolkata zone database.
+        self.assertEqual(tp._printed_date('2026-11-08T18:45:00+00:00'),
+                         '09 Nov 2026 12:15 AM IST')
+
+    def test_naive_database_timestamp_preserves_previous_utc_assumption(self):
+        self.assertEqual(tp._printed_date('2026-11-08 09:00:00'),
+                         '08 Nov 2026 02:30 PM IST')
+
+    def test_missing_or_invalid_timestamp_is_safe(self):
+        self.assertEqual(tp._printed_date(None), '')
+        self.assertEqual(tp._printed_date('invalid-date'), 'invalid-date')
+
+
 class ReceiptRasterTests(unittest.TestCase):
     def test_tm_t81_width_and_escpos_bit_count(self):
         from PIL import ImageDraw

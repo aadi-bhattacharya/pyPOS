@@ -12,11 +12,14 @@ import io
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from zoneinfo import ZoneInfo
 
 PAPER_DOTS = 512  # TM-T81: 79.5 mm paper, ~72.2 mm printable area
+# India uses UTC+05:30 year-round for current POS transactions. A fixed
+# offset avoids depending on an OS IANA zone database, missing on many
+# Windows systems and some frozen builds.
+INDIA_TIMEZONE = timezone(timedelta(hours=5, minutes=30))
 MAX_IMAGE_HEIGHT = 60000
 
 
@@ -45,7 +48,7 @@ def _printed_date(value):
         dt = datetime.fromisoformat(str(value).replace(' ', 'T').replace('Z', '+00:00'))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(ZoneInfo('Asia/Kolkata')).strftime('%d %b %Y %I:%M %p IST')
+        return dt.astimezone(INDIA_TIMEZONE).strftime('%d %b %Y %I:%M %p IST')
     except (ValueError, OverflowError):
         return _clean(value)
 
