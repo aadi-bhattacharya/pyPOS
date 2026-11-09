@@ -255,6 +255,52 @@ function brandingSettingsCard(main, saved) {
       } }, "Remove uploaded POS logo")));
 }
 
+function returnPolicyCard(main, saved) {
+  const rules = [
+    ["refund_allow_original", "Record cash / card / UPI refunds",
+      "Off: staff cannot issue a direct payout/refund. Existing recorded refunds remain unchanged."],
+    ["refund_allow_credit", "Issue named-customer store credit",
+      "Credit requires a registered customer ID. An anonymous shopper cannot hold a balance without an identity."],
+    ["exchange_allow", "Allow item exchanges",
+      "An exchange creates a linked return and new sale in one transaction."],
+    ["exchange_allow_anonymous", "Allow walk-in exchanges without customer details",
+      "No name or phone required; the return offsets the replacement invoice directly, with no cash payout or wallet."],
+    ["exchange_allow_forfeit_difference", "Allow forfeiting unused exchange value",
+      "Off by default. If the replacement costs less and no credit can be issued, block the exchange. When enabled, the cashier must explicitly acknowledge the forfeited amount; it is recorded for audit. Confirm this policy is lawful before enabling it."],
+  ];
+  const boxes = Object.fromEntries(rules.map(([key]) => [key,
+    h("input", { type: "checkbox", checked: saved[key] !== "false" &&
+      (key !== "exchange_allow_forfeit_difference" || saved[key] === "true") })]));
+  return h("div", { class: "card card-pad", style: "margin-top:16px" },
+    h("h3", { style: "margin-bottom:6px" }, "Returns & exchange rules"),
+    h("p", { class: "form-hint", style: "margin-bottom:12px" },
+      "Administrator policy. Enforced by the server, not only by the cashier screen. " +
+      "Changing a rule affects future returns and exchanges, not historical documents."),
+    ...rules.map(([key, label, help]) =>
+      h("div", { style: "margin-bottom:12px" },
+        h("label", { class: "credit-toggle" }, boxes[key], h("span", {}, label)),
+        h("p", { class: "form-hint" }, help))),
+    h("button", { class: "btn primary", onclick: async () => {
+      const values = Object.fromEntries(rules.map(([key]) =>
+        [key, boxes[key].checked ? "true" : "false"]));
+      if (values.exchange_allow_forfeit_difference === "true" &&
+          saved.exchange_allow_forfeit_difference !== "true") {
+        if (!(await confirmDialog({
+          title: "Allow forfeiting exchange differences?",
+          message: "This permits the store to retain the unused value of a return " +
+            "when no customer credit is issued. The cashier must explicitly confirm each case. " +
+            "Check consumer protection and GST treatment before enabling this rule.",
+          confirmLabel: "Enable with acknowledgement", danger: true,
+        }))) return;
+      }
+      try {
+        state.settings = await api.saveSettings(values);
+        toast("Returns & exchange rules saved.", "success");
+        renderSettingsView(main);
+      } catch (e) { toastError(e); }
+    } }, icon("i-check"), "Save return rules"));
+}
+
 export async function renderSettingsView(main) {
   const authState = await api.settingsAuth();
   if (authState.configured && !authState.authenticated) {
@@ -319,6 +365,20 @@ export async function renderSettingsView(main) {
   const localTaxSelect = h("select", { class: "input" },
     ...["SGST", "UTGST"].map((x) =>
       h("option", { value: x, selected: s.store_local_tax === x }, x)));
+  const printMode = h("select", { class: "input", "aria-label": "Receipt printer output mode" },
+    ...[["thermal", "Epson TM-T81 (direct, no dialog)"],
+       ["browser", "Browser / PDF (manual print dialog)"]].map(([v, label]) =>
+      h("option", { value: v, selected: s.receipt_print_mode === v }, label)));
+  const autoPrint = h("input", { type: "checkbox", checked: s.receipt_auto_print !== "false" });
+  const printerQueue = h("input", { class: "input", type: "text", maxlength: "160",
+    value: s.receipt_printer_name || "", placeholder: "Blank = default OS printer",
+    "aria-label": "Installed printer queue name" });
+  const printerInfo = h("p", { class: "form-hint", "aria-live": "polite" },
+    "The installed printer must accept RAW ESC/POS, not PDF or ordinary driver-rendered pages.");
+  void api.printingInfo().then(info => {
+    printerInfo.textContent = `OS: ${info.platform}. Default printer: ${info.default_printer || "none detected"}. ` +
+      "You can leave the printer name blank to use this default.";
+  }).catch(() => {});
   const showLogo = h("input", { type: "checkbox", checked: s.show_receipt_logo === "true" });
   const logoWidth = h("input", { class: "input num", type: "number", min: "12",
     max: "65", value: s.receipt_logo_width || "32", step: "1" });
@@ -361,8 +421,14 @@ export async function renderSettingsView(main) {
       "A receipt heading alone does not establish GST compliance. Confirm the required invoice fields, " +
       "e-invoicing applicability and treatment of each supply with your accountant."),
     h("p", { class: "form-hint", style: "margin-bottom:12px" },
-      "Choose paper width for browser printing, export to PDF via the print dialog, and optionally print your shop logo. " +
-      "Select matching paper size in the printer's own dialog as well."),
+      "Direct thermal printing submits ESC/POS receipts through your computer's printer spooler. " +
+      "The Epson TM-T81 has 512 printable dots (about 72 mm) on nominal 80 mm stock. " +
+      "Use the printer's RAW queue on Windows, Linux or macOS. A queued job does not guarantee that paper emerged."),
+    h("div", { class: "field" }, h("label", {}, "Print output"), printMode),
+    h("label", { class: "credit-toggle" }, autoPrint,
+      h("span", {}, "Automatically print completed sales, returns and exchanges")),
+    h("div", { class: "field" }, h("label", {}, "Installed printer queue (optional)"), printerQueue),
+    printerInfo,
     h("div", { class: "field" }, h("label", {}, "How are product prices entered?"), priceTaxSelect,
       h("p", { class: "form-hint" }, "This setting changes how ALL catalog prices are interpreted for NEW sales. " +
         "Do not switch it without reviewing your SKU prices. Past invoices and refunds keep their original mode.")),
@@ -380,6 +446,9 @@ export async function renderSettingsView(main) {
         try {
           const values = {
             receipt_paper: paperSelect.value,
+            receipt_print_mode: printMode.value,
+            receipt_auto_print: autoPrint.checked ? "true" : "false",
+            receipt_printer_name: printerQueue.value.trim(),
             price_tax_mode: priceTaxSelect.value,
             receipt_heading: titleSelect.value,
             receipt_logo_width: logoWidth.value,
@@ -395,8 +464,17 @@ export async function renderSettingsView(main) {
           renderSettingsView(main);
         } catch (e) { toastError(e); }
       } }, icon("i-check"), "Save print settings"),
-      h("button", { class: "btn", onclick: () => {
-        // Explicitly non-transactional calibration slip, not a fabricated sale.
+      h("button", { class: "btn", onclick: async () => {
+        if (state.settings.receipt_print_mode === "thermal") {
+          try {
+            // Read from SAVED settings, not unsaved form edits, avoiding a
+            // silent test to the wrong printer or paper setting.
+            const job = await api.testThermalPrinter();
+            toast(`Test slip queued for ${job.printer}.`, "success");
+          } catch (e) { toastError(e, "Thermal test print failed"); }
+          return;
+        }
+        // Browser/PDF mode is deliberately manual and uses the print dialog.
         const settingsNow = { ...state.settings, receipt_paper: paperSelect.value,
           show_receipt_logo: showLogo.checked ? "true" : "false",
           receipt_logo_width: logoWidth.value };
@@ -634,6 +712,7 @@ export async function renderSettingsView(main) {
       imageOptimizerCard(),
       taxCard,
       loyaltyCard,
+      returnPolicyCard(main, s),
       h("div", { class: "card card-pad", style: "margin-top:16px" },
         h("h3", { style: "margin-bottom:8px" }, "Staff menu visibility"),
         h("p", { class: "form-hint", style: "margin-bottom:12px" },

@@ -1,5 +1,5 @@
 // DOM builder, toasts, modals, confirms.
-import { state } from "./api.js";
+import { api, state } from "./api.js";
 
 export function h(tag, attrs = {}, ...children) {
   const el = document.createElement(tag);
@@ -126,14 +126,34 @@ export function confirmDialog({ title = "Are you sure?", message = "", confirmLa
   });
 }
 
-// Renders receipt HTML into the hidden print area and opens the print dialog.
-export function printReceipt(receiptEl) {
+// In thermal mode only the local pyPOS backend may submit RAW ESC/POS jobs.
+// Never allow receipt HTML, printer commands, or payment details from the
+// browser to be the authoritative printable invoice. All values come from DB.
+export async function printReceipt(receiptEl, recordedSale = null, { automatic = false } = {}) {
+  if (state.settings.receipt_print_mode === "thermal") {
+    if (!recordedSale?.id) {
+      toast("Only recorded invoices can be sent directly to the thermal printer.", "warn");
+      return;
+    }
+    try {
+      const result = await api.printRecordedSale(recordedSale.id, !automatic);
+      if (!automatic && result.status === "spooled")
+        toast(`Receipt queued for ${result.printer}.`, "success");
+      if (automatic && result.status === "already_requested" && result.previous_status !== "SPOOLED")
+        toast("This receipt has an earlier print attempt. Check the printer and use Print to retry.", "warn");
+    } catch (error) {
+      toastError(error, automatic
+        ? "Sale recorded, but the receipt did not print"
+        : "Receipt printing failed; sale was not modified");
+    }
+    return;
+  }
+  if (automatic) return; // Never open browser dialogs automatically.
   const root = document.getElementById("print-root");
   root.innerHTML = "";
   root.dataset.paper = state.settings.receipt_paper || "80mm";
   root.append(receiptEl.cloneNode(true));
-  // Let the embedded logo load before opening the browser print dialog.
   const images = [...root.querySelectorAll("img")];
-  Promise.all(images.map((img) => img.decode?.().catch(() => {}) || Promise.resolve()))
-    .then(() => window.print());
+  await Promise.all(images.map((img) => img.decode?.().catch(() => {}) || Promise.resolve()));
+  window.print();
 }

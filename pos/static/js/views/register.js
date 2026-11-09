@@ -1255,10 +1255,17 @@ async function openPayment() {
       }
       saveCart();
       renderCart();
-      await refreshCatalog();
-      if (cashStripEl?.isConnected) await renderCashStatusStrip(cashStripEl);
+      // The sale is already committed. Show/queue its receipt before optional
+      // dashboard refresh requests; a network failure there must never be
+      // misreported as an unsuccessful sale or suppress automatic printing.
       modal.close();
       showReceiptModal(receipt);
+      try {
+        await refreshCatalog();
+        if (cashStripEl?.isConnected) await renderCashStatusStrip(cashStripEl);
+      } catch (refreshError) {
+        toast("Sale recorded and receipt prepared. Refresh the register to update stock display.", "warn");
+      }
     } catch (e) {
       toastError(e, "Sale failed");
       completeBtn.disabled = false;
@@ -1306,11 +1313,16 @@ export function showReceiptModal(receipt) {
     footer: [
       h("button", {
         class: "btn",
-        onclick: () => printReceipt(receiptEl),
+        onclick: () => printReceipt(receiptEl, receipt),
       }, icon("i-printer"), "Print"),
       h("button", { class: "btn primary", onclick: () => m.close() }, "Done"),
     ],
   });
+  // This is reached only for a committed sale, refund, or exchange invoice.
+  // An offline printer must never undo the transaction or empty the cart again.
+  if (state.settings.receipt_auto_print === "true") {
+    void printReceipt(receiptEl, receipt, { automatic: true });
+  }
 }
 
 // ================= keyboard helpers =================

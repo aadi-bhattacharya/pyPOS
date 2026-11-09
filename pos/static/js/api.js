@@ -85,6 +85,14 @@ export const api = {
   setStaffPermissions: (id, permissions) =>
     request(`/staff/users/${id}/permissions`, { method: "PUT", body: { permissions } }),
 
+  // Local operating system RAW thermal printer (no browser print dialog).
+  printingInfo: () => request("/printing/info"),
+  testThermalPrinter: () => request("/printing/test", { method: "POST", body: {} }),
+  printRecordedSale: (id, manual = false) => request(`/printing/sales/${id}`, {
+    method: "POST", body: { manual },
+  }),
+  printSessionReport: (id) => request(`/printing/reports/${id}`, { method: "POST", body: {} }),
+
   // settings
   getSettings: () => request("/settings"),
   saveSettings: (values) => request("/settings", { method: "PUT", body: values }),
@@ -162,9 +170,14 @@ export const api = {
   getSale: (id) => request(`/sales/${id}`),
   refundSale: (id, payload = {}) =>
     request(`/sales/${id}/refund`, { method: "POST", body: payload }),
-  previewRefund: (id, lines, toCredit = false) =>
+  previewRefund: (id, lines, toCredit = false, creditCustomerId = null) =>
     request(`/sales/${id}/refund/preview`,
-      { method: "POST", body: { lines, to_credit: toCredit } }),
+      { method: "POST", body: { lines, to_credit: toCredit,
+        credit_customer_id: creditCustomerId } }),
+  previewExchange: (id, payload) =>
+    request(`/sales/${id}/exchange/preview`, { method: "POST", body: payload }),
+  exchangeSale: (id, payload) =>
+    request(`/sales/${id}/exchange`, { method: "POST", body: payload }),
   voidSale: (id) => request(`/sales/${id}/void`, { method: "POST" }),
 
   // customers & store credit

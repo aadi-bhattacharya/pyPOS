@@ -11,7 +11,7 @@ from pathlib import Path
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, send_file, session
 
 from pos.db import connect, init_db
-from pos import catalog, reports, sales, backups, gdrive
+from pos import catalog, reports, sales, exchanges, backups, gdrive
 from pos import customers as customers_mod
 from pos import parked as parked_mod
 from pos import cash_sessions
@@ -22,6 +22,7 @@ from pos import catalog_import
 from pos import operations
 from pos import staff
 from pos import stock_policy
+from pos import thermal_print
 from pos.demo import seed_demo_data
 from pos.security import install_security, issue_csrf_token
 from pos.india import LOGO_PATTERN
@@ -329,7 +330,8 @@ def create_app(db_path=None, extra_hosts=()):
         # toggle cannot grant Settings auth, backups, staff editing or demo reset.
         endpoint = request.endpoint or ""
         owner_only = (endpoint.startswith(("api_staff_", "api_backup_", "api_backups_", "api_gdrive_"))
-                      or endpoint in ("api_settings_put", "api_settings_password", "api_demo"))
+                      or endpoint in ("api_settings_put", "api_settings_password", "api_demo",
+                                      "api_thermal_print_test", "api_thermal_print_info"))
         if owner_only and g.staff_actor["role"] != "admin":
             return jsonify({"error": "Owner/administrator access required",
                             "code": "staff_forbidden"}), 403
@@ -368,8 +370,12 @@ def create_app(db_path=None, extra_hosts=()):
             "api_supplier_payment": "manage_purchases", "api_stocktake_start": "stocktakes",
             "api_stocktake_count": "stocktakes", "api_stocktake_post": "stocktakes",
             "api_checkout": "checkout", "api_parked_create": "checkout",
+            "api_thermal_print_sale": "checkout",
+            "api_thermal_print_report": "view_reports",
             "api_parked_delete": "checkout", "api_sale_refund_preview": "refund_sales",
             "api_sale_refund": "refund_sales", "api_sale_void": "void_sales",
+            "api_sale_exchange_preview": "refund_sales",
+            "api_sale_exchange": "refund_sales",
             "api_customers_create": "manage_customers", "api_customer_update": "manage_customers",
             "api_customer_delete": "delete_customers", "api_customer_credit": "manage_credit",
             "api_loyalty_adjust": "manage_loyalty", "api_loyalty_redeem": "manage_loyalty",
@@ -378,6 +384,13 @@ def create_app(db_path=None, extra_hosts=()):
             "api_catalog_import_preview": "import_stock",
             "api_catalog_import_apply": "import_stock",
         }
+        # An exchange is both a return and a new sale. Refund permission alone
+        # must not let an operator bypass the checkout capability.
+        if (endpoint in ("api_sale_exchange", "api_sale_exchange_preview")
+                and g.staff_actor["role"] != "admin"
+                and not staff.can(g.staff_actor, "checkout")):
+            return jsonify({"error": "Permission required: checkout",
+                            "code": "staff_forbidden"}), 403
         if endpoint == "api_stock":
             # Safe integer parsing and reason validation are also enforced in
             # api_stock. Reject malformed deltas there, never default to +.
@@ -1043,7 +1056,8 @@ def create_app(db_path=None, extra_hosts=()):
     def api_sale_refund_preview(sid):
         data = body()
         return jsonify(sales.preview_refund(get_db(), sid, lines=data.get("lines"),
-                                          to_credit=bool(data.get("to_credit"))))
+                                          to_credit=bool(data.get("to_credit")),
+                                          credit_customer_id=data.get("credit_customer_id")))
 
     @app.post("/api/sales/<int:sid>/refund")
     def api_sale_refund(sid):
@@ -1057,7 +1071,34 @@ def create_app(db_path=None, extra_hosts=()):
                                          to_credit=to_credit,
                                          reason=data.get("reason", ""),
                                          request_id=data.get("request_id"),
+                                         credit_customer_id=data.get("credit_customer_id"),
                                          require_open_session=True))
+
+    @app.post("/api/sales/<int:sid>/exchange/preview")
+    def api_sale_exchange_preview(sid):
+        data = body()
+        return jsonify(exchanges.preview_exchange(
+            get_db(), sid, returns=data.get("returns"),
+            replacements=data.get("replacements"), customer_id=data.get("customer_id"),
+            supply_type=data.get("supply_type", "intra"),
+            place_of_supply=data.get("place_of_supply", "")))
+
+    @app.post("/api/sales/<int:sid>/exchange")
+    def api_sale_exchange(sid):
+        denied = require_open_day()
+        if denied is not None:
+            return denied
+        data = body()
+        return jsonify(exchanges.exchange_sale(
+            get_db(), sid, returns=data.get("returns"),
+            replacements=data.get("replacements"), customer_id=data.get("customer_id"),
+            payments=data.get("payments"), reason=data.get("reason", ""),
+            request_id=data.get("request_id"),
+            supply_type=data.get("supply_type", "intra"),
+            place_of_supply=data.get("place_of_supply", ""),
+            salesperson=g.staff_actor["display_name"],
+            require_open_session=True,
+            accept_forfeit=data.get("accept_forfeit", False))), 201
 
     @app.post("/api/sales/<int:sid>/void")
     def api_sale_void(sid):
@@ -1083,6 +1124,55 @@ def create_app(db_path=None, extra_hosts=()):
     def api_settings_put():
         updated = settings_mod.save_settings(get_db(), body())
         return jsonify(updated)
+
+    # ---------------- direct thermal printing ----------------
+    # Print only invoices fetched from the server's own database. Never accept
+    # arbitrary ESC/POS or user-provided receipt HTML from the browser.
+    @app.get("/api/printing/info")
+    def api_thermal_print_info():
+        try:
+            default = thermal_print.default_printer()
+        except (OSError, thermal_print.PrinterError):
+            default = ""
+        return jsonify({"platform": __import__("sys").platform, "default_printer": default})
+
+    @app.post("/api/printing/test")
+    def api_thermal_print_test():
+        cfg = settings_mod.get_settings(get_db())
+        if cfg.get("receipt_print_mode") != "thermal":
+            return fail(400, "Enable thermal printing and save your printer settings first")
+        try:
+            printer = thermal_print.send_image(thermal_print.render_test(cfg), cfg)
+        except thermal_print.PrinterError as e:
+            return fail(503, e)
+        return jsonify({"status": "spooled", "printer": printer})
+
+    @app.post("/api/printing/sales/<int:sid>")
+    def api_thermal_print_sale(sid):
+        payload = body()
+        manual = payload.get("manual", False)
+        if type(manual) is not bool:
+            return fail(400, "manual must be a boolean")
+        try:
+            result = thermal_print.print_recorded_sale(get_db(), sid, manual=manual)
+        except thermal_print.PrinterError as e:
+            # Sale/refund/exchange was already committed. A printer failure must
+            # never be surfaced as a failed financial transaction.
+            return fail(503, e)
+        return jsonify(result)
+
+    @app.post("/api/printing/reports/<int:sid>")
+    def api_thermal_print_report(sid):
+        cfg = settings_mod.get_settings(get_db())
+        if cfg.get("receipt_print_mode") != "thermal":
+            return fail(400, "Enable thermal printing first")
+        try:
+            report = cash_sessions.session_report(get_db(), sid)
+            printer = thermal_print.send_image(
+                thermal_print.render_z_report(report, cfg), cfg)
+        except thermal_print.PrinterError as e:
+            return fail(503, e)
+        return jsonify({"status": "spooled", "printer": printer})
 
     # ---------------- demo ----------------
     @app.post("/api/demo-data")
@@ -1445,7 +1535,9 @@ def create_app(db_path=None, extra_hosts=()):
             ["refund_receipt_id", "timestamp_utc", "original_sale_id",
              "original_invoice_number", "customer_id", "reason",
              "subtotal", "discount", "recorded_gst", "total_refunded",
-             "cash", "card", "upi", "store_credit", "refund_number"],
+             "cash", "card", "upi", "store_credit", "settlement_type",
+             "exchange_offset", "exchange_forfeited", "replacement_invoice",
+             "refund_number"],
             "pypos-refunds.csv")
 
     @app.get("/api/export/sales.csv")

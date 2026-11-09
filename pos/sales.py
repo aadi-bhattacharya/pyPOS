@@ -169,7 +169,7 @@ def compute_totals(lines, discount_mode=None, discount_value=None, tax_inclusive
     }
 
 
-def _normalize_items(conn, items):
+def _normalize_items(conn, items, stock_additions=None):
     """Merge duplicate products, validate shape, fetch live product data."""
     if not isinstance(items, list) or not items:
         raise InvalidSaleError("Cart is empty")
@@ -207,9 +207,10 @@ def _normalize_items(conn, items):
         if row is None:
             raise ProductNotFoundError(f"No product with id {pid}")
         item = merged[pid]
-        if item["quantity"] > row["quantity"]:
+        available = row["quantity"] + (stock_additions or {}).get(pid, 0)
+        if item["quantity"] > available:
             name = row["group_name"] or f"Product {pid}"
-            raise InsufficientStockError(f"{name}: only {row['quantity']} left in stock")
+            raise InsufficientStockError(f"{name}: only {available} left in stock")
         attributes = cur.execute(
             """SELECT attribute_name, attribute_value FROM product_attributes
                WHERE product_id = ? ORDER BY attribute_name COLLATE NOCASE""", (pid,)).fetchall()
@@ -356,7 +357,8 @@ def _split_refund(total, parts):
 def checkout(conn, items, payments=None, discount_mode=None, discount_value=None,
              customer_id=None, use_credit=False, supply_type="intra", place_of_supply="",
              request_id=None, salesperson=None, require_open_session=False,
-             max_discount_percent=None):
+             max_discount_percent=None, credit_limit_cents=None,
+             manage_transaction=True, exchange_offset_cents=0):
     """
     Complete a sale atomically: validate stock, recompute all money server-side,
     insert sale + items + payments, decrement inventory (via trigger), commit.
@@ -365,6 +367,12 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
     `use_credit` any available store credit is spent first and the rest of the
     balance due must be covered by `payments`.
     """
+    # Exchange offsets are caller-owned atomic settlements, not a checkout API
+    # option. A normal sale must never be able to invent a noncash payment.
+    if type(exchange_offset_cents) is not int or exchange_offset_cents < 0:
+        raise InvalidSaleError("Invalid exchange settlement")
+    if exchange_offset_cents and (manage_transaction or use_credit or request_id is not None):
+        raise InvalidSaleError("Exchange settlement requires a dedicated atomic exchange")
     # Free-text sales attribution is independent of staff login and is never
     # included in the legal invoice snapshot or customer-facing receipt.
     if salesperson is None:
@@ -388,7 +396,10 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
         "supply_type": supply_type, "place_of_supply": place_of_supply,
         "salesperson": salesperson},
         sort_keys=True, default=str, ensure_ascii=False).encode("utf-8")).hexdigest()
-    conn.execute("BEGIN IMMEDIATE")
+    if manage_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    elif not conn.in_transaction:
+        raise RuntimeError("Checkout requires an existing transaction")
     try:
         if request_id:
             existing = conn.execute("SELECT * FROM sale_requests WHERE request_id=?",
@@ -396,7 +407,8 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
             if existing:
                 if existing["fingerprint"] != fingerprint:
                     raise InvalidSaleError("Checkout request ID reused with different contents")
-                conn.commit()
+                if manage_transaction:
+                    conn.commit()
                 receipt = get_sale_detail(conn, existing["sale_id"])
                 receipt["change"] = existing["change_cents"] / 100
                 if existing["credit_cents"]:
@@ -448,7 +460,13 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
                 raise InvalidSaleError("Store credit requires a customer on the sale")
             total_cents = _cents(totals["total"])
             credit_cents = min(int(customer["store_credit_cents"]), total_cents)
-        due = totals["total"] - Decimal(credit_cents) / 100
+            if credit_limit_cents is not None:
+                if type(credit_limit_cents) is not int or credit_limit_cents < 0:
+                    raise InvalidSaleError("Invalid exchange credit limit")
+                credit_cents = min(credit_cents, credit_limit_cents)
+        if exchange_offset_cents > _cents(totals["total"]):
+            raise InvalidSaleError("Exchange offset exceeds the replacement invoice")
+        due = totals["total"] - Decimal(credit_cents + exchange_offset_cents) / 100
 
         if payments:
             applied_payments, change = _normalize_payments(payments, due)
@@ -492,6 +510,7 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
             "supply_type": supply_type,
             "price_tax_mode": "inclusive" if tax_inclusive else "exclusive",
             "place_of_supply": place_of_supply,
+            "exchange_offset_cents": exchange_offset_cents,
             "customer_name": customer.get("name") if customer else "",
             "customer_gstin": customer.get("gstin") if customer else "",
             "customer_address": customer.get("billing_address") if customer else "",
@@ -563,7 +582,7 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
 
         loyalty.award_on_sale(
             conn, customer["id"] if customer else None, sale_id,
-            max(0, _cents(totals["total"]) - credit_cents))
+            max(0, _cents(totals["total"]) - credit_cents - exchange_offset_cents))
         conn.execute("""UPDATE stock_movements SET kind='SALE', reference_id=?
             WHERE id>? AND kind='CHANGE'""", (sale_id, movement_start))
         if request_id:
@@ -571,9 +590,11 @@ def checkout(conn, items, payments=None, discount_mode=None, discount_value=None
                 (request_id, fingerprint, sale_id, change_cents, credit_cents)
                 VALUES(?, ?, ?, ?, ?)""",
                 (request_id, fingerprint, sale_id, _cents(change), credit_cents))
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if manage_transaction:
+            conn.rollback()
         raise
 
     receipt = get_sale_detail(conn, sale_id)
@@ -758,6 +779,29 @@ def get_sale_detail(conn, sale_id):
                               (sale["parent_sale_id"],)).fetchone()
         if parent:
             parent_invoice_number = parent["invoice_number"]
+    linked = conn.execute("""SELECT e.request_id, e.original_sale_id, e.refund_sale_id,
+               e.replacement_sale_id, e.credit_remainder_cents,
+               e.settlement_mode, e.offset_cents, e.forfeited_cents,
+               rs.refund_number AS linked_refund_number,
+               ns.invoice_number AS linked_invoice_number
+        FROM exchanges e JOIN sales rs ON rs.id=e.refund_sale_id
+        JOIN sales ns ON ns.id=e.replacement_sale_id
+        WHERE e.original_sale_id=? OR e.refund_sale_id=? OR e.replacement_sale_id=?
+        ORDER BY e.created_at, e.rowid""", (sale_id, sale_id, sale_id)).fetchall()
+    exchange_links = [{
+        "request_id": row["request_id"],
+        "original_sale_id": row["original_sale_id"],
+        "refund_sale_id": row["refund_sale_id"],
+        "replacement_sale_id": row["replacement_sale_id"],
+        "refund_number": row["linked_refund_number"],
+        "replacement_invoice_number": row["linked_invoice_number"],
+        "credit_remainder": row["credit_remainder_cents"] / 100,
+        "settlement_mode": row["settlement_mode"],
+        "offset_amount": row["offset_cents"] / 100,
+        "forfeited_amount": row["forfeited_cents"] / 100,
+        "role": ("return" if row["refund_sale_id"] == sale_id else
+                 "replacement" if row["replacement_sale_id"] == sale_id else "original"),
+    } for row in linked]
     return {
         "id": sale["id"],
         "invoice_number": sale.get("invoice_number"),
@@ -780,12 +824,15 @@ def get_sale_detail(conn, sale_id):
         "loyalty_points_reversed": points_reversed,
         "store_credit_used": round(credit_used / 100, 2),
         "store_credit_refunded": round(credit_returned / 100, 2),
+        "exchange_offset_used": (json.loads(sale["invoice_snapshot"] or "{}")
+                                  .get("exchange_offset_cents", 0) / 100),
         "refunded_to_credit": credit_returned > 0,
         "refund_reason": (json.loads(sale["invoice_snapshot"] or "{}").get("refund_reason", "")
                           if sale["status"] == "REFUNDED" else ""),
         "items": items,
         "payments": payments,
         "children": children,
+        "exchange_links": exchange_links,
         "refunded": any(c["status"] == "REFUNDED" for c in children),
         "fully_refunded": bool(items) and all(
             it["refundable_qty"] == 0 for it in items) and any(
@@ -833,6 +880,8 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0,
                      AND COALESCE(rq.refunded_qty, 0) >= COALESCE(i.item_count, 0)
                     THEN 1 ELSE 0 END AS fully_refunded,
                COALESCE(pm.methods, '') AS methods,
+               EXISTS(SELECT 1 FROM exchanges e WHERE e.refund_sale_id=s.id) AS exchange_refund,
+               EXISTS(SELECT 1 FROM exchanges e WHERE e.replacement_sale_id=s.id) AS exchange_replacement,
                EXISTS(SELECT 1 FROM sales c WHERE c.parent_sale_id = s.id
                       AND c.status = 'REFUNDED') AS refunded
         FROM sales s
@@ -861,7 +910,8 @@ def list_sales(conn, from_ts=None, to_ts=None, status=None, limit=500, offset=0,
     return [dict(r) for r in cur.fetchall()]
 
 
-def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore_refund_id=0):
+def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore_refund_id=0,
+                         credit_customer_id=None):
     '''Preview and commit use one allocation algorithm, always in paise.
 
     The original non-cash/cash tenders are repaid in their original proportions.
@@ -871,8 +921,8 @@ def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore
     card/UPI transfers separately.
     '''
     if to_credit:
-        if not sale["customer_id"]:
-            raise SalesError("Refund to store credit requires an attached customer")
+        if not (sale["customer_id"] or credit_customer_id):
+            raise SalesError("Refund to store credit requires a customer")
         return [], refund_total_cents
 
     sale_id = sale["id"]
@@ -890,7 +940,7 @@ def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore
     previous_original = 0
     for child in previous:
         snapshot = json.loads(child["invoice_snapshot"] or "{}")
-        if snapshot.get("refund_destination") != "credit":
+        if snapshot.get("refund_destination") not in ("credit", "exchange"):
             previous_original += _cents(child["total"])
 
     target_total = _split_refund(
@@ -922,7 +972,31 @@ def _refund_distribution(conn, sale, refund_total_cents, to_credit=False, ignore
     return refund_tender, credit
 
 
-def _refund_request_fingerprint(sale_id, lines, to_credit, reason):
+def _credit_recipient(conn, sale, to_credit, credit_customer_id):
+    """Never redirect a named customer's refund to a different identity.
+
+    An anonymous original invoice may be linked to a known customer on the
+    *new refund document*, leaving the historical invoice unchanged.
+    """
+    if credit_customer_id is not None and not to_credit:
+        raise InvalidSaleError("A credit recipient needs the store-credit destination")
+    original = sale["customer_id"]
+    if not to_credit:
+        return original
+    if credit_customer_id is None:
+        recipient = original
+    else:
+        recipient = _whole_positive(credit_customer_id, "Customer ID", 2**63 - 1)
+    if original and recipient != original:
+        raise InvalidSaleError("Store credit must go to the original invoice customer")
+    if not recipient:
+        raise InvalidSaleError("Choose a customer for the store-credit refund")
+    if conn.execute("SELECT 1 FROM customers WHERE id=?", (recipient,)).fetchone() is None:
+        raise CustomerNotFoundError(f"No customer with id {recipient}")
+    return recipient
+
+
+def _refund_request_fingerprint(sale_id, lines, to_credit, reason, credit_customer_id=None):
     # Semantic request fingerprint. Reordering equivalent line entries does
     # not change a retry; any changed quantity/destination/reason does.
     qtys = {}
@@ -936,6 +1010,9 @@ def _refund_request_fingerprint(sale_id, lines, to_credit, reason):
             qtys[pid] = qtys.get(pid, 0) + qty
     payload = [sale_id, sorted(qtys.items()) if lines is not None else None,
                bool(to_credit), reason]
+    # Keep old fingerprints stable for historical retry keys.
+    if credit_customer_id is not None:
+        payload.append(credit_customer_id)
     return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -955,8 +1032,14 @@ def refund_export_rows(conn):
         COALESCE((SELECT SUM(amount) FROM payments
                   WHERE sale_id=r.id AND method='UPI'),0) AS upi,
         COALESCE((SELECT SUM(delta_cents) FROM credit_events
-                  WHERE sale_id=r.id AND delta_cents>0),0) AS credit_cents
+                  WHERE sale_id=r.id AND delta_cents>0),0) AS credit_cents,
+        e.settlement_mode AS exchange_mode,
+        COALESCE(e.offset_cents,0) AS exchange_offset_cents,
+        COALESCE(e.forfeited_cents,0) AS exchange_forfeited_cents,
+        COALESCE(ns.invoice_number,'') AS replacement_invoice_number
         FROM sales r JOIN sales p ON p.id=r.parent_sale_id
+        LEFT JOIN exchanges e ON e.refund_sale_id=r.id
+        LEFT JOIN sales ns ON ns.id=e.replacement_sale_id
         WHERE r.status='REFUNDED' ORDER BY r.id DESC''').fetchall()
     exported = []
     for row in rows:
@@ -967,11 +1050,18 @@ def refund_export_rows(conn):
                          row["subtotal"], row["discount_total"], row["tax_total"],
                          row["total"], row["cash"], row["card"], row["upi"],
                          round(row["credit_cents"] / 100, 2),
+                         ("EXCHANGE_" + row["exchange_mode"].upper())
+                            if row["exchange_mode"] else
+                            ("CREDIT" if invoice.get("refund_destination") == "credit" else "PAYOUT"),
+                         row["exchange_offset_cents"] / 100,
+                         row["exchange_forfeited_cents"] / 100,
+                         row["replacement_invoice_number"],
                          row["refund_number"] or ""))
     return exported
 
 
-def preview_refund(conn, sale_id, lines=None, to_credit=False):
+def preview_refund(conn, sale_id, lines=None, to_credit=False,
+                   credit_customer_id=None, exchange_only=False):
     """Read-only, cent-exact preview using recorded original sale allocations.
 
     This does not mutate inventory, tender, customer credit or loyalty. The
@@ -983,6 +1073,17 @@ def preview_refund(conn, sale_id, lines=None, to_credit=False):
         raise SaleNotFoundError(f"No sale with id {sale_id}")
     if sale["status"] != "COMPLETED":
         raise AlreadyProcessedError(f"Sale {sale_id} cannot be refunded")
+    if exchange_only:
+        if to_credit or credit_customer_id is not None:
+            raise InvalidSaleError("Exchange-only return cannot issue wallet credit")
+        recipient = sale["customer_id"]
+    else:
+        cfg = settings_mod.get_settings(conn)
+        if to_credit and cfg["refund_allow_credit"] != "true":
+            raise InvalidSaleError("Store-credit refunds are disabled by store policy")
+        if not to_credit and cfg["refund_allow_original"] != "true":
+            raise InvalidSaleError("Cash/card/UPI refunds are disabled by store policy")
+        recipient = _credit_recipient(conn, sale, to_credit, credit_customer_id)
     source = {row["product_id"]: dict(row) for row in conn.execute(
         "SELECT * FROM sale_items WHERE sale_id=?", (sale_id,))}
     refunded = {row["product_id"]: int(row["qty"]) for row in conn.execute(
@@ -1021,7 +1122,9 @@ def preview_refund(conn, sale_id, lines=None, to_credit=False):
         net += n
         tax += t
     cents = net if inclusive else net + tax
-    tender, credit = _refund_distribution(conn, sale, cents, to_credit=to_credit) if requested else ([], 0)
+    tender, credit = (([], 0) if exchange_only else
+        (_refund_distribution(conn, sale, cents, to_credit=to_credit,
+                              credit_customer_id=recipient) if requested else ([], 0)))
     return {
         "subtotal": gross / 100,
         "discount_total": discount / 100,
@@ -1032,11 +1135,14 @@ def preview_refund(conn, sale_id, lines=None, to_credit=False):
         "refund_payments": [{"method": p["method"], "amount": p["amount_cents"] / 100}
                             for p in tender],
         "refund_store_credit": credit / 100,
-        "refund_destination": "credit" if to_credit else "original",
+        "refund_destination": "exchange" if exchange_only else ("credit" if to_credit else "original"),
+        "credit_customer_id": recipient if to_credit else None,
     }
 
 
-def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_id=None, require_open_session=False):
+def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_id=None,
+                require_open_session=False, credit_customer_id=None,
+                manage_transaction=True, exchange_only=False):
     """
     Refund a completed sale.
 
@@ -1049,6 +1155,8 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
     Stock comes back via the inventory trigger as REFUNDED child items are
     inserted.
     """
+    if exchange_only and (manage_transaction or to_credit or credit_customer_id is not None):
+        raise InvalidSaleError("Exchange return requires a caller-owned transaction")
     reason = str(reason or "").strip()
     if len(reason) > 250:
         raise InvalidSaleError("Refund reason must be 250 characters or fewer")
@@ -1056,8 +1164,12 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
         request_id = str(request_id)
         if not re.fullmatch(r"[A-Za-z0-9_-]{8,100}", request_id):
             raise InvalidSaleError("Invalid refund request ID")
-    fingerprint = _refund_request_fingerprint(sale_id, lines, to_credit, reason) if request_id else None
-    conn.execute("BEGIN IMMEDIATE")
+    fingerprint = _refund_request_fingerprint(
+        sale_id, lines, to_credit, reason, credit_customer_id) if request_id else None
+    if manage_transaction:
+        conn.execute("BEGIN IMMEDIATE")
+    elif not conn.in_transaction:
+        raise RuntimeError("Refund requires an existing transaction")
     try:
         if request_id:
             existing = conn.execute(
@@ -1066,7 +1178,8 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
             if existing:
                 if existing["original_sale_id"] != sale_id or existing["fingerprint"] != fingerprint:
                     raise InvalidSaleError("Refund request ID was reused with different details")
-                conn.commit()
+                if manage_transaction:
+                    conn.commit()
                 return get_sale_detail(conn, existing["refund_sale_id"])
         if require_open_session and conn.execute(
                 "SELECT 1 FROM cash_sessions WHERE closed_at IS NULL LIMIT 1").fetchone() is None:
@@ -1078,6 +1191,15 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
         if sale["status"] != "COMPLETED":
             raise AlreadyProcessedError(
                 f"Sale {sale_id} is {sale['status']} and cannot be refunded")
+        if exchange_only:
+            recipient = sale["customer_id"]
+        else:
+            cfg_refunds = settings_mod.get_settings(conn)
+            if to_credit and cfg_refunds["refund_allow_credit"] != "true":
+                raise InvalidSaleError("Store-credit refunds are disabled by store policy")
+            if not to_credit and cfg_refunds["refund_allow_original"] != "true":
+                raise InvalidSaleError("Cash/card/UPI refunds are disabled by store policy")
+            recipient = _credit_recipient(conn, sale, to_credit, credit_customer_id)
 
         cur = conn.cursor()
         cur.execute(
@@ -1164,8 +1286,10 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
 
         parent_invoice = json.loads(sale["invoice_snapshot"]) if sale.get("invoice_snapshot") else None
         refund_invoice = dict(parent_invoice or {})
-        refund_invoice["refund_destination"] = "credit" if to_credit else "original"
+        refund_invoice["refund_destination"] = "exchange" if exchange_only else ("credit" if to_credit else "original")
         refund_invoice["refund_reason"] = reason
+        if to_credit:
+            refund_invoice["refund_credit_customer_id"] = recipient
         refund_invoice["tax_breakup"] = _tax_breakup(
             conn, refund_tax_lines,
             refund_invoice.get("tax_configuration") or settings_mod.get_settings(conn))
@@ -1179,7 +1303,7 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
                                   refund_number, timestamp, cash_session_id, cash_session_explicit)
                 VALUES(?, ?, ?, ?, 'REFUNDED', ?, ?, ?, ?, ?, ?, 1) ''',
             (gross_c / 100, tax_c / 100, disc_c / 100, refund_total_cents / 100,
-             sale_id, sale["customer_id"],
+             sale_id, recipient if to_credit else sale["customer_id"],
              json.dumps(refund_invoice, ensure_ascii=False) if refund_invoice else None,
              refund_number, recorded_at.strftime("%Y-%m-%d %H:%M:%S"),
              (conn.execute("SELECT id FROM cash_sessions WHERE closed_at IS NULL ORDER BY id DESC LIMIT 1")
@@ -1203,16 +1327,16 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
                  row["description_at_sale"], row["sku_at_sale"]),
             )
 
-        tender_payments, credit_cents = _refund_distribution(
-            conn, sale, refund_total_cents, to_credit=to_credit,
-            ignore_refund_id=refund_id)
+        tender_payments, credit_cents = (([], 0) if exchange_only else
+            _refund_distribution(conn, sale, refund_total_cents, to_credit=to_credit,
+                                 ignore_refund_id=refund_id, credit_customer_id=recipient))
         for pay in tender_payments:
             cur.execute(''' INSERT INTO payments(sale_id, method, amount, is_partial)
                 VALUES(?, ?, ?, ?) ''',
                 (refund_id, pay["method"], pay["amount_cents"] / 100,
                  int(refund_total_cents < _cents(sale["total"]))))
         if credit_cents:
-            _apply_credit(conn, sale["customer_id"], credit_cents,
+            _apply_credit(conn, recipient, credit_cents,
                           f"Return credit from sale #{sale_id}" if not to_credit else
                           f"Refund of sale #{sale_id}", sale_id=refund_id)
         if request_id:
@@ -1224,9 +1348,11 @@ def refund_sale(conn, sale_id, lines=None, to_credit=False, reason="", request_i
                                    _cents(sale["total"]), "REFUND")
         conn.execute("""UPDATE stock_movements SET kind='REFUND', reference_id=?
             WHERE id>? AND kind='CHANGE'""", (refund_id, movement_start))
-        conn.commit()
+        if manage_transaction:
+            conn.commit()
     except Exception:
-        conn.rollback()
+        if manage_transaction:
+            conn.rollback()
         raise
 
     return get_sale_detail(conn, refund_id)

@@ -62,6 +62,12 @@ export function buildReceipt(receipt, { store = null } = {}) {
         ? `Invoice: ${receipt.invoice_number}`
         : `Receipt: #${String(receipt.id).padStart(5, "0")}`),
     h("div", { class: "r-datetime" }, fmtTs(receipt.timestamp)),
+    receipt.exchange_links?.find(x => x.role === "return")
+      ? h("div", { class: "r-muted-line" },
+          `Exchange → ${receipt.exchange_links.find(x => x.role === "return").replacement_invoice_number}`) : null,
+    receipt.exchange_links?.find(x => x.role === "replacement")
+      ? h("div", { class: "r-muted-line" },
+          `Exchange against ${receipt.exchange_links.find(x => x.role === "replacement").refund_number}`) : null,
     receipt.parent_sale_id
       ? h("div", { class: "r-row" }, h("span", {}, "For sale"),
           h("span", {}, receipt.parent_invoice_number ||
@@ -106,6 +112,18 @@ export function buildReceipt(receipt, { store = null } = {}) {
       h("span", {}, isRefund ? "TOTAL REFUNDED" : "TOTAL"), h("span", {}, money(receipt.total))),
     h("hr"),
     ...paymentLines,
+    isRefund && receipt.exchange_links?.some(x => x.role === "return" && x.settlement_mode === "offset")
+      ? h("div", { class: "r-row" }, h("span", {}, "Return applied to exchange (no cash payout)"),
+          h("span", {}, money(receipt.exchange_links.find(x => x.role === "return").offset_amount)))
+      : null,
+    Number(receipt.exchange_offset_used) > 0
+      ? h("div", { class: "r-row" }, h("span", {}, "Exchange return applied (not cash)"),
+          h("span", {}, "-" + money(receipt.exchange_offset_used)))
+      : null,
+    receipt.exchange_links?.some(x => x.forfeited_amount > 0 && x.role === "replacement")
+      ? h("div", { class: "r-row" }, h("span", {}, "Exchange difference forfeited"),
+          h("span", {}, money(receipt.exchange_links.find(x => x.role === "replacement").forfeited_amount)))
+      : null,
     Number(receipt.store_credit_used) > 0
       ? h("div", { class: "r-row" }, h("span", {}, "Store credit used"),
           h("span", {}, "-" + money(receipt.store_credit_used)))

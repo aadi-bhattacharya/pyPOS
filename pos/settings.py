@@ -22,9 +22,20 @@ SETTING_KEYS = {
     "cashier_allow_stock_reduction": "false",  # Default denies manual reductions.
     "cashier_allow_stock_import": "true",  # Existing approved SKU receipts only.
     "cashier_max_discount_percent": "0",  # 0% by default; approve discounts in Settings.
+    # Return rules are owner-controlled and validated on every API commit.
+    "refund_allow_original": "true",       # Cash/Card/UPI payout recording
+    "refund_allow_credit": "true",         # Named-customer ledger credit
+    "exchange_allow": "true",
+    "exchange_allow_anonymous": "true",    # No name or phone for direct offsets
+    "exchange_allow_forfeit_difference": "false",  # Explicitly acknowledged, never default
     "show_receipt_logo": "true",
     "receipt_logo_width": "32",
     "receipt_paper": "80mm",
+    # RAW ESC/POS is sent by the local pyPOS backend to a configured OS queue.
+    # This does NOT change any historical invoices or payment records.
+    "receipt_print_mode": "thermal",  # thermal or browser (manual fallback)
+    "receipt_auto_print": "true",  # print after successful checkout/refund/exchange
+    "receipt_printer_name": "",  # blank uses the current OS default printer
     "receipt_heading": "Retail receipt",
     "store_local_tax": "SGST",
     "tax_label": "GST",
@@ -70,6 +81,10 @@ def get_settings(conn):
     stored = {r["key"]: r["value"] for r in cur.fetchall()}
     merged = dict(SETTING_KEYS)
     merged.update({k: v for k, v in stored.items() if k in SETTING_KEYS})
+    # A legacy 58 mm or A4 store must not suddenly receive 80 mm ESC/POS
+    # commands merely because it upgraded to a release with direct printing.
+    if "receipt_print_mode" not in stored and merged.get("receipt_paper") != "80mm":
+        merged["receipt_print_mode"] = "browser"
     for k in SECRET_KEYS:
         merged[k] = ""
     return merged
@@ -82,6 +97,8 @@ def get_all_settings(conn):
     stored = {r["key"]: r["value"] for r in cur.fetchall()}
     merged = dict(SETTING_KEYS)
     merged.update({k: v for k, v in stored.items() if k in SETTING_KEYS})
+    if "receipt_print_mode" not in stored and merged.get("receipt_paper") != "80mm":
+        merged["receipt_print_mode"] = "browser"
     return merged
 
 
@@ -100,7 +117,10 @@ def save_settings(conn, values):
         elif key in ("store_logo", "pos_logo"):
             value = logo_data(value)
         elif key in ("show_staff_menu", "cashier_allow_stock_reduction",
-                     "cashier_allow_stock_import") and value not in ("true", "false"):
+                     "cashier_allow_stock_import", "refund_allow_original",
+                     "refund_allow_credit", "exchange_allow",
+                     "exchange_allow_anonymous",
+                     "exchange_allow_forfeit_difference") and value not in ("true", "false"):
             raise ValueError(f"{key} must be true or false")
         elif key == "cashier_max_discount_percent":
             if not value.isascii() or not value.isdecimal() or not 0 <= int(value) <= 100:
@@ -126,6 +146,14 @@ def save_settings(conn, values):
                 raise ValueError("State/UT code must be a valid two-digit GST code")
         elif key == "price_tax_mode" and value not in ("inclusive", "exclusive"):
             raise ValueError("Price tax mode must be inclusive or exclusive")
+        elif key in ("receipt_auto_print",) and value not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false")
+        elif key == "receipt_print_mode" and value not in ("thermal", "browser"):
+            raise ValueError("Receipt print mode must be thermal or browser")
+        elif key == "receipt_printer_name":
+            value = value.strip()
+            if len(value) > 160 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+                raise ValueError("Printer queue name must be at most 160 visible characters")
         elif key == "receipt_paper" and value not in ("58mm", "80mm", "A4"):
             raise ValueError("Receipt paper must be 58mm, 80mm or A4")
         elif key == "store_local_tax" and value not in ("SGST", "UTGST"):
@@ -155,6 +183,8 @@ def save_settings(conn, values):
             continue  # blank field on a form should not erase stored secrets
         normalized[key] = value
     combined = {**get_settings(conn), **normalized}
+    if combined["receipt_print_mode"] == "thermal" and combined["receipt_paper"] != "80mm":
+        raise ValueError("Epson TM-T81 direct printing uses 80mm paper; use browser mode for other sizes")
     if combined["pos_logo_mode"] == "custom" and not combined["pos_logo"]:
         raise ValueError("Upload a custom POS logo before selecting custom logo mode")
     if (combined["store_gstin"] and combined["store_state_code"] and

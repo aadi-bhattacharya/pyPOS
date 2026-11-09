@@ -539,8 +539,13 @@ export function showZModal(rep) {
     narrow: true,
     body: el,
     footer: [
-      h("button", { class: "btn", onclick: () => printReceipt(el) },
-        icon("i-printer"), "Print"),
+      h("button", { class: "btn", onclick: async () => {
+        if (state.settings.receipt_print_mode !== "thermal") return printReceipt(el);
+        try {
+          const job = await api.printSessionReport(rep.session_id);
+          toast(`Report queued for ${job.printer}.`, "success");
+        } catch (e) { toastError(e, "Could not print cash report"); }
+      } }, icon("i-printer"), "Print"),
       h("button", { class: "btn primary", onclick: () => m.close() }, "Done"),
     ],
   });

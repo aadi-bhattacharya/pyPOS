@@ -283,6 +283,28 @@ CREATE TABLE IF NOT EXISTS refund_requests (
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- A single atomic exchange is represented by linked refund and taxable sale
+-- documents. Settlement is either named-customer wallet credit or a direct
+-- exchange offset (no payout, no dummy customer, no anonymous wallet).
+-- Monetary differences forfeited under opt-in policy are recorded explicitly.
+CREATE TABLE IF NOT EXISTS exchanges (
+  request_id TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL,
+  original_sale_id INTEGER NOT NULL REFERENCES sales(id),
+  refund_sale_id INTEGER NOT NULL UNIQUE REFERENCES sales(id),
+  replacement_sale_id INTEGER NOT NULL UNIQUE REFERENCES sales(id),
+  customer_id INTEGER REFERENCES customers(id),
+  settlement_mode TEXT NOT NULL DEFAULT 'wallet' CHECK(settlement_mode IN ('wallet','offset')),
+  offset_cents INTEGER NOT NULL DEFAULT 0 CHECK(offset_cents >= 0),
+  forfeited_cents INTEGER NOT NULL DEFAULT 0 CHECK(forfeited_cents >= 0),
+  refund_cents INTEGER NOT NULL CHECK(refund_cents >= 0),
+  credit_spent_cents INTEGER NOT NULL CHECK(credit_spent_cents >= 0),
+  payment_due_cents INTEGER NOT NULL CHECK(payment_due_cents >= 0),
+  credit_remainder_cents INTEGER NOT NULL CHECK(credit_remainder_cents >= 0),
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_exchanges_original_sale ON exchanges(original_sale_id);
+
 CREATE TABLE IF NOT EXISTS sale_items (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
@@ -451,3 +473,18 @@ BEGIN
   INSERT INTO stock_movements(product_id, sku_at_event, delta, balance_after, kind)
   VALUES(OLD.id, OLD.SKU, -OLD.quantity, 0, 'REMOVED');
 END;
+
+-- An OS spooler acceptance is recorded separately from the sale. These records
+-- never change money/stock. The unique auto index prevents repeated automatic
+-- print submission on UI/network retries; manual reprints remain possible.
+CREATE TABLE IF NOT EXISTS receipt_print_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE RESTRICT,
+  kind TEXT NOT NULL CHECK (kind IN ('auto', 'manual')),
+  status TEXT NOT NULL CHECK (status IN ('CLAIMED', 'SPOOLED', 'FAILED')),
+  printer_name TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_print_once
+  ON receipt_print_jobs(sale_id, kind) WHERE kind = 'auto';

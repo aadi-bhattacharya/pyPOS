@@ -1,6 +1,7 @@
 import { api, can, fmt, fmtDate } from "../api.js";
 import { h, icon, toastError } from "../ui.js";
 import { refundDialog, detailModal } from "./salesview.js";
+import { exchangeDialog } from "./exchanges.js";
 
 const PAGE = 75;
 let renderSeq = 0;
@@ -16,7 +17,7 @@ export async function renderRefunds(main) {
   const loadMore = h("button", { class: "btn", hidden: true }, "Show older refund receipts");
   const title = h("div", { class: "view-head" },
     h("div", { class: "view-title" }, h("h2", {}, "Returns & refunds"),
-      h("div", { class: "sub" }, "Find an original invoice, select returned items and record the repayment")),
+      h("div", { class: "sub" }, "Refund to payment or store credit, or exchange for new items")),
     h("div", { class: "view-actions" },
       can("export_data") ? h("a", { class: "btn", href: "/api/export/refunds.csv", download: "" }, "Refunds CSV") : null,
       h("a", { class: "btn", href: "#/sales" }, icon("i-sales"), "All sales")));
@@ -61,7 +62,10 @@ export async function renderRefunds(main) {
                 row.customer_id ? h("div", { class: "cl-sub" }, `Customer ID ${row.customer_id}`) : null),
               h("strong", {}, fmt(row.total)),
               h("button", { class: "btn primary sm", onclick: () => refundDialog(row.id, () => loadRecent(true)) },
-                icon("i-undo"), row.refunded ? "Continue return" : "Return items"))))
+                icon("i-undo"), row.refunded ? "Continue return" : "Return items"),
+              can("refund_sales") && can("checkout")
+                ? h("button", { class: "btn sm", onclick: () => exchangeDialog(row.id, () => loadRecent(true)) },
+                    icon("i-refresh"), "Exchange") : null)))
         : h("p", { class: "form-hint" },
           "No refundable completed sales matched. Try the full invoice number or check All sales."));
     } catch (e) { if (seq === searchCount) { toastError(e); result.replaceChildren(); } }
@@ -81,7 +85,7 @@ export async function renderRefunds(main) {
       offset += page.length;
       for (const r of page) recent.append(h("div", { class: "return-history-row" },
         h("div", {}, h("strong", {}, r.refund_number || `Refund #${r.id}`),
-          h("div", { class: "cl-sub" }, `${fmtDate(r.timestamp)} · Original sale #${r.parent_sale_id || "?"}`)),
+          h("div", { class: "cl-sub" }, `${fmtDate(r.timestamp)} · Original sale #${r.parent_sale_id || "?"}${r.exchange_refund ? " · Exchange" : ""}`)),
         h("strong", { class: "return-negative" }, `−${fmt(r.total)}`),
         h("button", { class: "btn sm", onclick: () => detailModal(r.id) }, "View / print")));
       if (!offset) recent.replaceChildren(h("p", { class: "form-hint" }, "No recorded refunds yet."));

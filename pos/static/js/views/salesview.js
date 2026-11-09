@@ -1,7 +1,9 @@
-import { api, fmt, fmtDate, todayISO } from "../api.js";
+import { api, can, fmt, fmtDate, todayISO } from "../api.js";
 import { h, icon, openModal, closeModalAll, toast, toastError, confirmDialog, printReceipt } from "../ui.js";
 import { buildReceipt, methodLabel } from "../receipt.js";
 import { showReceiptModal } from "./register.js";
+import { creditCustomerPicker } from "./creditCustomerPicker.js";
+import { exchangeDialog } from "./exchanges.js";
 
 const PAGE_SIZE = 100;
 const PRESETS = [["today", "Today"], ["7", "7 days"], ["30", "30 days"],
@@ -194,6 +196,8 @@ function rowHtml(r) {
       h("button", { class: "sales-invoice-button", onclick: () => detailModal(r.id) },
         r.refund_number || r.invoice_number || `#${String(r.id).padStart(5, "0")}`),
       r.parent_sale_id ? h("div", { class: "cell-sub" }, `Return against sale #${r.parent_sale_id}`) : null,
+      r.exchange_refund || r.exchange_replacement
+        ? h("div", { class: "cell-sub" }, r.exchange_refund ? "Exchange return" : "Exchange replacement") : null,
       r.customer_name ? h("div", { class: "cell-sub" }, r.customer_name) : null),
     h("td", {}, fmtDate(r.timestamp)),
     h("td", { class: "cell-sub" }, r.salesperson || "—"),
@@ -204,6 +208,8 @@ function rowHtml(r) {
     h("td", { class: "actions-cell" },
       actionBtn("i-eye", "View and reprint", () => detailModal(r.id)),
       canRefund ? actionBtn("i-undo", "Refund", () => refundDialog(r.id, () => loadRows(true))) : null,
+      canRefund && can("refund_sales") && can("checkout")
+        ? actionBtn("i-refresh", "Exchange", () => exchangeDialog(r.id, () => loadRows(true))) : null,
       canVoid ? actionBtn("i-ban", "Void", () => voidFlow(r, () => loadRows(true))) : null));
 }
 
@@ -257,7 +263,7 @@ export async function detailModal(id) {
                 : `Voided (#${c.id})`).join("; "))
         : null),
     footer: [
-      h("button", { class: "btn", onclick: () => printReceipt(receiptEl) },
+      h("button", { class: "btn", onclick: () => printReceipt(receiptEl, sale) },
         icon("i-printer"), "Print"),
       canAct ? h("button", {
         class: "btn subtle-danger",
@@ -267,6 +273,9 @@ export async function detailModal(id) {
         class: "btn primary",
         onclick: () => refundDialog(sale.id, () => loadRows(true)),
       }, icon("i-undo"), "Refund") : null,
+      canAct && can("refund_sales") && can("checkout") ? h("button", { class: "btn",
+        onclick: () => exchangeDialog(sale.id, () => loadRows(true)) },
+        icon("i-refresh"), "Exchange") : null,
     ],
   });
 }
@@ -278,6 +287,13 @@ export async function refundDialog(saleId, done) {
   try { sale = await api.getSale(saleId); }
   catch (e) { return toastError(e); }
   if (sale.status !== "COMPLETED") return toast("Only completed sales can be returned.", "warn");
+  let policy;
+  try { policy = await api.getSettings(); }
+  catch (e) { return toastError(e); }
+  const allowPayout = policy.refund_allow_original !== "false";
+  const allowCredit = policy.refund_allow_credit !== "false";
+  if (!allowPayout && !allowCredit) return toast(
+    "Direct refunds and store-credit refunds are disabled. Use an exchange if permitted.", "warn");
 
   const refundable = sale.items.filter((it) => it.refundable_qty > 0);
   if (!refundable.length) return toast("This invoice has no remaining refundable items.", "warn");
@@ -306,10 +322,13 @@ export async function refundDialog(saleId, done) {
   const noteInput = h("input", { class: "input", type: "text", maxlength: "160",
     placeholder: "Additional details (optional)", "aria-label": "Return notes" });
   const paySel = h("select", { class: "input", "aria-label": "Refund destination" },
-    h("option", { value: "original" }, "Original payment methods"),
-    sale.customer_id ? h("option", { value: "credit" }, "Customer store credit") : null);
+    allowPayout ? h("option", { value: "original" }, "Original payment methods") : null,
+    allowCredit ? h("option", { value: "credit" }, "Customer store credit") : null);
+  let onCustomerChange = () => {};
+  const creditPicker = sale.customer_id ? null : creditCustomerPicker(() => onCustomerChange());
   const payHint = h("p", { class: "form-hint return-pay-hint" },
-    "Cash must be paid out at the till. Card / UPI repayments must be initiated separately; this POS records them but cannot transfer money.");
+    allowPayout ? "Cash must be paid out at the till. Card / UPI repayments must be initiated separately; this POS records them but cannot transfer money." :
+      "This store issues credit only to an identified customer. No cash or bank transfer is made.");
   const goBtn = h("button", { class: "btn primary lg", disabled: true },
     icon("i-undo"), "Record refund");
   let previewGeneration = 0;
@@ -343,7 +362,8 @@ export async function refundDialog(saleId, done) {
     amountEl.textContent = "Calculating…";
     detailEl.textContent = "Checking the original sale's recorded discount, GST and payment split…";
     try {
-      const p = await api.previewRefund(saleId, lines, paySel.value === "credit");
+      const p = await api.previewRefund(saleId, lines, paySel.value === "credit",
+        paySel.value === "credit" ? (sale.customer_id || creditPicker?.id()) : null);
       if (gen !== previewGeneration) return;
       previewOk = true;
       previewAmount = Number(p.total);
@@ -401,11 +421,14 @@ export async function refundDialog(saleId, done) {
     }
     updateTotal();
   } }, "Clear selection");
+  onCustomerChange = () => updateTotal();
   reasonSel.addEventListener("change", updateEnabled);
   paySel.addEventListener("change", () => {
     payHint.textContent = paySel.value === "credit"
       ? "Store credit will be added immediately to the original customer. No cash or bank transfer takes place."
       : "Cash must be paid out at the till. Card / UPI repayments must be initiated separately; this POS records them but cannot transfer money.";
+    const selector = document.getElementById("credit-recipient-choice");
+    if (selector) selector.hidden = paySel.value !== "credit";
     updateTotal();
   });
   goBtn.addEventListener("click", async () => {
@@ -416,7 +439,8 @@ export async function refundDialog(saleId, done) {
     const reason = reasonValue();
     // A stable key makes retry-after-network-failure safe. A changed payload
     // receives a new ID; the server rejects any key reused with new details.
-    const payloadKey = JSON.stringify({lines, to_credit, reason});
+    const credit_customer_id = to_credit ? (sale.customer_id || creditPicker?.id()) : null;
+    const payloadKey = JSON.stringify({lines, to_credit, reason, credit_customer_id});
     if (payloadKey !== pendingFingerprint) {
       pendingKey = typeof crypto !== "undefined" && crypto.randomUUID
         ? crypto.randomUUID() : `refund_${Date.now()}_${Math.random().toString(36).slice(2)}`;
@@ -424,14 +448,16 @@ export async function refundDialog(saleId, done) {
     }
     const ok = await confirmDialog({
       title: `Confirm return · ${fmt(previewAmount)}`,
-      message: `Record a refund of ${fmt(previewAmount)} for ${originalLabel}? Verify the items are back in your possession and arrange any cash, card or UPI payout manually. This cannot be undone.`,
+      message: to_credit
+        ? `Issue ${fmt(previewAmount)} as customer store credit for ${originalLabel}? No cash or bank transfer is made. Verify the returned goods. This cannot be undone.`
+        : `Record a refund of ${fmt(previewAmount)} for ${originalLabel}? Verify the items are back in your possession and arrange any cash, card or UPI payout manually. This cannot be undone.`,
       confirmLabel: "Record refund", danger: true,
     });
     if (!ok) return;
     goBtn.disabled = true;
     try {
       const refund = await api.refundSale(saleId, {
-        lines, to_credit, reason, request_id: pendingKey,
+        lines, to_credit, reason, credit_customer_id, request_id: pendingKey,
       });
       toast(`Refund ${refund.refund_number || `#${refund.id}`} · ${fmt(refund.total)} recorded.`, "success",
         { title: "Return recorded" });
@@ -461,6 +487,7 @@ export async function refundDialog(saleId, done) {
         h("div", { class: "field" }, h("label", {}, "2. Reason for return"), reasonSel),
         h("div", { class: "field" }, h("label", {}, "Details"), noteInput)),
       h("div", { class: "field" }, h("label", {}, "3. Where to refund"), paySel, payHint),
+      creditPicker ? h("div", { hidden: paySel.value !== "credit", id: "credit-recipient-choice" }, creditPicker.root) : null,
       previewBox,
       h("p", { class: "form-hint" },
         "The original recorded discount and tax are used. Returned stock and relevant loyalty points are reversed. This is an operational refund, not a statutory GST credit note.")),
