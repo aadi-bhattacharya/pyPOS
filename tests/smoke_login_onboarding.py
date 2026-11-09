@@ -1,7 +1,7 @@
 """Offline Chromium checks for the standalone staff setup and login UI.
 
 Works without Flask: loads the actual HTML template and form builders from
-pos/app.py with a stubbed CSRF token issuer. No HTTP server required.
+pos/auth_pages.py with a stubbed CSRF token issuer. No HTTP server required.
 """
 import ast
 import html
@@ -11,7 +11,7 @@ from pathlib import Path
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parents[1]
-APP = ROOT / 'pos' / 'app.py'
+APP = ROOT / 'pos' / 'auth_pages.py'
 CSS = ROOT / 'pos' / 'static' / 'css'
 LOGIN_JS = ROOT / 'pos' / 'static' / 'js' / 'login.js'
 

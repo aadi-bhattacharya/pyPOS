@@ -21,7 +21,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/example/pypos"
+Homepage = "https://github.com/aadi-bhattacharya/pyPOS"
 
 [project.scripts]
 pypos = "pos.cli:main"
