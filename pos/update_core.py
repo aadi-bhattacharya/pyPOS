@@ -219,8 +219,11 @@ def clean_versions(root, *, keep):
             LOG.warning("Unable to remove old version %s", p.name)
 
 
-def update_once(root, current, repository, *, system=None, fetch=safe_fetch):
-    """Attempt one update; caller runs this off the UI/server thread."""
+def update_once(root, current, repository, *, system=None, fetch=safe_fetch,
+                allowed=lambda: True):
+    """Attempt one update; an opt-out blocks checking AND final staging."""
+    if not allowed():
+        return False
     key = platform_key(system=system)
     latest, release_url, checksum_url = release_assets(repository, key, fetch=fetch)
     if not newer(latest, current):
@@ -231,7 +234,11 @@ def update_once(root, current, repository, *, system=None, fetch=safe_fetch):
         raise UpdateError("Release checksum sidecar is invalid")
     data = fetch(release_url, MAX_DOWNLOAD)
     files = validate_archive(data, latest, key, checksum, system=system)
+    if not allowed():
+        return False  # Preference changed while downloading; never stage.
     install_version(root, latest, files, system=system)
+    if not allowed():
+        return False  # Preference changed while installing; do not activate.
     atomic_version_file(Path(root) / "pending.txt", latest)
     LOG.info("Installed %s for next launch; current register remains running", latest)
     return True

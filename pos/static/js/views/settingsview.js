@@ -6,6 +6,8 @@ import { imageQualitySelect, imageSizeSelect, imageCompressionSettings, imageOpt
 import { returnPolicyCard } from "./settingsReturnRules.js";
 import { backupsCard } from "./settingsBackups.js";
 
+let selectedSettingsSection = "store";
+
 const FIELDS = [
   ["store_name", "Store name", "text", "My Store"],
   ["store_phone", "Phone", "text", ""],
@@ -221,23 +223,21 @@ export async function renderSettingsView(main) {
 
   const footerIn = h("textarea", { class: "input", rows: "2" });
   footerIn.value = s.receipt_footer ?? "";
-  form.append(h("div", { class: "field" },
-    h("label", {}, "Receipt footer message"), footerIn));
 
   // Printer branding is stored in the SQLite database and included in backups.
-  const priceTaxSelect = h("select", { class: "input" },
+  const priceTaxSelect = h("select", { class: "input", "aria-label": "How are product prices entered?" },
     h("option", { value: "exclusive", selected: s.price_tax_mode !== "inclusive" },
       "Prices before GST (add tax at checkout)"),
     h("option", { value: "inclusive", selected: s.price_tax_mode === "inclusive" },
       "Prices include GST (e.g. GST-inclusive MRP)"));
-  const paperSelect = h("select", { class: "input" },
+  const paperSelect = h("select", { class: "input", "aria-label": "Paper / print layout" },
     ...[["58mm", "58mm thermal receipt"], ["80mm", "80mm thermal receipt"],
          ["A4", "A4 paper / PDF printing"]].map(([val, label]) =>
       h("option", { value: val, selected: s.receipt_paper === val }, label)));
-  const titleSelect = h("select", { class: "input" },
+  const titleSelect = h("select", { class: "input", "aria-label": "Receipt heading" },
     ...["Retail receipt", "Tax invoice", "Bill of supply"].map((x) =>
       h("option", { value: x, selected: s.receipt_heading === x }, x)));
-  const localTaxSelect = h("select", { class: "input" },
+  const localTaxSelect = h("select", { class: "input", "aria-label": "Local tax component" },
     ...["SGST", "UTGST"].map((x) =>
       h("option", { value: x, selected: s.store_local_tax === x }, x)));
   const printMode = h("select", { class: "input", "aria-label": "Receipt printer output mode" },
@@ -304,12 +304,9 @@ export async function renderSettingsView(main) {
       h("span", {}, "Automatically print completed sales, returns and exchanges")),
     h("div", { class: "field" }, h("label", {}, "Installed printer queue (optional)"), printerQueue),
     printerInfo,
-    h("div", { class: "field" }, h("label", {}, "How are product prices entered?"), priceTaxSelect,
-      h("p", { class: "form-hint" }, "This setting changes how ALL catalog prices are interpreted for NEW sales. " +
-        "Do not switch it without reviewing your SKU prices. Past invoices and refunds keep their original mode.")),
     h("div", { class: "field" }, h("label", {}, "Paper / print layout"), paperSelect),
     h("div", { class: "field" }, h("label", {}, "Receipt heading"), titleSelect),
-    h("div", { class: "field" }, h("label", {}, "Local tax component"), localTaxSelect),
+    h("div", { class: "field" }, h("label", {}, "Receipt footer message"), footerIn),
     h("div", { class: "field" }, h("label", {}, "Upload receipt logo (auto-compressed to 200 KiB)"), logoInput),
     imageCompressionSettings(receiptMaxEdge, receiptQuality,
       "Choose settings before selecting the file; select it again to recompress."),
@@ -324,11 +321,10 @@ export async function renderSettingsView(main) {
             receipt_print_mode: printMode.value,
             receipt_auto_print: autoPrint.checked ? "true" : "false",
             receipt_printer_name: printerQueue.value.trim(),
-            price_tax_mode: priceTaxSelect.value,
             receipt_heading: titleSelect.value,
             receipt_logo_width: logoWidth.value,
             show_receipt_logo: showLogo.checked ? "true" : "false",
-            store_local_tax: localTaxSelect.value,
+            receipt_footer: footerIn.value.trim(),
           };
           if (receiptLogoTask && logoInput.files?.length) {
             const processed = await receiptLogoTask;
@@ -417,7 +413,11 @@ export async function renderSettingsView(main) {
     h("span", {}));
 
   const taxCard = h("div", { class: "card card-pad", style: "margin-top:16px" },
-    h("h3", { style: "margin-bottom:6px" }, "Legacy / unregistered tax display"),
+    h("h3", { style: "margin-bottom:6px" }, "Pricing and GST"),
+    h("div", { class: "field" }, h("label", {}, "How are product prices entered?"), priceTaxSelect,
+      h("p", { class: "form-hint" }, "Applies to NEW sales. Switching between inclusive and exclusive GST changes charged totals. Check catalog MRPs before changing; past invoices are preserved.")),
+    h("div", { class: "field" }, h("label", {}, "Local tax component"), localTaxSelect),
+    h("h4", { style: "margin:16px 0 8px" }, "Tax breakup display"),
     h("label", { class: "credit-toggle", style: "margin-bottom:10px" },
       breakupOn,
       h("span", {}, "Show tax breakup lines on bills (e.g. GST as CGST + SGST)")),
@@ -432,7 +432,11 @@ export async function renderSettingsView(main) {
     h("button", {
       class: "btn primary", style: "margin-top:14px",
       onclick: async () => {
-        const values = { tax_breakup: breakupOn.checked ? "true" : "false" };
+        const values = {
+          tax_breakup: breakupOn.checked ? "true" : "false",
+          price_tax_mode: priceTaxSelect.value,
+          store_local_tax: localTaxSelect.value,
+        };
         for (const [i, row] of [1, 2].map((i) => [i, compRows[i - 1]])) {
           const [enabled, name, share] = [
             row.querySelectorAll("input")[0],
@@ -549,119 +553,175 @@ export async function renderSettingsView(main) {
       } catch (e) { toastError(e); }
     } }, icon("i-check"), "Save loyalty settings"));
 
+  const storeCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Business identity"),
+    h("p", { class: "form-hint" },
+      "Seller details, registration and contact information used on new receipts."),
+    form,
+    h("button", { class: "btn primary", onclick: async () => {
+      const values = {
+        store_name: inputs.store_name.value.trim() || "My Store",
+        store_address: addressIn.value.trim(),
+        store_phone: inputs.store_phone.value.trim(),
+        currency: inputs.currency.value.trim() || "₹",
+        ...Object.fromEntries(Object.entries(businessInputs).map(([k, el]) => [k, el.value.trim()])),
+        tax_label: inputs.tax_label.value.trim() || "Tax",
+        low_stock_threshold: String(parseInt(inputs.low_stock_threshold.value, 10) || 5),
+      };
+      try {
+        state.settings = await api.saveSettings(values);
+        toast("Business details saved.", "success");
+      } catch (e) { toastError(e); }
+    } }, icon("i-check"), "Save business details"));
+
+  const staffMenuCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Staff menu visibility"),
+    h("p", { class: "form-hint" },
+      "Hiding Staff from the menu does not disable PIN login, permissions or audit logs."),
+    (() => {
+      const toggle = h("input", { type: "checkbox", checked: s.show_staff_menu !== "false" });
+      return h("div", {},
+        h("label", { class: "credit-toggle" }, toggle, h("span", {}, "Show Staff in main menu")),
+        h("div", { class: "settings-actions" },
+          h("button", { class: "btn primary", onclick: async () => {
+            try {
+              state.settings = await api.saveSettings({ show_staff_menu: toggle.checked ? "true" : "false" });
+              applyBranding(state.settings);
+              toast("Staff menu preference saved.", "success");
+            } catch (e) { toastError(e); }
+          } }, icon("i-check"), "Save menu preference"),
+          h("button", { class: "btn", onclick: () => { location.hash = "#/staff"; } },
+            "Open Staff management")));
+    })());
+
+  const staffPermissionCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Individual staff permissions"),
+    h("p", { class: "form-hint" },
+      "Manage stock receiving, shortage corrections, imports, refunds, checkout and opening or closing the till per operator."),
+    h("a", { href: "#/staff", class: "btn" }, "Manage staff access"));
+
+  const discountCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Standard staff discount limit"),
+    h("p", { class: "form-hint" },
+      "Applies to operators without Discount override permission. Grant overrides under Staff."),
+    (() => {
+      const max = h("input", { type: "number", class: "input", min: "0", max: "100", step: "1",
+        style: "max-width:160px", value: s.cashier_max_discount_percent || "0" });
+      return h("div", {},
+        h("div", { class: "field" }, h("label", {}, "Maximum discount (%)"), max),
+        h("button", { class: "btn primary", onclick: async () => {
+          if (!/^(?:100|\d{1,2})$/.test(max.value)) {
+            toast("Enter a whole percentage between 0 and 100.", "warn"); return;
+          }
+          try {
+            state.settings = await api.saveSettings({ cashier_max_discount_percent: max.value });
+            toast("Standard discount policy saved.", "success");
+          } catch (e) { toastError(e); }
+        } }, "Save discount policy"));
+    })());
+
+  const sampleDataCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Sample data (new stores only)"),
+    h("p", { class: "form-hint" },
+      productsCount > 0
+        ? "Your catalog already has products, so sample data cannot be loaded."
+        : "Load a sample catalog and sales history to explore the interface. Do not use for live accounting."),
+    h("button", { class: "btn", disabled: productsCount > 0, onclick: async () => {
+      const ok = await confirmDialog({ title: "Load sample data?",
+        message: "Adds sample groups, products and past sales. Only possible while the catalog is empty.",
+        confirmLabel: "Load samples" });
+      if (!ok) return;
+      try {
+        const r = await api.seedDemo();
+        toast(`Added ${r.products} products and ${r.sales_created} sales.`, "success");
+      } catch (e) { toastError(e); }
+    } }, icon("i-catalog"), "Load sample data"));
+
+  const updatesToggle = h("input", { type: "checkbox", checked: s.auto_updates_enabled !== "false",
+    "aria-label": "Automatically check, download and activate software updates" });
+  const updateStatus = h("p", { class: "form-hint", "aria-live": "polite" },
+    s.auto_updates_enabled === "false"
+      ? "Automatic updates are off. Any previously staged update will remain inactive."
+      : "The managed launcher can check for verified releases, stage them and activate on the next launch.");
+  const updateCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Software updates"),
+    h("p", { class: "form-hint" },
+      "Control automatic updates on this device. This preference is shared with the installed launcher, not just this browser."),
+    h("label", { class: "credit-toggle" }, updatesToggle,
+      h("span", {}, "Enable automatic software updates")),
+    updateStatus,
+    h("p", { class: "form-hint" },
+      "When off, the launcher does not automatically check, download, stage or activate pending releases. " +
+      "Current app and sales data remain unchanged. You can still download and install a release manually."),
+    h("div", { class: "settings-actions" },
+      h("button", { class: "btn primary", onclick: async () => {
+        try {
+          const enabling = updatesToggle.checked;
+          state.settings = await api.saveSettings({
+            auto_updates_enabled: enabling ? "true" : "false",
+          });
+          updateStatus.textContent = enabling
+            ? "Automatic updates enabled. A pending verified update may activate on next restart."
+            : "Automatic updates disabled. Any previously staged update remains inactive.";
+          toast(enabling ? "Automatic updates enabled." : "Automatic updates disabled.", "success");
+        } catch (e) { toastError(e); }
+      } }, icon("i-check"), "Save update preference"),
+      h("a", { class: "btn", target: "_blank", rel: "noopener noreferrer",
+        href: "https://github.com/aadi-bhattacharya/pyPOS/releases" }, "View available releases")));
+
+  const sections = [
+    { id: "store", title: "Store & tax", subtitle: "Business details, GST treatment and prices",
+      cards: [storeCard, taxCard] },
+    { id: "receipts", title: "Receipts & printer", subtitle: "Printer queue, paper and receipt branding",
+      cards: [brandingCard] },
+    { id: "appearance", title: "Appearance", subtitle: "POS name, colours, logos and image tools",
+      cards: [brandingSettingsCard(main, s), imageOptimizerCard()] },
+    { id: "customers", title: "Customers & returns", subtitle: "Loyalty points, refunds and exchanges",
+      cards: [loyaltyCard, returnPolicyCard(s, () => renderSettingsView(main))] },
+    { id: "staff", title: "Staff & security", subtitle: "Operator access, discounts and administrator login",
+      cards: [staffPermissionCard, discountCard, staffMenuCard, passwordCard] },
+    { id: "backups", title: "Backups & recovery", subtitle: "Local snapshots, restore and Google Drive",
+      cards: [backupsCard()] },
+    { id: "app", title: "App & updates", subtitle: "Version updates and first-run tools",
+      cards: [updateCard, sampleDataCard] },
+  ];
+
+  const navigation = h("nav", { class: "settings-nav", "aria-label": "Settings categories" });
+  const panels = h("div", { class: "settings-content" });
+  const items = [];
+  for (const group of sections) {
+    const button = h("button", { type: "button", class: "settings-nav-button",
+      "aria-controls": `settings-panel-${group.id}` },
+      h("span", { class: "settings-nav-name" }, group.title),
+      h("span", { class: "settings-nav-detail" }, group.subtitle));
+    const panel = h("section", { class: "settings-panel", id: `settings-panel-${group.id}`,
+      "aria-label": group.title },
+      h("div", { class: "settings-panel-head" },
+        h("h3", {}, group.title), h("p", { class: "form-hint" }, group.subtitle)),
+      ...group.cards);
+    button.addEventListener("click", () => showSection(group.id));
+    navigation.append(button);
+    panels.append(panel);
+    items.push({ id: group.id, button, panel });
+  }
+
+  function showSection(id) {
+    selectedSettingsSection = id;
+    for (const item of items) {
+      const active = item.id === id;
+      item.panel.hidden = !active;
+      item.button.classList.toggle("active", active);
+      if (active) item.button.setAttribute("aria-current", "page");
+      else item.button.removeAttribute("aria-current");
+    }
+  }
+
   main.append(
     h("div", { class: "view-head" },
       h("div", { class: "view-title" },
         h("h2", {}, "Settings"),
-        h("div", { class: "sub" }, "Store details and receipt preferences"))),
-
-    h("div", { style: "max-width:780px" },
-      brandingSettingsCard(main, s),
-      h("div", { class: "card card-pad" },
-        h("h3", { style: "margin-bottom:14px" }, "Store"),
-        form,
-        h("button", {
-          class: "btn primary",
-          onclick: async () => {
-            const values = {
-              store_name: inputs.store_name.value.trim() || "My Store",
-              store_address: addressIn.value.trim(),
-              store_phone: inputs.store_phone.value.trim(),
-              currency: inputs.currency.value.trim() || "₹",
-              ...Object.fromEntries(Object.entries(businessInputs).map(([k, el]) =>
-                [k, el.value.trim()])) ,
-              tax_label: inputs.tax_label.value.trim() || "Tax",
-              low_stock_threshold: String(parseInt(inputs.low_stock_threshold.value, 10) || 5),
-              receipt_footer: footerIn.value.trim(),
-            };
-            try {
-              state.settings = await api.saveSettings(values);
-              toast("Settings saved.", "success");
-            } catch (e) {
-              toastError(e);
-            }
-          },
-        }, icon("i-check"), "Save settings")),
-
-      brandingCard,
-      imageOptimizerCard(),
-      taxCard,
-      loyaltyCard,
-      returnPolicyCard(s, () => renderSettingsView(main)),
-      h("div", { class: "card card-pad", style: "margin-top:16px" },
-        h("h3", { style: "margin-bottom:8px" }, "Staff menu visibility"),
-        h("p", { class: "form-hint", style: "margin-bottom:12px" },
-          "Choose whether Staff appears in the sidebar. Staff PIN login, permissions and activity logging continue working when hidden."),
-        (() => {
-          const toggle = h("input", { type: "checkbox", checked: s.show_staff_menu !== "false" });
-          return h("div", {},
-            h("label", { class: "credit-toggle" }, toggle, h("span", {}, "Show Staff in main menu")),
-            h("div", { style: "display:flex;gap:8px;flex-wrap:wrap;margin-top:12px" },
-              h("button", { class: "btn primary", onclick: async () => {
-                try {
-                  state.settings = await api.saveSettings({ show_staff_menu: toggle.checked ? "true" : "false" });
-                  applyBranding(state.settings);
-                  toast("Staff menu visibility saved.", "success");
-                } catch (e) { toastError(e); }
-              } }, icon("i-check"), "Save menu preference"),
-              h("button", { class: "btn", onclick: () => { location.hash = "#/staff"; } },
-                "Open Staff management")));
-        })()),
-
-      h("div", { class: "card card-pad", style: "margin-top:16px" },
-        h("h3", { style: "margin-bottom:8px" }, "Individual staff permissions"),
-        h("p", { class: "form-hint" },
-          "Stock receiving, shortage corrections, imports, refunds and daily opening/closing are now controlled per operator, not through global cashier/manager roles."),
-        h("a", { href: "#/staff", class: "btn" }, "Manage staff access")),
-
-      h("div", { class: "card card-pad", style: "margin-top:16px" },
-        h("h3", { style: "margin-bottom:8px" }, "Standard staff discount limit"),
-        h("p", { class: "form-hint" },
-          "Applies to employees without the Discount override permission. For special approvals, grant that permission individually under Staff."),
-        (() => {
-          const max = h("input", { type: "number", class: "input", min: "0", max: "100", step: "1",
-            style: "max-width:160px", value: s.cashier_max_discount_percent || "0" });
-          return h("div", {},
-            h("div", { class: "field" }, h("label", {}, "Maximum discount (%)"), max),
-            h("button", { class: "btn primary", onclick: async () => {
-              if (!/^(?:100|\d{1,2})$/.test(max.value)) {
-                toast("Enter a whole percentage between 0 and 100.", "warn"); return;
-              }
-              try {
-                state.settings = await api.saveSettings({ cashier_max_discount_percent: max.value });
-                toast("Standard discount policy saved.", "success");
-              } catch (e) { toastError(e); }
-            } }, "Save discount policy"));
-        })()),
-
-      h("div", { class: "card card-pad", style: "margin-top:16px" },
-        h("h3", { style: "margin-bottom:8px" }, "Sample data"),
-        h("p", { style: "color:var(--text-2);margin-bottom:12px" },
-          productsCount > 0
-            ? "Your catalog already has products, so demo data can't be loaded."
-            : "Load a realistic starter catalog plus two weeks of sales history to explore the app."),
-        h("button", {
-          class: "btn",
-          disabled: productsCount > 0,
-          onclick: async () => {
-            const ok = await confirmDialog({
-              title: "Load sample data?",
-              message:
-                "Adds sample groups, products and past sales. Only possible while the catalog is empty.",
-              confirmLabel: "Load samples",
-            });
-            if (!ok) return;
-            try {
-              const r = await api.seedDemo();
-              toast(`Added ${r.products} products and ${r.sales_created} sales.`,
-                "success");
-            } catch (e) {
-              toastError(e);
-            }
-          },
-        }, icon("i-catalog"), "Load sample data")),
-
-      passwordCard,
-      backupsCard()),
-  );
+        h("div", { class: "sub" }, "Choose an area to configure. Save changes in that area."))),
+    h("div", { class: "settings-layout" }, navigation, panels));
+  showSection(sections.some(group => group.id === selectedSettingsSection)
+    ? selectedSettingsSection : "store");
 }

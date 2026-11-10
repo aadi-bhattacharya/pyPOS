@@ -94,14 +94,14 @@ The `.pyz` is manually updated; it is not the managed native launcher. For a por
 1. **Protect your data.** If this store has prior records, make an independent backup first and choose **one authoritative database**. Do not initialize a second database and start issuing overlapping invoice numbers.
 2. **Create the owner account.** First-run setup is local-only. Establish the separate administrator Settings password and the owner's personal operator PIN. Do not share the owner PIN with cashiers.
 3. **Enter shop details** in Settings: legal/trading name, address, phone, State/UT and applicable GSTIN; optional FSSAI and merchant UPI ID. A valid-looking GSTIN/FSSAI value is not proof that a registration is active.
-4. **Choose receipt settings**: GST-inclusive pricing for MRP-based retail (or GST-exclusive if appropriate), 58 mm/80 mm thermal or A4/PDF paper, logo and footer. Switching pricing modes does **not** reprice existing catalogue entries.
+4. **Configure pricing and receipts separately**: choose GST-inclusive pricing for MRP-based retail (or GST-exclusive when appropriate) under **Settings → Store & tax**, then select printer queue, paper, logo and footer under **Settings → Receipts & printer**. Switching pricing modes does **not** reprice existing catalogue entries.
 5. **Review your catalogue**: selling price/MRP, GST rate, HSN/SAC, UQC, SKU, barcode, variants and quantity. Imported missing cost or GST values are *review flags*, not trustworthy zero amounts.
 6. **Create staff accounts** under Staff & permissions; assign only the capabilities each person needs. Test the operator login before handing the till to a cashier.
 7. **Test on a separate copy**: one sale, its receipt, a partial refund, the correct stock edition, start/end day, backup/restore, scanner and physical printer. Only then operate against live store data.
 
 ### Logo and printing
 
-In **Settings → Receipt printing & logo**, upload PNG/JPEG/WebP logo
+In **Settings → Receipts & printer**, upload PNG/JPEG/WebP logo
 (up to **200 KiB**), choose direct Epson TM-T81 printing or browser/PDF
 printing, set the 80 mm paper layout and select the OS printer queue. Click
 **Print test slip** to verify the actual device. Direct printing uses ESC/POS
@@ -200,13 +200,17 @@ The script uses SQLite's backup API and will **not overwrite** an existing manag
 
 ### Local and off-device backups
 
-In **Settings → Backups**, create snapshots, configure retention and optionally connect Google Drive. Snapshots are written through SQLite's online backup API, checked and atomically published. The system enforces count and size limits; older snapshots may be pruned under policy. For disaster recovery keep an **independent off-device backup** and occasionally restore a copy to verify it works. Restore a live database only when operators have stopped transacting.
+In **Settings → Backups & recovery**, create snapshots, configure retention and optionally connect Google Drive. Snapshots are written through SQLite's online backup API, checked and atomically published. The system enforces count and size limits; older snapshots may be pruned under policy. For disaster recovery keep an **independent off-device backup** and occasionally restore a copy to verify it works. Restore a live database only when operators have stopped transacting.
 
-For optional Google Drive sync, enable the **Google Drive API**, create a Google OAuth web-client credential with redirect URI `http://127.0.0.1:8420/gdrive/callback`, then enter its client ID/secret in **Settings → Backups** and authorize the chosen Google account. The app requests the limited `drive.file` scope. OAuth credentials and access tokens must remain private. Sync is optional; sales stay local if the network or Drive is unavailable.
+For optional Google Drive sync, enable the **Google Drive API**, create a Google OAuth web-client credential with redirect URI `http://127.0.0.1:8420/gdrive/callback`, then enter its client ID/secret in **Settings → Backups & recovery** and authorize the chosen Google account. The app requests the limited `drive.file` scope. OAuth credentials and access tokens must remain private. Sync is optional; sales stay local if the network or Drive is unavailable.
 
 ## Updates, shutdown and recovery
 
-**Managed native releases only:** The launcher checks the pinned GitHub Releases source in the background. A strictly newer stable release with a matching platform ZIP, manifest and SHA-256 checksums is downloaded and staged separately. **It is not activated during an open session or while the app is running**; the next valid launcher start selects it after making a pre-update SQLite snapshot. Network failure does not block ordinary sales.
+**Managed native releases only:** When **Settings → App & updates → Enable automatic software updates** is on (the default), the launcher checks the pinned GitHub Releases source in the background. A strictly newer stable release with a matching platform ZIP, manifest and SHA-256 checksums is downloaded and staged separately. **It is not activated during an open session or while the app is running**; the next valid launcher start selects it after making a pre-update SQLite snapshot. Network failure does not block ordinary sales.
+
+To **opt out**, sign in as owner, open **Settings → App & updates**, switch off **Enable automatic software updates**, then select **Save update preference**. This preference is stored in the persistent shop settings database, not in browser storage. The launcher stops scheduling automatic checks/downloads and will not activate an already-staged `pending.txt` release at restart while opted out. The running version, database and staged files remain untouched. Re-enabling allows a verified staged release to activate at the next normal launch; to update manually instead, download an official release for your OS from [GitHub Releases](https://github.com/aadi-bhattacharya/pyPOS/releases) and install it deliberately. Turning auto-updates off also disables unattended security fixes.
+
+**Settings organization:** use the seven categories: **Store & tax**, **Receipts & printer**, **Appearance**, **Customers & returns**, **Staff & security**, **Backups & recovery**, and **App & updates**. Each group has its own Save control. Printer preferences no longer silently save GST pricing changes.
 
 The managed launcher retains the previous version for recovery. A failed new binary can trigger **binary** rollback, but **schema/data rollback is not automatic**: restoring yesterday's database could lose today's sales. Never treat a version rollback as authorization to overwrite the transaction database.
 
@@ -311,7 +315,7 @@ service** before pyPOS can send jobs to it.
    macOS, configure a CUPS queue that passes ESC/POS data **unmodified**, and
    verify that `lp -o raw -d QUEUE` works. A driver queue that rasterizes PDF
    or filters arbitrary bytes will not work with this transport.
-2. In **Settings → Receipt printing & logo**, choose **Epson TM-T81 (direct,
+2. In **Settings → Receipts & printer**, choose **Epson TM-T81 (direct,
    no dialog)**, **80 mm** paper, and enter the installed **printer queue name**.
    Leave it blank to use the OS default printer. Save settings before testing.
 3. Click **Print test slip** and physically verify paper width, logo, legible
@@ -376,12 +380,12 @@ Python **3.10+**, Flask **3.0+**, Waitress **3.0+**, and `qrcode` **7.4+** are d
 
 | Distribution | Python on shop PC? | Automatic native updates? | Startup |
 | --- | --- | --- | --- |
-| Tagged native ZIP | No | Yes, verified/staged | Installed pyPOS shortcut / managed launcher |
+| Tagged native ZIP | No | Optional (on by default; owner can opt out) | Installed pyPOS shortcut / managed launcher |
 | `.pyz` zipapp | Yes | No | `python pypos-<version>.pyz` |
 | pip/pipx | Yes | No | `pypos` |
 | source checkout | Yes | No | `python main.py`, `run.sh` or Windows VBS |
 
-Native binaries are built **on each target OS/CPU**, not cross-compiled from one Linux job. Manual, branch and ad-hoc builds intentionally lack a pinned update identity.
+Native binaries are built **on each target OS/CPU**, not cross-compiled from one Linux job. Manual, branch and ad-hoc builds intentionally lack a pinned update identity. The launcher reads `auto_updates_enabled` from the persistent SQLite settings table in the managed install data directory; missing preferences default to enabled, but unreadable/corrupt settings prevent update activity. The opt-out is checked before network use, after a download and again before staged activation. Manual release installation is unaffected.
 
 ### Data boundaries and migrations
 

@@ -1482,3 +1482,28 @@ a.btn, a.btn:hover, a.btn:focus { text-decoration: none; }
 .staff-sensitive { display:block; font-size:11px; color:var(--danger); font-weight:650; margin-top:2px; }
 .staff-permission-presets { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
 #nav a[hidden] { display:none !important; }
+
+/* Settings: one focused category at a time. No nested screen-wide scrollbars. */
+.settings-layout { display:grid; grid-template-columns:minmax(185px,225px) minmax(0,1fr); gap:22px; align-items:start; width:100%; max-width:1160px; }
+.settings-nav { display:flex; flex-direction:column; gap:4px; position:sticky; top:16px; min-width:0; }
+.settings-nav-button { display:flex; flex-direction:column; gap:3px; align-items:stretch; text-align:left;
+  border:1px solid transparent; background:transparent; border-radius:7px; color:var(--text); padding:12px; cursor:pointer; font:inherit; }
+.settings-nav-button:hover { background:var(--surface-2); }
+.settings-nav-button.active { background:var(--accent-soft); border-color:var(--accent); }
+.settings-nav-button:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
+.settings-nav-name { font-size:13px; font-weight:700; }
+.settings-nav-detail { font-size:11px; line-height:1.4; color:var(--text-2); }
+.settings-content { min-width:0; max-width:860px; }
+.settings-panel[hidden] { display:none !important; }
+.settings-panel-head { padding:2px 0 13px; border-bottom:1px solid var(--border); margin-bottom:16px; }
+.settings-panel-head h3 { font-size:18px; margin:0 0 4px; }
+.settings-panel-head p { margin:0; }
+.settings-panel > .card { margin:0 0 16px !important; }
+.settings-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:13px; }
+@media (max-width:800px) {
+  .settings-layout { display:flex; flex-direction:column; gap:16px; }
+  .settings-nav { position:static; width:100%; flex-direction:row; overflow-x:auto; padding:2px 0 7px; }
+  .settings-nav-button { min-width:max-content; padding:10px 12px; }
+  .settings-nav-detail { display:none; }
+  .settings-content { width:100%; }
+}

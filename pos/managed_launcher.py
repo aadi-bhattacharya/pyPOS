@@ -25,6 +25,7 @@ from .launch_dialog import confirm_stop
 from .launch_dialog import configure_logging, show_error, unexpected_failure
 from .platform_paths import binary_names, install_root, platform_key
 from .db import default_data_dir
+from .update_policy import automatic_updates_enabled
 from .update_core import (UpdateError, atomic_version_file, clean_versions,
                           install_version, read_version_file, update_once,
                           validate_version)
@@ -230,7 +231,7 @@ def stable_launch(root):
     (root / "stop.request").unlink(missing_ok=True)
     current = read_version_file(root / "current.txt")
     pending = read_version_file(root / "pending.txt")
-    if pending and verify_installed(root, pending):
+    if pending and automatic_updates_enabled() and verify_installed(root, pending):
         activate = True
         if current and current != pending:
             try:
@@ -308,10 +309,14 @@ def _run_locked(root, version_dir):
         try:
             if not release_build.ENABLED or not release_build.REPOSITORY:
                 return
+            if not automatic_updates_enabled():
+                LOG.info("Automatic updates disabled by store administrator")
+                return
             # Do not spend time on updates if the register failed to start.
             if child.poll() is not None:
                 return
-            changed = update_once(root, version, release_build.REPOSITORY)
+            changed = update_once(root, version, release_build.REPOSITORY,
+                                  allowed=automatic_updates_enabled)
             if changed:
                 LOG.info("A verified update is ready for the next pyPOS launch")
         except Exception:

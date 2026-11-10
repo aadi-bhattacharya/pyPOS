@@ -56,6 +56,7 @@ SETTING_KEYS = {
     "tax_comp2_enabled": "true",
     "tax_comp2_name": "SGST",
     "tax_comp2_share": "50",
+    "auto_updates_enabled": "true",  # Managed launcher: check, stage and activate updates
     "auto_backup_enabled": "true",
     "auto_backup_interval_hours": "24",
     "backup_keep": "14",
@@ -146,7 +147,7 @@ def save_settings(conn, values):
                 raise ValueError("State/UT code must be a valid two-digit GST code")
         elif key == "price_tax_mode" and value not in ("inclusive", "exclusive"):
             raise ValueError("Price tax mode must be inclusive or exclusive")
-        elif key in ("receipt_auto_print",) and value not in ("true", "false"):
+        elif key in ("receipt_auto_print", "auto_updates_enabled") and value not in ("true", "false"):
             raise ValueError(f"{key} must be true or false")
         elif key == "receipt_print_mode" and value not in ("thermal", "browser"):
             raise ValueError("Receipt print mode must be thermal or browser")
