@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,9 +44,12 @@ class UpdatePreferenceTests(unittest.TestCase):
         self.assertTrue(automatic_updates_enabled(self.db_path))
 
     def test_unreadable_or_invalid_value_does_not_override_opt_out(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
-                         ("auto_updates_enabled", "invalid"))
+        # sqlite3.Connection.__exit__ commits but does not close the handle.
+        # Windows refuses to delete the temporary DB while it remains open.
+        with closing(sqlite3.connect(self.db_path)) as conn:
+            with conn:
+                conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES (?, ?)",
+                             ("auto_updates_enabled", "invalid"))
         self.assertFalse(automatic_updates_enabled(self.db_path))
         corrupt = self.root / "corrupt.db"
         corrupt.write_bytes(b"not a sqlite database")
