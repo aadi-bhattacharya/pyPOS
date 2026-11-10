@@ -1,4 +1,6 @@
 import os
+import hashlib
+import logging
 from contextlib import closing
 import re
 import shutil
@@ -59,6 +61,11 @@ def _atomic_write_text(path, text):
 
 ERROR_MARKER = ".remote_error"
 SYNC_SUFFIX = ".synced"
+REASON_SUFFIX = ".reason"
+OUTBOX_NAME = "sync-outbox"
+OUTBOX_KEEP = 3
+LOG = logging.getLogger("pypos.backups")
+
 
 
 def _gdrive_connected(settings):
@@ -154,7 +161,7 @@ def _ensure_disk_room(settings, source_path=None):
     return removed
 
 
-def create_backup(source_path=None):
+def create_backup(source_path=None, reason=None):
     """Create a consistent, power-cut-safe snapshot of the live database.
 
     The copy is written to a temp name, integrity-checked, fsynced and then
@@ -202,6 +209,12 @@ def create_backup(source_path=None):
             os.close(fd)
         os.replace(tmp, final)
         _fsync_dir(bdir)
+        if reason:
+            # Informational metadata; the snapshot itself is already durable.
+            try:
+                _atomic_write_text(final.with_suffix(REASON_SUFFIX), str(reason)[:40])
+            except OSError:
+                LOG.exception("Snapshot is safe, but reason metadata could not be written")
 
         from .db import harden_permissions
         harden_permissions(final.parent)
@@ -253,7 +266,12 @@ def list_backups(bdir=None):
             created_utc = datetime.fromtimestamp(
                 st.st_mtime, timezone.utc
             ).replace(tzinfo=None).isoformat(timespec="seconds")
+            try:
+                reason = f.with_suffix(REASON_SUFFIX).read_text(encoding="utf-8").strip()
+            except OSError:
+                reason = ""
             out.append({
+                "reason": reason,
                 "name": f.name,
                 "size": st.st_size,
                 "size_human": _human_size(st.st_size),
@@ -267,6 +285,7 @@ def delete_backup(name, bdir=None):
     path = _backup_path(name, bdir)
     path.unlink(missing_ok=True)
     path.with_suffix(SYNC_SUFFIX).unlink(missing_ok=True)
+    path.with_suffix(REASON_SUFFIX).unlink(missing_ok=True)
 
 
 def restore_backup(name, live_path=None):
@@ -352,13 +371,93 @@ def cleanup_debris(max_age_hours=24, bdir=None):
             elif NAME_RE.match(f.name) and f.stat().st_size == 0:
                 f.unlink(missing_ok=True)
                 removed += 1
-            elif f.name.endswith(SYNC_SUFFIX):
+            elif f.name.endswith((SYNC_SUFFIX, REASON_SUFFIX)):
                 if not f.with_suffix(".db").exists():
                     f.unlink(missing_ok=True)
                     removed += 1
         except OSError:
             continue  # file vanished mid-scan — fine
     return removed
+
+
+def _sync_outbox(source_path=None):
+    """Only immutable completed snapshots, NEVER pypos.db or WAL files."""
+    return _backup_dir(source_path) / OUTBOX_NAME
+
+
+def replicate_snapshot(path, source_path=None):
+    """Atomically publish an integrity-checked copy for Syncthing Send Only.
+
+    This stages a local outbox; it does not claim Syncthing is connected or
+    that an independent machine has received the file.
+    """
+    path = Path(path)
+    if not NAME_RE.fullmatch(path.name):
+        raise BackupError("Only finalized pyPOS snapshots may be replicated")
+    validate_database(path)
+    outbox = _sync_outbox(source_path)
+    _ensure_dir(outbox)
+    target = outbox / path.name
+    if target.exists():
+        validate_database(target)
+        return target
+    if _free_bytes(outbox) is not None and _free_bytes(outbox) < path.stat().st_size + MIN_FREE_MARGIN_BYTES:
+        raise BackupError("Not enough disk space to stage a replication copy")
+    temp = outbox / (TMP_PREFIX + path.name)
+    h_src = hashlib.sha256()
+    try:
+        with path.open("rb") as src, temp.open("xb") as dest:
+            while chunk := src.read(1024 * 1024):
+                h_src.update(chunk)
+                dest.write(chunk)
+            dest.flush()
+            os.fsync(dest.fileno())
+        h_dst = hashlib.sha256()
+        with temp.open("rb") as check:
+            while chunk := check.read(1024 * 1024):
+                h_dst.update(chunk)
+        if h_src.digest() != h_dst.digest():
+            raise BackupError("Replicated snapshot checksum mismatch")
+        validate_database(temp)
+        os.replace(temp, target)
+        _fsync_dir(outbox)
+        # Bounded outbox: remote mirror contains the latest three snapshots.
+        for old in sorted(outbox.glob("pypos-*.db"), reverse=True)[OUTBOX_KEEP:]:
+            if NAME_RE.fullmatch(old.name):
+                old.unlink(missing_ok=True)
+        return target
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def _retention_candidates(backups_list, settings):
+    """Keep 10-minute history for 24h, hourly to 7d, daily to 30d.
+
+    Day-end and pre-migration snapshots are protected against *tiering*, not
+    against the hard byte/count caps or emergency disk-space pruning.
+    """
+    if "backup_retention_days" not in settings:
+        return backups_list
+    days = max(1, int(settings["backup_retention_days"]))
+    now = datetime.now(timezone.utc)
+    kept = []
+    seen = set()
+    for index, item in enumerate(backups_list):
+        created = datetime.fromisoformat(item["created_at"]).replace(tzinfo=timezone.utc)
+        age = max(0., (now - created).total_seconds())
+        if index != 0 and age > days * 86400:
+            continue
+        if age <= 86400 or item.get("reason") in ("day_end", "pre_migration"):
+            kept.append(item)
+            continue
+        if age <= 7 * 86400:
+            bucket = ("hour", created.strftime("%Y-%m-%d-%H"))
+        else:
+            bucket = ("day", created.strftime("%Y-%m-%d"))
+        if bucket not in seen:
+            seen.add(bucket)
+            kept.append(item)
+    return kept
 
 
 def prune_backups(keep, settings=None, bdir=None):
@@ -372,9 +471,13 @@ def prune_backups(keep, settings=None, bdir=None):
     removed = 0
 
     backups_list = list_backups(bdir)
-    for b in backups_list[keep:]:
-        delete_backup(b["name"], bdir)
-        removed += 1
+    chosen = _retention_candidates(backups_list, settings or {})
+    # The newest snapshot is always protected from normal retention pruning.
+    kept_names = {b["name"] for b in chosen[:keep]}
+    for b in backups_list:
+        if b["name"] not in kept_names:
+            delete_backup(b["name"], bdir)
+            removed += 1
 
     if settings is not None:
         budget_mb = float(settings.get("backup_max_mb") or 0)
@@ -390,7 +493,7 @@ def prune_backups(keep, settings=None, bdir=None):
     return removed
 
 
-def run_backup_cycle(settings, source_path=None):
+def run_backup_cycle(settings, source_path=None, *, reason=None, upload_gdrive=True):
     """One scheduled/manual cycle: cleanup -> disk guard -> snapshot -> prune.
 
     Guarded by a lock so a manual click and the scheduler can never run two
@@ -405,17 +508,28 @@ def run_backup_cycle(settings, source_path=None):
         except BackupError:
             raise
 
-        name = create_backup(source_path)
+        name = create_backup(source_path, reason=reason)
         pruned = prune_backups(
             settings.get("backup_keep", "14"), settings=settings, bdir=bdir)
 
         path = bdir / name
+        replication_staged, replication_error = False, None
+        if settings.get("backup_replication_enabled") == "true":
+            try:
+                replicate_snapshot(path, source_path)
+                replication_staged = True
+            except (OSError, sqlite3.Error, BackupError) as exc:
+                replication_error = str(exc)[:200]
+                LOG.warning("Replication staging failed: %s", exc)
+
         pushed, err = False, None
-        if _gdrive_connected(settings):
+        if upload_gdrive and _gdrive_connected(settings):
             pushed, err = push_to_gdrive(path, settings)
             _mark_remote_result(path, pushed, err)
         return {"name": name, "pruned": pruned + emergency_pruned,
-                "pushed": pushed, "remote_error": err}
+                "pushed": pushed, "remote_error": err,
+                "replication_staged": replication_staged,
+                "replication_error": replication_error}
 
 
 # ---------------- scheduler ----------------
@@ -427,16 +541,17 @@ class BackupScheduler(threading.Thread):
         super().__init__(daemon=True, name="pos-backup-scheduler")
         self.get_settings = get_settings_fn
         self.source_path = source_path
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
 
     def stop(self):
-        self._stop.set()
+        self._stop_event.set()
 
     def next_run(self, settings, last_ts):
-        hours = float(settings.get("auto_backup_interval_hours") or 24)
-        if settings.get("auto_backup_enabled") != "true" or hours <= 0:
+        minutes = float(settings.get("auto_backup_interval_minutes") or
+                        float(settings.get("auto_backup_interval_hours") or 24) * 60)
+        if settings.get("auto_backup_enabled") != "true" or minutes <= 0:
             return None
-        interval = timedelta(hours=hours)
+        interval = timedelta(minutes=minutes)
         if last_ts is None:
             return time.time() + 15  # first auto-run shortly after boot
         return last_ts + interval.total_seconds()
@@ -444,7 +559,7 @@ class BackupScheduler(threading.Thread):
     def run(self):
         marker_file = _backup_dir(self.source_path) / ".last_auto_backup"
         # Backwards-compatible: also honor newest manual/auto snapshot on disk.
-        while not self._stop.wait(60):
+        while not self._stop_event.wait(60):
             try:
                 settings = self.get_settings()
                 last_ts = self._last_run(marker_file, settings)
@@ -469,7 +584,8 @@ class BackupScheduler(threading.Thread):
             pass
         backups = list_backups(_backup_dir(self.source_path))
         if backups:
-            return datetime.fromisoformat(backups[0]["created_at"]).timestamp()
+            return datetime.fromisoformat(backups[0]["created_at"]).replace(
+                tzinfo=timezone.utc).timestamp()
         return None
 
 
@@ -483,7 +599,9 @@ def scheduler_status(get_settings_fn, source_path=None):
     bdir = _backup_dir(source_path)
     marker = bdir / ".last_auto_backup"
     enabled = settings.get("auto_backup_enabled") == "true"
-    hours = float(settings.get("auto_backup_interval_hours") or 24)
+    minutes = float(settings.get("auto_backup_interval_minutes") or
+                    float(settings.get("auto_backup_interval_hours") or 24) * 60)
+    hours = minutes / 60
     backups = list_backups(bdir)
     last_iso = None
     if marker.exists():
@@ -513,10 +631,24 @@ def scheduler_status(get_settings_fn, source_path=None):
 
     total_bytes = sum(b["size"] for b in backups)
     free = _free_bytes(bdir)
+    outbox = _sync_outbox(source_path)
+    replicated = [p for p in sorted(outbox.glob("pypos-*.db"), reverse=True)
+                  if NAME_RE.fullmatch(p.name)] if outbox.is_dir() else []
     return {
         "enabled": enabled,
-        "interval_hours": hours,
-        "keep": int(settings.get("backup_keep") or 14),
+        "interval_minutes": minutes,
+        "interval_hours": hours,  # Compatible with old Settings clients.
+        "retention_days": int(settings.get("backup_retention_days") or 30),
+        "day_end_enabled": settings.get("backup_day_end_enabled") == "true",
+        "pre_migration_enabled": settings.get("backup_pre_migration_enabled") == "true",
+        "replication": {
+            "enabled": settings.get("backup_replication_enabled") == "true",
+            "outbox": str(outbox),
+            "staged_count": len(replicated),
+            "last_staged": replicated[0].name if replicated else None,
+            "remote_verified": False,  # Syncthing remote state is external.
+        },
+        "keep": int(settings.get("backup_keep") or 500),
         "storage": {
             "used_human": _human_size(total_bytes),
             "used_bytes": total_bytes,

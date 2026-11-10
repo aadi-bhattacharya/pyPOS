@@ -57,10 +57,17 @@ SETTING_KEYS = {
     "tax_comp2_name": "SGST",
     "tax_comp2_share": "50",
     "auto_updates_enabled": "true",  # Managed launcher: check, stage and activate updates
+    "lan_access_enabled": "false",  # Administrator opt-in; takes effect after restart.
     "auto_backup_enabled": "true",
-    "auto_backup_interval_hours": "24",
-    "backup_keep": "14",
-    "backup_max_mb": "800",
+    "auto_backup_interval_hours": "24",  # Legacy API for old clients.
+    "auto_backup_interval_minutes": "10",
+    "backup_retention_days": "30",
+    "backup_day_end_enabled": "true",
+    "backup_pre_migration_enabled": "true",
+    "backup_replication_enabled": "true",  # Outbox for Syncthing, not the live DB.
+    "backup_keep": "500",  # Secondary safety ceiling after tiered retention.
+    "backup_max_mb": "4096",  # Storage safety ceiling; can shorten retention.
+
     # Google Drive OAuth credentials (native, no rclone needed)
     "gdrive_client_id": "",
     "gdrive_client_secret": "",
@@ -147,7 +154,22 @@ def save_settings(conn, values):
                 raise ValueError("State/UT code must be a valid two-digit GST code")
         elif key == "price_tax_mode" and value not in ("inclusive", "exclusive"):
             raise ValueError("Price tax mode must be inclusive or exclusive")
+        elif key in ("receipt_auto_print", "auto_updates_enabled",
+                     "auto_backup_enabled", "backup_day_end_enabled",
+                     "backup_pre_migration_enabled", "backup_replication_enabled",
+                     "lan_access_enabled") and value not in ("true", "false"):
+            raise ValueError(f"{key} must be true or false")
+        elif key == "auto_backup_interval_minutes":
+            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 1440:
+                raise ValueError("Backup interval must be between 1 and 1440 minutes")
+        elif key == "backup_retention_days":
+            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 365:
+                raise ValueError("Backup retention must be between 1 and 365 days")
+        elif key in ("backup_keep", "backup_max_mb", "auto_backup_interval_hours"):
+            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= (100000 if key == "backup_keep" else 1000000):
+                raise ValueError(f"{key} must be a positive integer")
         elif key in ("receipt_auto_print", "auto_updates_enabled") and value not in ("true", "false"):
+
             raise ValueError(f"{key} must be true or false")
         elif key == "receipt_print_mode" and value not in ("thermal", "browser"):
             raise ValueError("Receipt print mode must be thermal or browser")

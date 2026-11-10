@@ -1280,9 +1280,23 @@ def create_app(db_path=None, extra_hosts=()):
     @app.post("/api/cash-sessions/close")
     def api_session_close():
         data = body()
-        return jsonify(cash_sessions.close_session(
+        # Closing is committed before backup IO. If the disk/cloud is down,
+        # never tell the cashier the day is still open or attempt to close it
+        # twice; report an explicit, recoverable backup warning instead.
+        result = cash_sessions.close_session(
             get_db(), counted_cash=data.get("counted_cash"),
-            note=data.get("note")))
+            note=data.get("note"))
+        cfg = settings_mod.get_all_settings(get_db())
+        if cfg.get("backup_day_end_enabled") == "true":
+            try:
+                result["backup"] = backups.run_backup_cycle(
+                    cfg, source_path=db_path(), reason="day_end",
+                    upload_gdrive=False)
+            except Exception as exc:
+                app.logger.exception("Day closed but automatic snapshot failed")
+                result["backup_warning"] = (
+                    "Day closed successfully, but the backup failed: " + str(exc)[:180])
+        return jsonify(result)
 
     @app.post("/api/cash-sessions/movements")
     def api_cash_movement():

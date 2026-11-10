@@ -38,6 +38,9 @@ async function renderBackups(wrap) {
       : "";
     statusBits.push(`Storage: ${status.storage.used_human} used${cap} · ${status.storage.free_human} free`);
   }
+  if (status.replication?.enabled) {
+    statusBits.push(`Syncthing outbox: ${status.replication.staged_count || 0} local snapshots; remote delivery not verified`);
+  }
   if (status.gdrive?.connected) {
     statusBits.push(`Google Drive ✓ ${status.gdrive.client_id}`);
   }
@@ -100,13 +103,19 @@ async function renderBackups(wrap) {
   // ---- auto-backup + Google Drive configuration ----
   const enabledIn = h("input", { type: "checkbox" });
   enabledIn.checked = status.enabled;
-  const intervalIn = h("input", { class: "input", type: "number", min: "1", step: "1",
-    value: String(status.interval_hours || 24), style: "width:90px" });
-  const keepIn = h("input", { class: "input", type: "number", min: "1", step: "1",
-    value: String(status.keep ?? 14), style: "width:90px" });
+  const intervalIn = h("input", { class: "input", type: "number", min: "1", max: "1440", step: "1",
+    value: String(status.interval_minutes || 10), style: "width:90px" });
+  const daysIn = h("input", { class: "input", type: "number", min: "1", max: "365", step: "1",
+    value: String(status.retention_days || 30), style: "width:90px" });
   const maxMbIn = h("input", { class: "input", type: "number", min: "1", step: "1",
-    value: String(status.storage?.max_mb || 800), style: "width:90px",
-    title: "Hard ceiling: oldest snapshots are deleted beyond this total size" });
+    value: String(status.storage?.max_mb || 4096), style: "width:90px",
+    title: "Hard storage ceiling; snapshots may be removed before the configured age" });
+  const dayEndIn = h("input", { type: "checkbox" });
+  dayEndIn.checked = status.day_end_enabled;
+  const migrationIn = h("input", { type: "checkbox" });
+  migrationIn.checked = status.pre_migration_enabled;
+  const replicationIn = h("input", { type: "checkbox" });
+  replicationIn.checked = status.replication?.enabled;
 
   const scheduleSaveBtn = h("button", {
     class: "btn",
@@ -114,9 +123,12 @@ async function renderBackups(wrap) {
       try {
         await api.saveSettings({
           auto_backup_enabled: enabledIn.checked ? "true" : "false",
-          auto_backup_interval_hours: String(parseInt(intervalIn.value, 10) || 24),
-          backup_keep: String(parseInt(keepIn.value, 10) || 14),
-          backup_max_mb: String(parseInt(maxMbIn.value, 10) || 800),
+          auto_backup_interval_minutes: intervalIn.value,
+          backup_retention_days: daysIn.value,
+          backup_max_mb: maxMbIn.value,
+          backup_day_end_enabled: dayEndIn.checked ? "true" : "false",
+          backup_pre_migration_enabled: migrationIn.checked ? "true" : "false",
+          backup_replication_enabled: replicationIn.checked ? "true" : "false",
         });
         toast("Backup schedule saved.", "success");
         await renderBackups(wrap);
@@ -130,12 +142,25 @@ async function renderBackups(wrap) {
         enabledIn, "Automatic backups"),
       h("div", { style: "display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end" },
         h("div", { class: "field", style: "margin:0" },
-          h("label", {}, "Interval (hours)"), intervalIn),
+          h("label", {}, "Interval (minutes)"), intervalIn),
         h("div", { class: "field", style: "margin:0" },
-          h("label", {}, "Keep last N"), keepIn),
+          h("label", {}, "History (days)"), daysIn),
         h("div", { class: "field", style: "margin:0" },
           h("label", {}, "Size cap (MB)"), maxMbIn),
         scheduleSaveBtn)),
+      h("label", { style: "display:flex;gap:8px;align-items:center" },
+        dayEndIn, "Take an extra snapshot when End Day succeeds"),
+      h("label", { style: "display:flex;gap:8px;align-items:center" },
+        migrationIn, "Snapshot the existing database before schema migration"),
+      h("label", { style: "display:flex;gap:8px;align-items:center" },
+        replicationIn, "Stage the latest 3 verified snapshots for Syncthing"),
+      h("div", { class: "form-hint", style: "overflow-wrap:anywhere" },
+        `Syncthing Send Only folder: ${status.replication?.outbox || "Not configured"}. ` +
+        "Configure this folder in Syncthing and set the other device to Receive Only. " +
+        "It is not the live database. Syncthing connectivity cannot be verified here."),
+      h("div", { class: "form-hint" },
+        "Recent backups are kept every 10 minutes, then thinned to hourly and daily " +
+        "history through 30 days. Space/count caps can shorten retention."),
     );
 
   wrap.append(gdriveSection(status, () => renderBackups(wrap)));

@@ -84,6 +84,15 @@ def _run(argv=None):
 
     db_path = init_db(args.db)
 
+    # Persisted LAN opt-in makes native shortcuts usable as a shared register
+    # without modifying launcher command lines. CLI --lan remains available.
+    if not args.lan:
+        cfg_conn = connect(db_path)
+        try:
+            args.lan = settings_mod.get_all_settings(cfg_conn).get(
+                "lan_access_enabled") == "true"
+        finally:
+            cfg_conn.close()
     if args.lan:
         args.host = "0.0.0.0"
     elif not _is_loopback(args.host):
@@ -128,7 +137,8 @@ def _run(argv=None):
     scheduler.start()
 
     app = create_app(db_path, extra_hosts=("*",) if args.lan else ())
-    url = f"http://{args.host}:{args.port}"
+    # 0.0.0.0 is a listen address, not a useful browser destination.
+    url = f"http://{'127.0.0.1' if args.lan else args.host}:{args.port}"
 
 
     print(r"  ___               ____  _____  ___ ")

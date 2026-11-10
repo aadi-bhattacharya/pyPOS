@@ -197,20 +197,32 @@ def _pre_update_backup(current, pending):
     target = backup_dir / name
     if target.exists():
         raise UpdateError("Pre-update backup name already exists; update postponed")
-    # SQLite's online backup API copies a transaction-consistent snapshot,
-    # including committed transactions in WAL. No raw .db file copying.
+    # A partially written snapshot must never be exposed as a finished backup.
+    # The temporary and final paths are on the same filesystem for atomic rename.
+    temp = backup_dir / (".tmp-" + name)
+    if temp.exists():
+        raise UpdateError("Unfinished pre-update backup exists; update postponed")
+    from .backups import _fsync_dir
     source = sqlite3.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
     try:
-        destination = sqlite3.connect(str(target), timeout=10)
+        destination = sqlite3.connect(str(temp), timeout=10)
         try:
             source.backup(destination, pages=256, sleep=0.1)
-            status = destination.execute("PRAGMA quick_check").fetchone()[0]
+            destination.execute("PRAGMA journal_mode = DELETE")
+            status = destination.execute("PRAGMA integrity_check").fetchone()[0]
             if status != "ok":
-                raise UpdateError("Pre-update SQLite backup did not pass quick_check")
+                raise UpdateError("Pre-update SQLite backup failed integrity_check")
         finally:
             destination.close()
+        fd = os.open(str(temp), os.O_RDWR)  # Windows fsync needs writable fd.
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temp, target)
+        _fsync_dir(backup_dir)
     except Exception:
-        target.unlink(missing_ok=True)
+        temp.unlink(missing_ok=True)
         raise
     finally:
         source.close()

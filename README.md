@@ -17,6 +17,7 @@ pyPOS runs a local Python server and opens the register in your browser. It uses
 - [Billing, GST and refunds](#billing-gst-and-refunds)
 - [Staff accounts and permissions](#staff-accounts-and-permissions)
 - [Backups and store data](#backups-and-store-data)
+- [Multiple checkout terminals](#multiple-checkout-terminals)
 - [Updates, shutdown and recovery](#updates-shutdown-and-recovery)
 - [Troubleshooting](#troubleshooting)
 - [For developers](#for-developers)
@@ -200,9 +201,25 @@ The script uses SQLite's backup API and will **not overwrite** an existing manag
 
 ### Local and off-device backups
 
-In **Settings → Backups & recovery**, create snapshots, configure retention and optionally connect Google Drive. Snapshots are written through SQLite's online backup API, checked and atomically published. The system enforces count and size limits; older snapshots may be pruned under policy. For disaster recovery keep an **independent off-device backup** and occasionally restore a copy to verify it works. Restore a live database only when operators have stopped transacting.
+In **Settings → Backups & recovery**, automatic backups are **enabled every 10 minutes** by default. The 30-day history keeps all snapshots from the last 24 hours, an hourly snapshot for the next six days, then a daily snapshot through 30 days. Additional snapshots are made **after End Day commits** and **before the first schema migration for a version**. Each snapshot is a SQLite online backup including committed WAL entries, checked for integrity and atomically published. Pre-migration snapshots are created before modifying existing tables; an unsuccessful safety backup prevents that migration.
+
+**Capacity is not unlimited.** The default 500-snapshot count ceiling and 4 GiB disk budget may shorten the 30-day history for larger stores. The newest local snapshot is protected against ordinary pruning, and backups are skipped safely when there is too little disk space. Verify the visible snapshot history regularly. Day-end backup failures report a warning while preserving the already-closed day.
+
+**Syncthing replication support (enabled by default):** pyPOS stages the **latest three completed snapshots only** in the `backups/sync-outbox/` subfolder and verifies each copied file. Install/configure Syncthing yourself; in Syncthing, share *that folder* from the shop server as **Send Only**, and configure a second PC/NAS as **Receive Only**. Syncthing copies and deletes staged files according to its own sync status. pyPOS cannot verify that the other device received them: the UI reports only *locally staged* snapshots. Test an actual restore on the second device; maintain independent historical/off-site backups and protect customer data in transit and at rest. **Never synchronize live `pypos.db`, `pypos.db-wal` or `pypos.db-shm`**. These are not independently safe replicas.
+
+The outbox itself is a second local copy, *not* an independent off-site backup until Syncthing has delivered it. You can disable outbox staging, day-end backups or pre-migration backups separately; disabling pre-migration protection increases upgrade risk. For a proper disaster recovery plan maintain an additional off-device and/or cloud backup and periodically restore to a test database. Restore the live database only with operators stopped and the original protected.
 
 For optional Google Drive sync, enable the **Google Drive API**, create a Google OAuth web-client credential with redirect URI `http://127.0.0.1:8420/gdrive/callback`, then enter its client ID/secret in **Settings → Backups & recovery** and authorize the chosen Google account. The app requests the limited `drive.file` scope. OAuth credentials and access tokens must remain private. Sync is optional; sales stay local if the network or Drive is unavailable.
+
+## Multiple checkout terminals
+
+Use **one pyPOS server as the authoritative register**. On the computer holding the real shop database, sign in as the administrator and enable **Settings → App & updates → Shared register (multiple terminals) → Allow other terminals on this trusted LAN**. Save, **stop pyPOS gracefully and start it again**. This setting makes managed native shortcuts bind to the LAN; `python main.py --lan --no-browser` is an alternative for a source installation. By default, LAN access is **off**. The host PC must remain running and connected.
+
+On each additional terminal, open `http://SERVER-IP:8420` in a browser, replacing `SERVER-IP` with the host PC's **trusted LAN address** (such as `192.168.x.x`). Each operator logs in with their own PIN. Allow inbound TCP port `8420` through the **host's firewall only for trusted devices**. Every connected browser uses the *same* sales, invoice sequences, cash-session record and stock in the central SQLite database. **Do not run another independent pyPOS database on the other terminals.** The existing Cash Drawer represents a *shared store-wide day*, not separate physical tills per counter; use a single reconciled cash drawer until per-terminal sessions exist. Direct thermal receipts print through the **server computer's configured printer**, not a separate printer attached to each browser-only terminal.
+
+**Security:** pyPOS LAN mode uses **unencrypted HTTP**. Credentials and transaction data are therefore visible to attackers on an untrusted network. Use only a physically isolated/trusted LAN, ideally wired, or place the service behind an appropriate HTTPS/TLS gateway. Do not expose TCP `8420` to the Internet, forward the router port, or use public/shared Wi-Fi. No cloud service is required for local multi-terminal billing, but if the server PC or LAN is unavailable the other terminals cannot check out until it recovers.
+
+Syncthing is for **completed backup snapshots only**. It is *not* a synchronization mechanism for multiple independently writable tills: simultaneous SQLite writers on separate replicas would generate conflicts and diverging invoice/stock/credit records.
 
 ## Updates, shutdown and recovery
 
@@ -550,7 +567,7 @@ Reports support IST date boundaries and operational drill-down; selected CSV exp
 
 #### Local web security
 
-- Default binding is `127.0.0.1`; nonloopback listen requires explicit `--lan`, which exposes **unencrypted HTTP** and should be restricted to a trusted, segmented LAN, not the public internet.
+- Default binding is `127.0.0.1`; nonloopback listen requires `--lan` or an administrator-enabled `lan_access_enabled` preference followed by restart, which exposes **unencrypted HTTP** and should be restricted to a trusted, segmented LAN, not the public internet.
 - Request Host validation mitigates DNS rebinding. Mutating requests require permitted same-origin context: matching scheme and port; intended loopback hostname variants (`localhost`, `127.0.0.1`, IPv6 loopback) are handled carefully. Never broadly trust opaque `Origin: null`, arbitrary external sites or another port.
 - Session/CSRF protections remain in place; privileged mutations require authenticated owner identity and appropriate settings unlock. Script/CSS/font assets are bundled and CSP/security headers restrict remote injection and framing; sensitive API responses are not cached.
 - Where available, app-data permissions are restricted to the running OS user. Google OAuth secrets and tokens stay server-side; backups enforce validated filenames and use safe paths. SQL uses parameterized queries.
@@ -562,7 +579,7 @@ Reports support IST date boundaries and operational drill-down; selected CSV exp
 
 - The SQLite **online backup API** creates transaction-consistent snapshots including committed WAL content, without force-checkpointing the live register before copying.
 - Snapshots are staged under temporary filenames, verified with SQLite integrity checks, durably written (with a **writable descriptor for Windows `fsync`**) and atomically renamed to their final names. A failed backup is not presented as a valid final snapshot.
-- Retention limits both **count** and **total size**. Disk-space safeguards can prune the oldest eligible snapshots or refuse a backup; an off-device independent copy is still essential. A restore is an operator-controlled recovery procedure, **not** a way to erase disagreement between two live tills.
+- The 10-minute scheduler retains 24-hour high-frequency, seven-day hourly and 30-day daily history, subject to **count and total size** ceilings. Disk-space safeguards can prune the oldest eligible snapshots or refuse a backup; an off-device independent copy is still essential. A restore is an operator-controlled recovery procedure, **not** a way to erase disagreement between two live tills.
 - Restoring to the active SQLite database uses the online backup mechanism into the same target file to avoid splitting existing SQLite connections across a replaced inode. Even so, stop other operators and verify a disposable restoration before touching real transactions.
 - Optional Drive integration uses Google OAuth (`drive.file` scope, validated `state`) and callback `http://127.0.0.1:8420/gdrive/callback`. The permission covers files pyPOS creates, not the user's entire Drive. Token failures must never interrupt the local sale path.
 

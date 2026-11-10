@@ -107,13 +107,50 @@ def connect(db_path=None):
     return conn
 
 
+# Bump this when a release changes the persisted database schema. A database
+# created by an older release receives an immutable pre-migration snapshot.
+SCHEMA_BACKUP_VERSION = 1
+
+
+def _pre_migration_snapshot(conn, path, existed):
+    if not existed:
+        return
+    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if current >= SCHEMA_BACKUP_VERSION:
+        return
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+    if not tables:
+        return
+    enabled = True
+    if "settings" in tables:
+        row = conn.execute("SELECT value FROM settings WHERE key = ?",
+                           ("backup_pre_migration_enabled",)).fetchone()
+        enabled = row is None or row[0] == "true"
+    if enabled:
+        from . import backups  # Lazy import avoids db/backups import cycles.
+        backups._ensure_disk_room({"backup_max_mb": "0"}, path)
+        name = backups.create_backup(path, reason="pre_migration")
+        # A snapshot that fails verification must never be considered safe for
+        # schema migration. Older schemas may lack newer REQUIRED_TABLES.
+        snap = sqlite3.connect(f"file:{(Path(path).parent / 'backups' / name).resolve()}?mode=ro",
+                               uri=True)
+        try:
+            if snap.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("Pre-migration SQLite snapshot is corrupt")
+        finally:
+            snap.close()
+
+
 def init_db(db_path=None):
     """Create the database file and apply the schema. Safe to run repeatedly
     and safe on databases created by older pyPOS versions."""
     path = str(db_path) if db_path else _resolve(None)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
+    existed = Path(path).is_file() and Path(path).stat().st_size > 0
     conn = connect(path)
     try:
+        _pre_migration_snapshot(conn, path, existed)
         sql = schema_sql()
         # 1) Tables only — gives brand-new installs their skeleton and lets
         #    old databases pick up tables that didn't exist when they were made.
@@ -127,6 +164,7 @@ def init_db(db_path=None):
         #    and every statement is IF NOT EXISTS / idempotent.
         conn.executescript(sql)
         conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_BACKUP_VERSION}")
         conn.commit()
     finally:
         conn.close()

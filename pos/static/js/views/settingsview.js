@@ -669,6 +669,41 @@ export async function renderSettingsView(main) {
       h("a", { class: "btn", target: "_blank", rel: "noopener noreferrer",
         href: "https://github.com/aadi-bhattacharya/pyPOS/releases" }, "View available releases")));
 
+  const lanToggle = h("input", { type: "checkbox", checked: s.lan_access_enabled === "true",
+    "aria-label": "Allow other terminals to use this register over the local network" });
+  const lanStatus = h("p", { class: "form-hint", "aria-live": "polite" },
+    s.lan_access_enabled === "true"
+      ? "LAN access is enabled. Restart the server to apply any change."
+      : "LAN access is off. Only this computer can reach the register by default.");
+  const lanCard = h("div", { class: "card card-pad" },
+    h("h3", {}, "Shared register (multiple terminals)"),
+    h("p", { class: "form-hint" },
+      "All counters connect to ONE pyPOS server, sharing the same sales, inventory and SQLite database. " +
+      "Other computers open http://SERVER-IP:8420 in their browser. Do not sync the live database via Syncthing."),
+    h("label", { class: "credit-toggle" }, lanToggle,
+      h("span", {}, "Allow other terminals on this trusted LAN")),
+    lanStatus,
+    h("p", { class: "form-hint" },
+      "Security warning: LAN mode uses unencrypted HTTP. Only enable it on an isolated, trusted network. " +
+      "The operating system firewall must allow inbound TCP 8420. All counters currently share one cash-day session."),
+    h("div", { class: "settings-actions" },
+      h("button", { class: "btn primary", onclick: async () => {
+        const enabled = lanToggle.checked;
+        if (enabled && s.lan_access_enabled !== "true") {
+          const ok = await confirmDialog({ title: "Enable shared register over LAN?",
+            message: "Other devices on this network will be able to reach the sign-in page. " +
+              "Staff PINs and POS requests will travel over unencrypted HTTP. " +
+              "Only use an isolated trusted LAN. A restart is required.",
+            confirmLabel: "Enable LAN access" });
+          if (!ok) { lanToggle.checked = false; return; }
+        }
+        try {
+          state.settings = await api.saveSettings({ lan_access_enabled: enabled ? "true" : "false" });
+          lanStatus.textContent = "Saved. Stop and restart pyPOS to apply the network change.";
+          toast("Shared-register setting saved. Restart pyPOS to apply.", "success");
+        } catch (e) { toastError(e); }
+      } }, icon("i-check"), "Save LAN preference")));
+
   const sections = [
     { id: "store", title: "Store & tax", subtitle: "Business details, GST treatment and prices",
       cards: [storeCard, taxCard] },
@@ -682,8 +717,8 @@ export async function renderSettingsView(main) {
       cards: [staffPermissionCard, discountCard, staffMenuCard, passwordCard] },
     { id: "backups", title: "Backups & recovery", subtitle: "Local snapshots, restore and Google Drive",
       cards: [backupsCard()] },
-    { id: "app", title: "App & updates", subtitle: "Version updates and first-run tools",
-      cards: [updateCard, sampleDataCard] },
+    { id: "app", title: "App & updates", subtitle: "Network terminals, software updates and first-run tools",
+      cards: [lanCard, updateCard, sampleDataCard] },
   ];
 
   const navigation = h("nav", { class: "settings-nav", "aria-label": "Settings categories" });

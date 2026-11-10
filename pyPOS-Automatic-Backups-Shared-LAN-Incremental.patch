@@ -1,0 +1,1023 @@
+diff --git a/README.md b/README.md
+index 5aa5f0c..0d1d64f 100644
+--- a/README.md
++++ b/README.md
+@@ -17,6 +17,7 @@ pyPOS runs a local Python server and opens the register in your browser. It uses
+ - [Billing, GST and refunds](#billing-gst-and-refunds)
+ - [Staff accounts and permissions](#staff-accounts-and-permissions)
+ - [Backups and store data](#backups-and-store-data)
++- [Multiple checkout terminals](#multiple-checkout-terminals)
+ - [Updates, shutdown and recovery](#updates-shutdown-and-recovery)
+ - [Troubleshooting](#troubleshooting)
+ - [For developers](#for-developers)
+@@ -200,10 +201,26 @@ The script uses SQLite's backup API and will **not overwrite** an existing manag
+ 
+ ### Local and off-device backups
+ 
+-In **Settings → Backups & recovery**, create snapshots, configure retention and optionally connect Google Drive. Snapshots are written through SQLite's online backup API, checked and atomically published. The system enforces count and size limits; older snapshots may be pruned under policy. For disaster recovery keep an **independent off-device backup** and occasionally restore a copy to verify it works. Restore a live database only when operators have stopped transacting.
++In **Settings → Backups & recovery**, automatic backups are **enabled every 10 minutes** by default. The 30-day history keeps all snapshots from the last 24 hours, an hourly snapshot for the next six days, then a daily snapshot through 30 days. Additional snapshots are made **after End Day commits** and **before the first schema migration for a version**. Each snapshot is a SQLite online backup including committed WAL entries, checked for integrity and atomically published. Pre-migration snapshots are created before modifying existing tables; an unsuccessful safety backup prevents that migration.
++
++**Capacity is not unlimited.** The default 500-snapshot count ceiling and 4 GiB disk budget may shorten the 30-day history for larger stores. The newest local snapshot is protected against ordinary pruning, and backups are skipped safely when there is too little disk space. Verify the visible snapshot history regularly. Day-end backup failures report a warning while preserving the already-closed day.
++
++**Syncthing replication support (enabled by default):** pyPOS stages the **latest three completed snapshots only** in the `backups/sync-outbox/` subfolder and verifies each copied file. Install/configure Syncthing yourself; in Syncthing, share *that folder* from the shop server as **Send Only**, and configure a second PC/NAS as **Receive Only**. Syncthing copies and deletes staged files according to its own sync status. pyPOS cannot verify that the other device received them: the UI reports only *locally staged* snapshots. Test an actual restore on the second device; maintain independent historical/off-site backups and protect customer data in transit and at rest. **Never synchronize live `pypos.db`, `pypos.db-wal` or `pypos.db-shm`**. These are not independently safe replicas.
++
++The outbox itself is a second local copy, *not* an independent off-site backup until Syncthing has delivered it. You can disable outbox staging, day-end backups or pre-migration backups separately; disabling pre-migration protection increases upgrade risk. For a proper disaster recovery plan maintain an additional off-device and/or cloud backup and periodically restore to a test database. Restore the live database only with operators stopped and the original protected.
+ 
+ For optional Google Drive sync, enable the **Google Drive API**, create a Google OAuth web-client credential with redirect URI `http://127.0.0.1:8420/gdrive/callback`, then enter its client ID/secret in **Settings → Backups & recovery** and authorize the chosen Google account. The app requests the limited `drive.file` scope. OAuth credentials and access tokens must remain private. Sync is optional; sales stay local if the network or Drive is unavailable.
+ 
++## Multiple checkout terminals
++
++Use **one pyPOS server as the authoritative register**. On the computer holding the real shop database, sign in as the administrator and enable **Settings → App & updates → Shared register (multiple terminals) → Allow other terminals on this trusted LAN**. Save, **stop pyPOS gracefully and start it again**. This setting makes managed native shortcuts bind to the LAN; `python main.py --lan --no-browser` is an alternative for a source installation. By default, LAN access is **off**. The host PC must remain running and connected.
++
++On each additional terminal, open `http://SERVER-IP:8420` in a browser, replacing `SERVER-IP` with the host PC's **trusted LAN address** (such as `192.168.x.x`). Each operator logs in with their own PIN. Allow inbound TCP port `8420` through the **host's firewall only for trusted devices**. Every connected browser uses the *same* sales, invoice sequences, cash-session record and stock in the central SQLite database. **Do not run another independent pyPOS database on the other terminals.** The existing Cash Drawer represents a *shared store-wide day*, not separate physical tills per counter; use a single reconciled cash drawer until per-terminal sessions exist. Direct thermal receipts print through the **server computer's configured printer**, not a separate printer attached to each browser-only terminal.
++
++**Security:** pyPOS LAN mode uses **unencrypted HTTP**. Credentials and transaction data are therefore visible to attackers on an untrusted network. Use only a physically isolated/trusted LAN, ideally wired, or place the service behind an appropriate HTTPS/TLS gateway. Do not expose TCP `8420` to the Internet, forward the router port, or use public/shared Wi-Fi. No cloud service is required for local multi-terminal billing, but if the server PC or LAN is unavailable the other terminals cannot check out until it recovers.
++
++Syncthing is for **completed backup snapshots only**. It is *not* a synchronization mechanism for multiple independently writable tills: simultaneous SQLite writers on separate replicas would generate conflicts and diverging invoice/stock/credit records.
++
+ ## Updates, shutdown and recovery
+ 
+ **Managed native releases only:** When **Settings → App & updates → Enable automatic software updates** is on (the default), the launcher checks the pinned GitHub Releases source in the background. A strictly newer stable release with a matching platform ZIP, manifest and SHA-256 checksums is downloaded and staged separately. **It is not activated during an open session or while the app is running**; the next valid launcher start selects it after making a pre-update SQLite snapshot. Network failure does not block ordinary sales.
+@@ -550,7 +567,7 @@ Reports support IST date boundaries and operational drill-down; selected CSV exp
+ 
+ #### Local web security
+ 
+-- Default binding is `127.0.0.1`; nonloopback listen requires explicit `--lan`, which exposes **unencrypted HTTP** and should be restricted to a trusted, segmented LAN, not the public internet.
++- Default binding is `127.0.0.1`; nonloopback listen requires `--lan` or an administrator-enabled `lan_access_enabled` preference followed by restart, which exposes **unencrypted HTTP** and should be restricted to a trusted, segmented LAN, not the public internet.
+ - Request Host validation mitigates DNS rebinding. Mutating requests require permitted same-origin context: matching scheme and port; intended loopback hostname variants (`localhost`, `127.0.0.1`, IPv6 loopback) are handled carefully. Never broadly trust opaque `Origin: null`, arbitrary external sites or another port.
+ - Session/CSRF protections remain in place; privileged mutations require authenticated owner identity and appropriate settings unlock. Script/CSS/font assets are bundled and CSP/security headers restrict remote injection and framing; sensitive API responses are not cached.
+ - Where available, app-data permissions are restricted to the running OS user. Google OAuth secrets and tokens stay server-side; backups enforce validated filenames and use safe paths. SQL uses parameterized queries.
+@@ -562,7 +579,7 @@ Reports support IST date boundaries and operational drill-down; selected CSV exp
+ 
+ - The SQLite **online backup API** creates transaction-consistent snapshots including committed WAL content, without force-checkpointing the live register before copying.
+ - Snapshots are staged under temporary filenames, verified with SQLite integrity checks, durably written (with a **writable descriptor for Windows `fsync`**) and atomically renamed to their final names. A failed backup is not presented as a valid final snapshot.
+-- Retention limits both **count** and **total size**. Disk-space safeguards can prune the oldest eligible snapshots or refuse a backup; an off-device independent copy is still essential. A restore is an operator-controlled recovery procedure, **not** a way to erase disagreement between two live tills.
++- The 10-minute scheduler retains 24-hour high-frequency, seven-day hourly and 30-day daily history, subject to **count and total size** ceilings. Disk-space safeguards can prune the oldest eligible snapshots or refuse a backup; an off-device independent copy is still essential. A restore is an operator-controlled recovery procedure, **not** a way to erase disagreement between two live tills.
+ - Restoring to the active SQLite database uses the online backup mechanism into the same target file to avoid splitting existing SQLite connections across a replaced inode. Even so, stop other operators and verify a disposable restoration before touching real transactions.
+ - Optional Drive integration uses Google OAuth (`drive.file` scope, validated `state`) and callback `http://127.0.0.1:8420/gdrive/callback`. The permission covers files pyPOS creates, not the user's entire Drive. Token failures must never interrupt the local sale path.
+ 
+diff --git a/pos/app.py b/pos/app.py
+index 3816a35..42ff7d0 100644
+--- a/pos/app.py
++++ b/pos/app.py
+@@ -1280,9 +1280,23 @@ def create_app(db_path=None, extra_hosts=()):
+     @app.post("/api/cash-sessions/close")
+     def api_session_close():
+         data = body()
+-        return jsonify(cash_sessions.close_session(
++        # Closing is committed before backup IO. If the disk/cloud is down,
++        # never tell the cashier the day is still open or attempt to close it
++        # twice; report an explicit, recoverable backup warning instead.
++        result = cash_sessions.close_session(
+             get_db(), counted_cash=data.get("counted_cash"),
+-            note=data.get("note")))
++            note=data.get("note"))
++        cfg = settings_mod.get_all_settings(get_db())
++        if cfg.get("backup_day_end_enabled") == "true":
++            try:
++                result["backup"] = backups.run_backup_cycle(
++                    cfg, source_path=db_path(), reason="day_end",
++                    upload_gdrive=False)
++            except Exception as exc:
++                app.logger.exception("Day closed but automatic snapshot failed")
++                result["backup_warning"] = (
++                    "Day closed successfully, but the backup failed: " + str(exc)[:180])
++        return jsonify(result)
+ 
+     @app.post("/api/cash-sessions/movements")
+     def api_cash_movement():
+diff --git a/pos/backups.py b/pos/backups.py
+index f5d675c..3e0c37d 100644
+--- a/pos/backups.py
++++ b/pos/backups.py
+@@ -1,4 +1,6 @@
+ import os
++import hashlib
++import logging
+ from contextlib import closing
+ import re
+ import shutil
+@@ -59,6 +61,11 @@ def _atomic_write_text(path, text):
+ 
+ ERROR_MARKER = ".remote_error"
+ SYNC_SUFFIX = ".synced"
++REASON_SUFFIX = ".reason"
++OUTBOX_NAME = "sync-outbox"
++OUTBOX_KEEP = 3
++LOG = logging.getLogger("pypos.backups")
++
+ 
+ 
+ def _gdrive_connected(settings):
+@@ -154,7 +161,7 @@ def _ensure_disk_room(settings, source_path=None):
+     return removed
+ 
+ 
+-def create_backup(source_path=None):
++def create_backup(source_path=None, reason=None):
+     """Create a consistent, power-cut-safe snapshot of the live database.
+ 
+     The copy is written to a temp name, integrity-checked, fsynced and then
+@@ -202,6 +209,12 @@ def create_backup(source_path=None):
+             os.close(fd)
+         os.replace(tmp, final)
+         _fsync_dir(bdir)
++        if reason:
++            # Informational metadata; the snapshot itself is already durable.
++            try:
++                _atomic_write_text(final.with_suffix(REASON_SUFFIX), str(reason)[:40])
++            except OSError:
++                LOG.exception("Snapshot is safe, but reason metadata could not be written")
+ 
+         from .db import harden_permissions
+         harden_permissions(final.parent)
+@@ -253,7 +266,12 @@ def list_backups(bdir=None):
+             created_utc = datetime.fromtimestamp(
+                 st.st_mtime, timezone.utc
+             ).replace(tzinfo=None).isoformat(timespec="seconds")
++            try:
++                reason = f.with_suffix(REASON_SUFFIX).read_text(encoding="utf-8").strip()
++            except OSError:
++                reason = ""
+             out.append({
++                "reason": reason,
+                 "name": f.name,
+                 "size": st.st_size,
+                 "size_human": _human_size(st.st_size),
+@@ -267,6 +285,7 @@ def delete_backup(name, bdir=None):
+     path = _backup_path(name, bdir)
+     path.unlink(missing_ok=True)
+     path.with_suffix(SYNC_SUFFIX).unlink(missing_ok=True)
++    path.with_suffix(REASON_SUFFIX).unlink(missing_ok=True)
+ 
+ 
+ def restore_backup(name, live_path=None):
+@@ -352,7 +371,7 @@ def cleanup_debris(max_age_hours=24, bdir=None):
+             elif NAME_RE.match(f.name) and f.stat().st_size == 0:
+                 f.unlink(missing_ok=True)
+                 removed += 1
+-            elif f.name.endswith(SYNC_SUFFIX):
++            elif f.name.endswith((SYNC_SUFFIX, REASON_SUFFIX)):
+                 if not f.with_suffix(".db").exists():
+                     f.unlink(missing_ok=True)
+                     removed += 1
+@@ -361,6 +380,86 @@ def cleanup_debris(max_age_hours=24, bdir=None):
+     return removed
+ 
+ 
++def _sync_outbox(source_path=None):
++    """Only immutable completed snapshots, NEVER pypos.db or WAL files."""
++    return _backup_dir(source_path) / OUTBOX_NAME
++
++
++def replicate_snapshot(path, source_path=None):
++    """Atomically publish an integrity-checked copy for Syncthing Send Only.
++
++    This stages a local outbox; it does not claim Syncthing is connected or
++    that an independent machine has received the file.
++    """
++    path = Path(path)
++    if not NAME_RE.fullmatch(path.name):
++        raise BackupError("Only finalized pyPOS snapshots may be replicated")
++    validate_database(path)
++    outbox = _sync_outbox(source_path)
++    _ensure_dir(outbox)
++    target = outbox / path.name
++    if target.exists():
++        validate_database(target)
++        return target
++    if _free_bytes(outbox) is not None and _free_bytes(outbox) < path.stat().st_size + MIN_FREE_MARGIN_BYTES:
++        raise BackupError("Not enough disk space to stage a replication copy")
++    temp = outbox / (TMP_PREFIX + path.name)
++    h_src = hashlib.sha256()
++    try:
++        with path.open("rb") as src, temp.open("xb") as dest:
++            while chunk := src.read(1024 * 1024):
++                h_src.update(chunk)
++                dest.write(chunk)
++            dest.flush()
++            os.fsync(dest.fileno())
++        h_dst = hashlib.sha256()
++        with temp.open("rb") as check:
++            while chunk := check.read(1024 * 1024):
++                h_dst.update(chunk)
++        if h_src.digest() != h_dst.digest():
++            raise BackupError("Replicated snapshot checksum mismatch")
++        validate_database(temp)
++        os.replace(temp, target)
++        _fsync_dir(outbox)
++        # Bounded outbox: remote mirror contains the latest three snapshots.
++        for old in sorted(outbox.glob("pypos-*.db"), reverse=True)[OUTBOX_KEEP:]:
++            if NAME_RE.fullmatch(old.name):
++                old.unlink(missing_ok=True)
++        return target
++    finally:
++        temp.unlink(missing_ok=True)
++
++
++def _retention_candidates(backups_list, settings):
++    """Keep 10-minute history for 24h, hourly to 7d, daily to 30d.
++
++    Day-end and pre-migration snapshots are protected against *tiering*, not
++    against the hard byte/count caps or emergency disk-space pruning.
++    """
++    if "backup_retention_days" not in settings:
++        return backups_list
++    days = max(1, int(settings["backup_retention_days"]))
++    now = datetime.now(timezone.utc)
++    kept = []
++    seen = set()
++    for index, item in enumerate(backups_list):
++        created = datetime.fromisoformat(item["created_at"]).replace(tzinfo=timezone.utc)
++        age = max(0., (now - created).total_seconds())
++        if index != 0 and age > days * 86400:
++            continue
++        if age <= 86400 or item.get("reason") in ("day_end", "pre_migration"):
++            kept.append(item)
++            continue
++        if age <= 7 * 86400:
++            bucket = ("hour", created.strftime("%Y-%m-%d-%H"))
++        else:
++            bucket = ("day", created.strftime("%Y-%m-%d"))
++        if bucket not in seen:
++            seen.add(bucket)
++            kept.append(item)
++    return kept
++
++
+ def prune_backups(keep, settings=None, bdir=None):
+     """Enforce BOTH retention rules. Always keeps at least one snapshot.
+ 
+@@ -372,9 +471,13 @@ def prune_backups(keep, settings=None, bdir=None):
+     removed = 0
+ 
+     backups_list = list_backups(bdir)
+-    for b in backups_list[keep:]:
+-        delete_backup(b["name"], bdir)
+-        removed += 1
++    chosen = _retention_candidates(backups_list, settings or {})
++    # The newest snapshot is always protected from normal retention pruning.
++    kept_names = {b["name"] for b in chosen[:keep]}
++    for b in backups_list:
++        if b["name"] not in kept_names:
++            delete_backup(b["name"], bdir)
++            removed += 1
+ 
+     if settings is not None:
+         budget_mb = float(settings.get("backup_max_mb") or 0)
+@@ -390,7 +493,7 @@ def prune_backups(keep, settings=None, bdir=None):
+     return removed
+ 
+ 
+-def run_backup_cycle(settings, source_path=None):
++def run_backup_cycle(settings, source_path=None, *, reason=None, upload_gdrive=True):
+     """One scheduled/manual cycle: cleanup -> disk guard -> snapshot -> prune.
+ 
+     Guarded by a lock so a manual click and the scheduler can never run two
+@@ -405,17 +508,28 @@ def run_backup_cycle(settings, source_path=None):
+         except BackupError:
+             raise
+ 
+-        name = create_backup(source_path)
++        name = create_backup(source_path, reason=reason)
+         pruned = prune_backups(
+             settings.get("backup_keep", "14"), settings=settings, bdir=bdir)
+ 
+         path = bdir / name
++        replication_staged, replication_error = False, None
++        if settings.get("backup_replication_enabled") == "true":
++            try:
++                replicate_snapshot(path, source_path)
++                replication_staged = True
++            except (OSError, sqlite3.Error, BackupError) as exc:
++                replication_error = str(exc)[:200]
++                LOG.warning("Replication staging failed: %s", exc)
++
+         pushed, err = False, None
+-        if _gdrive_connected(settings):
++        if upload_gdrive and _gdrive_connected(settings):
+             pushed, err = push_to_gdrive(path, settings)
+             _mark_remote_result(path, pushed, err)
+         return {"name": name, "pruned": pruned + emergency_pruned,
+-                "pushed": pushed, "remote_error": err}
++                "pushed": pushed, "remote_error": err,
++                "replication_staged": replication_staged,
++                "replication_error": replication_error}
+ 
+ 
+ # ---------------- scheduler ----------------
+@@ -427,16 +541,17 @@ class BackupScheduler(threading.Thread):
+         super().__init__(daemon=True, name="pos-backup-scheduler")
+         self.get_settings = get_settings_fn
+         self.source_path = source_path
+-        self._stop = threading.Event()
++        self._stop_event = threading.Event()
+ 
+     def stop(self):
+-        self._stop.set()
++        self._stop_event.set()
+ 
+     def next_run(self, settings, last_ts):
+-        hours = float(settings.get("auto_backup_interval_hours") or 24)
+-        if settings.get("auto_backup_enabled") != "true" or hours <= 0:
++        minutes = float(settings.get("auto_backup_interval_minutes") or
++                        float(settings.get("auto_backup_interval_hours") or 24) * 60)
++        if settings.get("auto_backup_enabled") != "true" or minutes <= 0:
+             return None
+-        interval = timedelta(hours=hours)
++        interval = timedelta(minutes=minutes)
+         if last_ts is None:
+             return time.time() + 15  # first auto-run shortly after boot
+         return last_ts + interval.total_seconds()
+@@ -444,7 +559,7 @@ class BackupScheduler(threading.Thread):
+     def run(self):
+         marker_file = _backup_dir(self.source_path) / ".last_auto_backup"
+         # Backwards-compatible: also honor newest manual/auto snapshot on disk.
+-        while not self._stop.wait(60):
++        while not self._stop_event.wait(60):
+             try:
+                 settings = self.get_settings()
+                 last_ts = self._last_run(marker_file, settings)
+@@ -469,7 +584,8 @@ class BackupScheduler(threading.Thread):
+             pass
+         backups = list_backups(_backup_dir(self.source_path))
+         if backups:
+-            return datetime.fromisoformat(backups[0]["created_at"]).timestamp()
++            return datetime.fromisoformat(backups[0]["created_at"]).replace(
++                tzinfo=timezone.utc).timestamp()
+         return None
+ 
+ 
+@@ -483,7 +599,9 @@ def scheduler_status(get_settings_fn, source_path=None):
+     bdir = _backup_dir(source_path)
+     marker = bdir / ".last_auto_backup"
+     enabled = settings.get("auto_backup_enabled") == "true"
+-    hours = float(settings.get("auto_backup_interval_hours") or 24)
++    minutes = float(settings.get("auto_backup_interval_minutes") or
++                    float(settings.get("auto_backup_interval_hours") or 24) * 60)
++    hours = minutes / 60
+     backups = list_backups(bdir)
+     last_iso = None
+     if marker.exists():
+@@ -513,10 +631,24 @@ def scheduler_status(get_settings_fn, source_path=None):
+ 
+     total_bytes = sum(b["size"] for b in backups)
+     free = _free_bytes(bdir)
++    outbox = _sync_outbox(source_path)
++    replicated = [p for p in sorted(outbox.glob("pypos-*.db"), reverse=True)
++                  if NAME_RE.fullmatch(p.name)] if outbox.is_dir() else []
+     return {
+         "enabled": enabled,
+-        "interval_hours": hours,
+-        "keep": int(settings.get("backup_keep") or 14),
++        "interval_minutes": minutes,
++        "interval_hours": hours,  # Compatible with old Settings clients.
++        "retention_days": int(settings.get("backup_retention_days") or 30),
++        "day_end_enabled": settings.get("backup_day_end_enabled") == "true",
++        "pre_migration_enabled": settings.get("backup_pre_migration_enabled") == "true",
++        "replication": {
++            "enabled": settings.get("backup_replication_enabled") == "true",
++            "outbox": str(outbox),
++            "staged_count": len(replicated),
++            "last_staged": replicated[0].name if replicated else None,
++            "remote_verified": False,  # Syncthing remote state is external.
++        },
++        "keep": int(settings.get("backup_keep") or 500),
+         "storage": {
+             "used_human": _human_size(total_bytes),
+             "used_bytes": total_bytes,
+diff --git a/pos/cli.py b/pos/cli.py
+index 21cf4fe..325cdaf 100644
+--- a/pos/cli.py
++++ b/pos/cli.py
+@@ -84,6 +84,15 @@ def _run(argv=None):
+ 
+     db_path = init_db(args.db)
+ 
++    # Persisted LAN opt-in makes native shortcuts usable as a shared register
++    # without modifying launcher command lines. CLI --lan remains available.
++    if not args.lan:
++        cfg_conn = connect(db_path)
++        try:
++            args.lan = settings_mod.get_all_settings(cfg_conn).get(
++                "lan_access_enabled") == "true"
++        finally:
++            cfg_conn.close()
+     if args.lan:
+         args.host = "0.0.0.0"
+     elif not _is_loopback(args.host):
+@@ -128,7 +137,8 @@ def _run(argv=None):
+     scheduler.start()
+ 
+     app = create_app(db_path, extra_hosts=("*",) if args.lan else ())
+-    url = f"http://{args.host}:{args.port}"
++    # 0.0.0.0 is a listen address, not a useful browser destination.
++    url = f"http://{'127.0.0.1' if args.lan else args.host}:{args.port}"
+ 
+ 
+     print(r"  ___               ____  _____  ___ ")
+diff --git a/pos/db.py b/pos/db.py
+index 32e1f9e..ca108f2 100644
+--- a/pos/db.py
++++ b/pos/db.py
+@@ -107,13 +107,50 @@ def connect(db_path=None):
+     return conn
+ 
+ 
++# Bump this when a release changes the persisted database schema. A database
++# created by an older release receives an immutable pre-migration snapshot.
++SCHEMA_BACKUP_VERSION = 1
++
++
++def _pre_migration_snapshot(conn, path, existed):
++    if not existed:
++        return
++    current = int(conn.execute("PRAGMA user_version").fetchone()[0])
++    if current >= SCHEMA_BACKUP_VERSION:
++        return
++    tables = {row[0] for row in conn.execute(
++        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
++    if not tables:
++        return
++    enabled = True
++    if "settings" in tables:
++        row = conn.execute("SELECT value FROM settings WHERE key = ?",
++                           ("backup_pre_migration_enabled",)).fetchone()
++        enabled = row is None or row[0] == "true"
++    if enabled:
++        from . import backups  # Lazy import avoids db/backups import cycles.
++        backups._ensure_disk_room({"backup_max_mb": "0"}, path)
++        name = backups.create_backup(path, reason="pre_migration")
++        # A snapshot that fails verification must never be considered safe for
++        # schema migration. Older schemas may lack newer REQUIRED_TABLES.
++        snap = sqlite3.connect(f"file:{(Path(path).parent / 'backups' / name).resolve()}?mode=ro",
++                               uri=True)
++        try:
++            if snap.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
++                raise RuntimeError("Pre-migration SQLite snapshot is corrupt")
++        finally:
++            snap.close()
++
++
+ def init_db(db_path=None):
+     """Create the database file and apply the schema. Safe to run repeatedly
+     and safe on databases created by older pyPOS versions."""
+     path = str(db_path) if db_path else _resolve(None)
+     Path(path).parent.mkdir(parents=True, exist_ok=True)
++    existed = Path(path).is_file() and Path(path).stat().st_size > 0
+     conn = connect(path)
+     try:
++        _pre_migration_snapshot(conn, path, existed)
+         sql = schema_sql()
+         # 1) Tables only — gives brand-new installs their skeleton and lets
+         #    old databases pick up tables that didn't exist when they were made.
+@@ -127,6 +164,7 @@ def init_db(db_path=None):
+         #    and every statement is IF NOT EXISTS / idempotent.
+         conn.executescript(sql)
+         conn.execute("PRAGMA journal_mode = WAL")
++        conn.execute(f"PRAGMA user_version = {SCHEMA_BACKUP_VERSION}")
+         conn.commit()
+     finally:
+         conn.close()
+diff --git a/pos/managed_launcher.py b/pos/managed_launcher.py
+index 60fda31..5f61274 100644
+--- a/pos/managed_launcher.py
++++ b/pos/managed_launcher.py
+@@ -197,20 +197,32 @@ def _pre_update_backup(current, pending):
+     target = backup_dir / name
+     if target.exists():
+         raise UpdateError("Pre-update backup name already exists; update postponed")
+-    # SQLite's online backup API copies a transaction-consistent snapshot,
+-    # including committed transactions in WAL. No raw .db file copying.
++    # A partially written snapshot must never be exposed as a finished backup.
++    # The temporary and final paths are on the same filesystem for atomic rename.
++    temp = backup_dir / (".tmp-" + name)
++    if temp.exists():
++        raise UpdateError("Unfinished pre-update backup exists; update postponed")
++    from .backups import _fsync_dir
+     source = sqlite3.connect(db_file.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+     try:
+-        destination = sqlite3.connect(str(target), timeout=10)
++        destination = sqlite3.connect(str(temp), timeout=10)
+         try:
+             source.backup(destination, pages=256, sleep=0.1)
+-            status = destination.execute("PRAGMA quick_check").fetchone()[0]
++            destination.execute("PRAGMA journal_mode = DELETE")
++            status = destination.execute("PRAGMA integrity_check").fetchone()[0]
+             if status != "ok":
+-                raise UpdateError("Pre-update SQLite backup did not pass quick_check")
++                raise UpdateError("Pre-update SQLite backup failed integrity_check")
+         finally:
+             destination.close()
++        fd = os.open(str(temp), os.O_RDWR)  # Windows fsync needs writable fd.
++        try:
++            os.fsync(fd)
++        finally:
++            os.close(fd)
++        os.replace(temp, target)
++        _fsync_dir(backup_dir)
+     except Exception:
+-        target.unlink(missing_ok=True)
++        temp.unlink(missing_ok=True)
+         raise
+     finally:
+         source.close()
+diff --git a/pos/settings.py b/pos/settings.py
+index b328038..6e8a483 100644
+--- a/pos/settings.py
++++ b/pos/settings.py
+@@ -57,10 +57,17 @@ SETTING_KEYS = {
+     "tax_comp2_name": "SGST",
+     "tax_comp2_share": "50",
+     "auto_updates_enabled": "true",  # Managed launcher: check, stage and activate updates
++    "lan_access_enabled": "false",  # Administrator opt-in; takes effect after restart.
+     "auto_backup_enabled": "true",
+-    "auto_backup_interval_hours": "24",
+-    "backup_keep": "14",
+-    "backup_max_mb": "800",
++    "auto_backup_interval_hours": "24",  # Legacy API for old clients.
++    "auto_backup_interval_minutes": "10",
++    "backup_retention_days": "30",
++    "backup_day_end_enabled": "true",
++    "backup_pre_migration_enabled": "true",
++    "backup_replication_enabled": "true",  # Outbox for Syncthing, not the live DB.
++    "backup_keep": "500",  # Secondary safety ceiling after tiered retention.
++    "backup_max_mb": "4096",  # Storage safety ceiling; can shorten retention.
++
+     # Google Drive OAuth credentials (native, no rclone needed)
+     "gdrive_client_id": "",
+     "gdrive_client_secret": "",
+@@ -147,7 +154,22 @@ def save_settings(conn, values):
+                 raise ValueError("State/UT code must be a valid two-digit GST code")
+         elif key == "price_tax_mode" and value not in ("inclusive", "exclusive"):
+             raise ValueError("Price tax mode must be inclusive or exclusive")
++        elif key in ("receipt_auto_print", "auto_updates_enabled",
++                     "auto_backup_enabled", "backup_day_end_enabled",
++                     "backup_pre_migration_enabled", "backup_replication_enabled",
++                     "lan_access_enabled") and value not in ("true", "false"):
++            raise ValueError(f"{key} must be true or false")
++        elif key == "auto_backup_interval_minutes":
++            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 1440:
++                raise ValueError("Backup interval must be between 1 and 1440 minutes")
++        elif key == "backup_retention_days":
++            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= 365:
++                raise ValueError("Backup retention must be between 1 and 365 days")
++        elif key in ("backup_keep", "backup_max_mb", "auto_backup_interval_hours"):
++            if not value.isascii() or not value.isdecimal() or not 1 <= int(value) <= (100000 if key == "backup_keep" else 1000000):
++                raise ValueError(f"{key} must be a positive integer")
+         elif key in ("receipt_auto_print", "auto_updates_enabled") and value not in ("true", "false"):
++
+             raise ValueError(f"{key} must be true or false")
+         elif key == "receipt_print_mode" and value not in ("thermal", "browser"):
+             raise ValueError("Receipt print mode must be thermal or browser")
+diff --git a/pos/static/js/views/settingsBackups.js b/pos/static/js/views/settingsBackups.js
+index 1bd5478..c1f2f7d 100644
+--- a/pos/static/js/views/settingsBackups.js
++++ b/pos/static/js/views/settingsBackups.js
+@@ -38,6 +38,9 @@ async function renderBackups(wrap) {
+       : "";
+     statusBits.push(`Storage: ${status.storage.used_human} used${cap} · ${status.storage.free_human} free`);
+   }
++  if (status.replication?.enabled) {
++    statusBits.push(`Syncthing outbox: ${status.replication.staged_count || 0} local snapshots; remote delivery not verified`);
++  }
+   if (status.gdrive?.connected) {
+     statusBits.push(`Google Drive ✓ ${status.gdrive.client_id}`);
+   }
+@@ -100,13 +103,19 @@ async function renderBackups(wrap) {
+   // ---- auto-backup + Google Drive configuration ----
+   const enabledIn = h("input", { type: "checkbox" });
+   enabledIn.checked = status.enabled;
+-  const intervalIn = h("input", { class: "input", type: "number", min: "1", step: "1",
+-    value: String(status.interval_hours || 24), style: "width:90px" });
+-  const keepIn = h("input", { class: "input", type: "number", min: "1", step: "1",
+-    value: String(status.keep ?? 14), style: "width:90px" });
++  const intervalIn = h("input", { class: "input", type: "number", min: "1", max: "1440", step: "1",
++    value: String(status.interval_minutes || 10), style: "width:90px" });
++  const daysIn = h("input", { class: "input", type: "number", min: "1", max: "365", step: "1",
++    value: String(status.retention_days || 30), style: "width:90px" });
+   const maxMbIn = h("input", { class: "input", type: "number", min: "1", step: "1",
+-    value: String(status.storage?.max_mb || 800), style: "width:90px",
+-    title: "Hard ceiling: oldest snapshots are deleted beyond this total size" });
++    value: String(status.storage?.max_mb || 4096), style: "width:90px",
++    title: "Hard storage ceiling; snapshots may be removed before the configured age" });
++  const dayEndIn = h("input", { type: "checkbox" });
++  dayEndIn.checked = status.day_end_enabled;
++  const migrationIn = h("input", { type: "checkbox" });
++  migrationIn.checked = status.pre_migration_enabled;
++  const replicationIn = h("input", { type: "checkbox" });
++  replicationIn.checked = status.replication?.enabled;
+ 
+   const scheduleSaveBtn = h("button", {
+     class: "btn",
+@@ -114,9 +123,12 @@ async function renderBackups(wrap) {
+       try {
+         await api.saveSettings({
+           auto_backup_enabled: enabledIn.checked ? "true" : "false",
+-          auto_backup_interval_hours: String(parseInt(intervalIn.value, 10) || 24),
+-          backup_keep: String(parseInt(keepIn.value, 10) || 14),
+-          backup_max_mb: String(parseInt(maxMbIn.value, 10) || 800),
++          auto_backup_interval_minutes: intervalIn.value,
++          backup_retention_days: daysIn.value,
++          backup_max_mb: maxMbIn.value,
++          backup_day_end_enabled: dayEndIn.checked ? "true" : "false",
++          backup_pre_migration_enabled: migrationIn.checked ? "true" : "false",
++          backup_replication_enabled: replicationIn.checked ? "true" : "false",
+         });
+         toast("Backup schedule saved.", "success");
+         await renderBackups(wrap);
+@@ -130,12 +142,25 @@ async function renderBackups(wrap) {
+         enabledIn, "Automatic backups"),
+       h("div", { style: "display:flex;gap:14px;flex-wrap:wrap;align-items:flex-end" },
+         h("div", { class: "field", style: "margin:0" },
+-          h("label", {}, "Interval (hours)"), intervalIn),
++          h("label", {}, "Interval (minutes)"), intervalIn),
+         h("div", { class: "field", style: "margin:0" },
+-          h("label", {}, "Keep last N"), keepIn),
++          h("label", {}, "History (days)"), daysIn),
+         h("div", { class: "field", style: "margin:0" },
+           h("label", {}, "Size cap (MB)"), maxMbIn),
+         scheduleSaveBtn)),
++      h("label", { style: "display:flex;gap:8px;align-items:center" },
++        dayEndIn, "Take an extra snapshot when End Day succeeds"),
++      h("label", { style: "display:flex;gap:8px;align-items:center" },
++        migrationIn, "Snapshot the existing database before schema migration"),
++      h("label", { style: "display:flex;gap:8px;align-items:center" },
++        replicationIn, "Stage the latest 3 verified snapshots for Syncthing"),
++      h("div", { class: "form-hint", style: "overflow-wrap:anywhere" },
++        `Syncthing Send Only folder: ${status.replication?.outbox || "Not configured"}. ` +
++        "Configure this folder in Syncthing and set the other device to Receive Only. " +
++        "It is not the live database. Syncthing connectivity cannot be verified here."),
++      h("div", { class: "form-hint" },
++        "Recent backups are kept every 10 minutes, then thinned to hourly and daily " +
++        "history through 30 days. Space/count caps can shorten retention."),
+     );
+ 
+   wrap.append(gdriveSection(status, () => renderBackups(wrap)));
+diff --git a/pos/static/js/views/settingsview.js b/pos/static/js/views/settingsview.js
+index 97bd677..ffc94ea 100644
+--- a/pos/static/js/views/settingsview.js
++++ b/pos/static/js/views/settingsview.js
+@@ -669,6 +669,41 @@ export async function renderSettingsView(main) {
+       h("a", { class: "btn", target: "_blank", rel: "noopener noreferrer",
+         href: "https://github.com/aadi-bhattacharya/pyPOS/releases" }, "View available releases")));
+ 
++  const lanToggle = h("input", { type: "checkbox", checked: s.lan_access_enabled === "true",
++    "aria-label": "Allow other terminals to use this register over the local network" });
++  const lanStatus = h("p", { class: "form-hint", "aria-live": "polite" },
++    s.lan_access_enabled === "true"
++      ? "LAN access is enabled. Restart the server to apply any change."
++      : "LAN access is off. Only this computer can reach the register by default.");
++  const lanCard = h("div", { class: "card card-pad" },
++    h("h3", {}, "Shared register (multiple terminals)"),
++    h("p", { class: "form-hint" },
++      "All counters connect to ONE pyPOS server, sharing the same sales, inventory and SQLite database. " +
++      "Other computers open http://SERVER-IP:8420 in their browser. Do not sync the live database via Syncthing."),
++    h("label", { class: "credit-toggle" }, lanToggle,
++      h("span", {}, "Allow other terminals on this trusted LAN")),
++    lanStatus,
++    h("p", { class: "form-hint" },
++      "Security warning: LAN mode uses unencrypted HTTP. Only enable it on an isolated, trusted network. " +
++      "The operating system firewall must allow inbound TCP 8420. All counters currently share one cash-day session."),
++    h("div", { class: "settings-actions" },
++      h("button", { class: "btn primary", onclick: async () => {
++        const enabled = lanToggle.checked;
++        if (enabled && s.lan_access_enabled !== "true") {
++          const ok = await confirmDialog({ title: "Enable shared register over LAN?",
++            message: "Other devices on this network will be able to reach the sign-in page. " +
++              "Staff PINs and POS requests will travel over unencrypted HTTP. " +
++              "Only use an isolated trusted LAN. A restart is required.",
++            confirmLabel: "Enable LAN access" });
++          if (!ok) { lanToggle.checked = false; return; }
++        }
++        try {
++          state.settings = await api.saveSettings({ lan_access_enabled: enabled ? "true" : "false" });
++          lanStatus.textContent = "Saved. Stop and restart pyPOS to apply the network change.";
++          toast("Shared-register setting saved. Restart pyPOS to apply.", "success");
++        } catch (e) { toastError(e); }
++      } }, icon("i-check"), "Save LAN preference")));
++
+   const sections = [
+     { id: "store", title: "Store & tax", subtitle: "Business details, GST treatment and prices",
+       cards: [storeCard, taxCard] },
+@@ -682,8 +717,8 @@ export async function renderSettingsView(main) {
+       cards: [staffPermissionCard, discountCard, staffMenuCard, passwordCard] },
+     { id: "backups", title: "Backups & recovery", subtitle: "Local snapshots, restore and Google Drive",
+       cards: [backupsCard()] },
+-    { id: "app", title: "App & updates", subtitle: "Version updates and first-run tools",
+-      cards: [updateCard, sampleDataCard] },
++    { id: "app", title: "App & updates", subtitle: "Network terminals, software updates and first-run tools",
++      cards: [lanCard, updateCard, sampleDataCard] },
+   ];
+ 
+   const navigation = h("nav", { class: "settings-nav", "aria-label": "Settings categories" });
+diff --git a/tests/test_backup_automation.py b/tests/test_backup_automation.py
+new file mode 100644
+index 0000000..2ca091a
+--- /dev/null
++++ b/tests/test_backup_automation.py
+@@ -0,0 +1,304 @@
++"""Automatic snapshot, replication, migration and multi-counter regressions."""
++import os
++import sqlite3
++import tempfile
++import time
++import unittest
++from datetime import datetime, timedelta, timezone
++from pathlib import Path
++from unittest import mock
++
++from pos import backups, cash_sessions, db, settings
++
++
++class AutomaticBackupTests(unittest.TestCase):
++    def setUp(self):
++        self.tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.tmp.cleanup)
++        self.path = Path(self.tmp.name) / "store.db"
++        db.init_db(self.path)
++        self.bdir = self.path.parent / "backups"
++        conn = db.connect(self.path)
++        try:
++            self.options = settings.get_settings(conn)
++        finally:
++            conn.close()  # Windows cannot delete an open database file.
++
++    def _read_db(self, path, key):
++        con = sqlite3.connect(str(path))
++        try:
++            return con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
++        finally:
++            con.close()
++
++    def test_default_10min_30days_and_three_remote_staged_copies(self):
++        self.assertEqual(self.options['auto_backup_interval_minutes'], '10')
++        self.assertEqual(self.options['backup_retention_days'], '30')
++        sched = backups.BackupScheduler(lambda: self.options, self.path)
++        start = time.time()
++        self.assertAlmostEqual(sched.next_run(self.options, start), start + 600, delta=1)
++        self.assertTrue(self.options['backup_replication_enabled'] == 'true')
++        for i in range(4):
++            con = db.connect(self.path)
++            try:
++                settings.save_settings(con, {'store_name': f'Shop{i}'})
++            finally:
++                con.close()
++            result = backups.run_backup_cycle(self.options, self.path)
++            self.assertTrue(result['replication_staged'], result)
++            staged = backups._sync_outbox(self.path) / result['name']
++            backups.validate_database(staged)
++            self.assertEqual(self._read_db(staged, 'store_name'), (f'Shop{i}',))
++        self.assertEqual(len(list(backups._sync_outbox(self.path).glob('pypos-*.db'))), 3)
++        self.assertFalse(any(f.name == 'store.db' for f in backups._sync_outbox(self.path).iterdir()))
++
++    def test_wal_snapshot_includes_committed_sales_settings_without_checkpoint(self):
++        live = db.connect(self.path)
++        try:
++            live.execute('PRAGMA journal_mode=WAL')
++            settings.save_settings(live, {'store_name': 'Latest live value'})
++            wal = Path(str(self.path) + '-wal')
++            before = wal.stat().st_size
++            self.assertGreater(before, 0)
++            backups.run_backup_cycle(self.options, self.path)
++            self.assertEqual(wal.stat().st_size, before)
++            name = backups.list_backups(self.bdir)[0]['name']
++            self.assertEqual(self._read_db(self.bdir / name, 'store_name'), ('Latest live value',))
++        finally:
++            live.close()
++
++    def test_outbox_failure_never_undoes_valid_local_snapshot(self):
++        with mock.patch.object(backups, 'replicate_snapshot', side_effect=backups.BackupError('offline')):
++            result = backups.run_backup_cycle(self.options, self.path)
++        self.assertFalse(result['replication_staged'])
++        self.assertEqual(result['replication_error'], 'offline')
++        backups.validate_database(self.bdir / result['name'])
++
++    def test_atomic_outbox_failure_leaves_no_final_copy(self):
++        name = backups.create_backup(self.path)
++        path = self.bdir / name
++        with mock.patch.object(backups, 'validate_database', side_effect=[None, backups.BackupError('corrupt copy')]):
++            with self.assertRaises(backups.BackupError):
++                backups.replicate_snapshot(path, self.path)
++        self.assertEqual(list(backups._sync_outbox(self.path).glob('*.db')), [])
++
++    def test_tiered_history_and_30_day_age_ceiling(self):
++        now = datetime.now(timezone.utc).replace(hour=12, minute=30, second=0, microsecond=0)
++        simulated = []
++        for delta in (timedelta(minutes=10), timedelta(hours=30), timedelta(hours=30, minutes=10),
++                      timedelta(days=12), timedelta(days=12, hours=1), timedelta(days=31)):
++            timestamp = now - delta
++            item = {'name': 'pypos-' + timestamp.strftime('%Y-%m-%d-%H%M%S') + '-000.db',
++                    'created_at': timestamp.replace(tzinfo=None).isoformat(timespec='seconds'), 'reason': ''}
++            simulated.append(item)
++        simulated.sort(key=lambda d: d['name'], reverse=True)
++        keep = backups._retention_candidates(simulated, {'backup_retention_days': '30'})
++        self.assertEqual(len(keep), 3)
++        self.assertNotIn(simulated[-1], keep)
++        self.assertIn(simulated[0], keep)
++
++    def test_pre_migration_snapshots_are_created_once_and_restoreable(self):
++        con = sqlite3.connect(str(self.path))
++        try:
++            con.execute('PRAGMA user_version = 0')  # Old release database.
++            con.execute("INSERT INTO settings(key,value) VALUES('pre_migrate','preserved')")
++            con.commit()
++        finally:
++            con.close()
++        db.init_db(self.path)
++        pre = [x for x in backups.list_backups(self.bdir) if x['reason'] == 'pre_migration']
++        self.assertEqual(len(pre), 1)
++        self.assertEqual(self._read_db(self.bdir / pre[0]['name'], 'pre_migrate'), ('preserved',))
++        db.init_db(self.path)
++        pre = [x for x in backups.list_backups(self.bdir) if x['reason'] == 'pre_migration']
++        self.assertEqual(len(pre), 1)
++
++    def test_failed_pre_migration_backup_prevents_schema_changes(self):
++        conn = sqlite3.connect(str(self.path))
++        try:
++            conn.execute('PRAGMA user_version = 0')
++            conn.commit()
++        finally:
++            conn.close()
++        with mock.patch.object(backups, 'create_backup', side_effect=backups.BackupError('disk full')):
++            with self.assertRaisesRegex(backups.BackupError, 'disk full'):
++                db.init_db(self.path)
++        con = sqlite3.connect(str(self.path))
++        try:
++            self.assertEqual(con.execute('PRAGMA user_version').fetchone()[0], 0)
++        finally:
++            con.close()
++
++    def test_day_end_close_commits_and_creates_immutable_snapshot(self):
++        from pos.app import create_app
++        from pos import staff
++        con = db.connect(self.path)
++        try:
++            staff.add_user(con, 'owner1', 'Owner', 'admin', '12345678')
++        finally:
++            con.close()
++        app = create_app(self.path)
++        app.config['TESTING'] = True
++        client = app.test_client()
++        self.assertEqual(client.post('/staff-login', data={
++            'username': 'owner1', 'pin': '12345678'}).status_code, 302)
++        self.assertEqual(client.post('/api/cash-sessions/open', json={
++            'opening_float': 100}).status_code, 201)
++        closed = client.post('/api/cash-sessions/close', json={'counted_cash': 100})
++        self.assertEqual(closed.status_code, 200, closed.get_data(as_text=True))
++        self.assertIsNotNone(closed.json['session']['closed_at'])
++        self.assertEqual(len([i for i in backups.list_backups(self.bdir)
++                              if i['reason'] == 'day_end']), 1)
++        self.assertIn('backup', closed.json)
++        backups.validate_database(self.bdir / closed.json['backup']['name'])
++
++    def test_day_end_backup_failure_never_reopens_closed_day(self):
++        from pos.app import create_app
++        from pos import staff
++        con = db.connect(self.path)
++        try:
++            staff.add_user(con, 'owner2', 'Owner', 'admin', '12345678')
++        finally:
++            con.close()
++        app = create_app(self.path)
++        app.config['TESTING'] = True
++        client = app.test_client()
++        self.assertEqual(client.post('/staff-login', data={
++            'username': 'owner2', 'pin': '12345678'}).status_code, 302)
++        self.assertEqual(client.post('/api/cash-sessions/open', json={
++            'opening_float': 0}).status_code, 201)
++        with mock.patch.object(backups, 'run_backup_cycle',
++                               side_effect=backups.BackupError('disk full')):
++            closed = client.post('/api/cash-sessions/close', json={'counted_cash': 0})
++        self.assertEqual(closed.status_code, 200)
++        self.assertIsNotNone(closed.json['session']['closed_at'])
++        self.assertIn('backup_warning', closed.json)
++        self.assertIsNone(client.get('/api/cash-sessions/current').json)
++
++    def test_backup_setting_validation(self):
++        con = db.connect(self.path)
++        try:
++            for vals in ({'auto_backup_interval_minutes': '0'},
++                         {'backup_retention_days': '366'},
++                         {'backup_replication_enabled': 'maybe'}):
++                with self.assertRaises(ValueError):
++                    settings.save_settings(con, vals)
++            settings.save_settings(con, {'backup_day_end_enabled': 'false'})
++        finally:
++            con.close()
++
++    def test_restore_from_replication_copy_and_no_live_file_sync(self):
++        con = db.connect(self.path)
++        try:
++            settings.save_settings(con, {'store_name': 'Before snapshot'})
++        finally:
++            con.close()
++        result = backups.run_backup_cycle(self.options, self.path)
++        copied = backups._sync_outbox(self.path) / result['name']
++        con = db.connect(self.path)
++        try:
++            settings.save_settings(con, {'store_name': 'Changed since backup'})
++        finally:
++            con.close()
++        backups._swap_live(copied, self.path)
++        self.assertEqual(self._read_db(self.path, 'store_name'), ('Before snapshot',))
++
++
++class ManagedUpdateSnapshotTests(unittest.TestCase):
++    def test_failed_pre_update_sync_leaves_no_published_file(self):
++        from pos import managed_launcher as ml
++        with tempfile.TemporaryDirectory() as directory:
++            store = Path(directory)
++            path = store / 'pypos.db'
++            db.init_db(path)
++            with mock.patch.object(ml, 'default_data_dir', return_value=store), \
++                 mock.patch.object(ml.os, 'fsync', side_effect=OSError('disk error')):
++                with self.assertRaisesRegex(OSError, 'disk error'):
++                    ml._pre_update_backup('2.0.0', '2.1.0')
++            out = store / 'backups'
++            self.assertEqual(list(out.glob('pre-update-*.db')), [])
++            self.assertEqual(list(out.glob('.tmp-*.db')), [])
++
++
++class SharedTerminalTests(unittest.TestCase):
++    def test_two_terminals_use_one_server_database(self):
++        from pos.app import create_app
++        from pos import staff
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'central.db'
++            db.init_db(path)
++            con = db.connect(path)
++            try:
++                staff.add_user(con, 'owner1', 'Owner', 'admin', '12345678')
++            finally:
++                con.close()
++            con = db.connect(path)
++            try:
++                settings.save_settings(con, {'lan_access_enabled': 'true'})
++                con.execute("INSERT INTO product_groups(name) VALUES('Garments')")
++                con.execute("INSERT INTO products(group_id,SKU,price,cost_price,tax_rate,quantity) "
++                            "VALUES(1,'TEST',100,30,0,5)")
++            finally:
++                con.close()
++            app = create_app(path, extra_hosts=('*',))  # Explicit LAN mode.
++            app.config['TESTING'] = True
++            terminal_a = app.test_client()
++            terminal_b = app.test_client()
++            for client in (terminal_a, terminal_b):
++                login = client.post('/staff-login', data={'username': 'owner1', 'pin': '12345678'},
++                                    base_url='http://192.168.1.50:8420')
++                self.assertEqual(login.status_code, 302)
++            opened = terminal_a.post('/api/cash-sessions/open', json={'opening_float': 250},
++                                     base_url='http://192.168.1.50:8420')
++            self.assertEqual(opened.status_code, 201, opened.get_data(as_text=True))
++            seen = terminal_b.get('/api/cash-sessions/current', base_url='http://192.168.1.50:8420')
++            self.assertEqual(seen.status_code, 200)
++            self.assertEqual(seen.json['id'], opened.json['session']['id'])
++            duplicate = terminal_b.post('/api/cash-sessions/open', json={'opening_float': 0},
++                                        base_url='http://192.168.1.50:8420')
++            self.assertEqual(duplicate.status_code, 409)
++            payload = {'items': [{'product_id': 1, 'quantity': 1}],
++                       'payments': [{'method': 'CASH', 'amount': 100}]}
++            sale_a = terminal_a.post('/api/sales', json=payload,
++                                     base_url='http://192.168.1.50:8420')
++            sale_b = terminal_b.post('/api/sales', json=payload,
++                                     base_url='http://192.168.1.50:8420')
++            self.assertEqual(sale_a.status_code, 201, sale_a.get_data(as_text=True))
++            self.assertEqual(sale_b.status_code, 201, sale_b.get_data(as_text=True))
++            self.assertNotEqual(sale_a.json['id'], sale_b.json['id'])
++            con = db.connect(path)
++            try:
++                self.assertEqual(con.execute('SELECT quantity FROM products WHERE id=1').fetchone()[0], 3)
++                self.assertEqual(con.execute('SELECT COUNT(*) FROM sales').fetchone()[0], 2)
++            finally:
++                con.close()
++
++    def test_lan_setting_is_opt_in_and_controls_installed_startup(self):
++        from pos import cli
++        from pos.cli import PortBusyError
++        # A separate disposable store is used because this class has no setUp.
++        with tempfile.TemporaryDirectory() as directory:
++            path = Path(directory) / 'shared.db'
++            db.init_db(path)
++            con = db.connect(path)
++            try:
++                settings.save_settings(con, {'lan_access_enabled': 'true'})
++            finally:
++                con.close()
++            with mock.patch.object(cli, '_port_free', return_value=False):
++                with self.assertRaises(PortBusyError) as ctx:
++                    cli._run(['--db', str(path), '--no-browser'])
++            self.assertIn('0.0.0.0', str(ctx.exception))
++            con = db.connect(path)
++            try:
++                settings.save_settings(con, {'lan_access_enabled': 'false'})
++            finally:
++                con.close()
++            with mock.patch.object(cli, '_port_free', return_value=False):
++                with self.assertRaises(PortBusyError) as ctx:
++                    cli._run(['--db', str(path), '--no-browser'])
++            self.assertIn('127.0.0.1', str(ctx.exception))
++
++
++if __name__ == '__main__':
++    unittest.main()
